@@ -547,8 +547,16 @@ int main(int argc, char* argv[]) {
     dbg.writeMemory(runtimeBase + offsetFinder.offsetDisableAot_, &g_disable_aot_value,
                     sizeof(g_disable_aot_value));
 
-    dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-    dbg.continueExecution();
+    if (!dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_)) {
+        fprintf(stderr, "Failed to set breakpoint at exports fetch offset 0x%llx\n",
+                offsetFinder.offsetExportsFetch_);
+        return 1;
+    }
+    if (!dbg.continueExecution()) {
+        fprintf(stderr, "Child process exited before hitting exports fetch breakpoint.\n"
+                        "The rosetta runtime offsets are likely wrong for this macOS version.\n");
+        return 1;
+    }
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
 
     auto rosettaRuntimeExportsAddress = dbg.readRegister(MuhDebugger::Register::X19);
@@ -595,8 +603,15 @@ int main(int argc, char* argv[]) {
     dbg.restoreThreadState(mmapThreadState);
 
     // setup a breakpoint after mmap syscall
-    dbg.setBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
-    dbg.continueExecution();
+    if (!dbg.setBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_)) {
+        fprintf(stderr, "Failed to set breakpoint at svc call return offset\n");
+        return 1;
+    }
+    if (!dbg.continueExecution()) {
+        fprintf(stderr, "Child process exited before hitting mmap return breakpoint.\n"
+                        "The rosetta runtime offsets are likely wrong for this macOS version.\n");
+        return 1;
+    }
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
 
     uint64_t machoBase = dbg.readRegister(MuhDebugger::Register::X0);
@@ -748,9 +763,22 @@ int main(int argc, char* argv[]) {
     uint64_t machoExportsAddress = machoBase + machoLoader.getSection("__DATA", "exports")->addr;
     Exports machoExports;
 
-    dbg.readMemory(machoExportsAddress, &machoExports, sizeof(machoExports));
+    if (!dbg.readMemory(machoExportsAddress, &machoExports, sizeof(machoExports))) {
+        fprintf(stderr, "Failed to read exports from mapped macho at 0x%llx\n", machoExportsAddress);
+        return 1;
+    }
     // x87Exports and runtimeExports are already correct absolute addresses
     // after chain fixup rebasing — do NOT add machoBase again.
+
+    const uint64_t maxExportCount = 4096;
+    if (machoExports.x87ExportCount > maxExportCount ||
+        machoExports.runtimeExportCount > maxExportCount) {
+        fprintf(stderr,
+                "Export counts look invalid (x87=%llu, runtime=%llu). "
+                "Offsets are likely wrong for this macOS version.\n",
+                machoExports.x87ExportCount, machoExports.runtimeExportCount);
+        return 1;
+    }
 
     std::vector<Export> x87Exports(machoExports.x87ExportCount);
     std::vector<Export> runtimeExports(machoExports.runtimeExportCount);

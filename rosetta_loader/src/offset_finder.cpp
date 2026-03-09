@@ -25,6 +25,8 @@ auto OffsetFinder::setDefaultOffsets() -> void {
 	// C0 03 5F D6 - RET <--- end of function
 	offsetSvcCallRet_ = offsetSvcCallEntry_ + 0xC; // The return point of the above function
 
+	offsetDisableAot_ = 0x3B27C;
+
 	offsetTransactionResultSize_ = 0x0BA44;
 	offsetTranslateInsn_ = 0x01A654;
 }
@@ -41,11 +43,41 @@ __text:0000000000016730 C0 02 80 52                             MOV             
 search for 88 00 00 36 21 00 80 52 C0 02 80 52 
 */
 
+// Decode an ADRP+LDRB instruction pair to compute the target address.
+// adrp_offset is the file offset of the ADRP instruction.
+static bool decodeAdrpLdrb(const std::vector<unsigned char>& buffer, uint64_t adrp_offset, uintptr_t& result) {
+	if (adrp_offset + 8 > buffer.size()) return false;
+
+	uint32_t adrp_instruction = reinterpret_cast<const uint32_t*>(&buffer[adrp_offset])[0];
+	uint32_t ldrb_instruction = reinterpret_cast<const uint32_t*>(&buffer[adrp_offset + 4])[0];
+
+	// Verify ADRP (mask: 0x9F000000, value: 0x90000000)
+	if ((adrp_instruction & 0x9F000000) != 0x90000000) return false;
+	// Verify LDRB unsigned offset (mask: 0xFFC00000, value: 0x39400000)
+	if ((ldrb_instruction & 0xFFC00000) != 0x39400000) return false;
+
+	// Decode ADRP: PC-relative page address
+	// immlo = bits [30:29], immhi = bits [23:5]
+	uint64_t immlo = (adrp_instruction >> 29) & 0x3;
+	uint64_t immhi = (adrp_instruction >> 5) & 0x7FFFF;
+	int64_t imm = (int64_t)((immhi << 2) | immlo) << 12;
+	// Sign-extend from 33 bits
+	if (imm & (1ULL << 32))
+		imm |= ~((1ULL << 33) - 1);
+
+	uint64_t adrp_page = (adrp_offset & ~0xFFF) + imm;
+
+	// Decode LDRB (unsigned offset): pageoff = imm12 (bits [21:10]), no shift for byte access
+	uint64_t ldrb_imm12 = (ldrb_instruction >> 10) & 0xFFF;
+
+	result = adrp_page + ldrb_imm12;
+	return true;
+}
+
 auto OffsetFinder::determineOffsets() -> bool {
 	// byte patterns in hex for the functions we need to find.
 	const std::vector<unsigned char> exportsFetch = {0x62, 0x06, 0x40, 0xF9, 0x63, 0x12, 0x40, 0xB9 };
 	const std::vector<unsigned char> svcCall = { 0xB0, 0x18, 0x80, 0xD2, 0x01, 0x10, 0x00, 0xD4, 0xE1, 0x37, 0x9F, 0x9A, 0xC0, 0x03, 0x5F, 0xD6 };
-	const std::vector<unsigned char> disableAot = { 0x88, 0x00, 0x00, 0x36, 0x21, 0x00, 0x80, 0x52, 0xC0, 0x02, 0x80, 0x52 };
 	// For svc_call we need to check where this bitpattern starts in the code and also where it ends (we can just add 0xC to the start to get the end)
 
 	// Load rosetta runtime into an ifstream
@@ -71,60 +103,78 @@ auto OffsetFinder::determineOffsets() -> bool {
 		return false;
 	}
 
-	// Do the search and store the results
-	std::vector<std::uint64_t> results;
-	for (const auto offset : { exportsFetch, svcCall, disableAot }) {
-		const std::boyer_moore_searcher searcher(offset.begin(), offset.end());
+	// Search for exportsFetch pattern
+	{
+		const std::boyer_moore_searcher searcher(exportsFetch.begin(), exportsFetch.end());
 		const auto it = std::search(buffer.begin(), buffer.end(), searcher);
 		if (it == buffer.end()) {
-			fprintf(stderr, "Offset not found in rosetta runtime binary\n");
-			results.push_back(-1);
-		} else {
-			results.push_back((std::uint64_t)std::distance(buffer.begin(), it));
+			fprintf(stderr, "exportsFetch pattern not found in rosetta runtime binary\n");
+			return false;
+		}
+		offsetExportsFetch_ = (std::uint64_t)std::distance(buffer.begin(), it);
+	}
+
+	// Search for svcCall pattern
+	{
+		const std::boyer_moore_searcher searcher(svcCall.begin(), svcCall.end());
+		const auto it = std::search(buffer.begin(), buffer.end(), searcher);
+		if (it == buffer.end()) {
+			fprintf(stderr, "svcCall pattern not found in rosetta runtime binary\n");
+			return false;
+		}
+		offsetSvcCallEntry_ = (std::uint64_t)std::distance(buffer.begin(), it);
+		offsetSvcCallRet_ = offsetSvcCallEntry_ + 0xC;
+	}
+
+	// Find g_disable_aot address.
+	// Strategy 1 (macOS 26.0): search for TBZ+MOV+MOV pattern, ADRP+LDRB is 8 bytes before.
+	// Strategy 2 (macOS 26.4+): search for MOV W1,#1 + MOV W0,#0x16, scan nearby for ADRP+LDRB.
+	bool foundDisableAot = false;
+
+	// Strategy 1: old pattern (TBZ W8, #0 + MOV W1, #1 + MOV W0, #0x16)
+	const std::vector<unsigned char> disableAotOld = { 0x88, 0x00, 0x00, 0x36, 0x21, 0x00, 0x80, 0x52, 0xC0, 0x02, 0x80, 0x52 };
+	{
+		const std::boyer_moore_searcher searcher(disableAotOld.begin(), disableAotOld.end());
+		const auto it = std::search(buffer.begin(), buffer.end(), searcher);
+		if (it != buffer.end()) {
+			uint64_t patternOffset = (std::uint64_t)std::distance(buffer.begin(), it);
+			uintptr_t result;
+			if (patternOffset >= 8 && decodeAdrpLdrb(buffer, patternOffset - 8, result)) {
+				offsetDisableAot_ = result;
+				foundDisableAot = true;
+			}
 		}
 	}
 
-	// If we've stored -1 in any offset, error out and fall back to non-accelerated x87 handles.
-	if ((int)results[0] <= -1 || (int)results[1] <= -1 || (int)results[2] <= -1) {
-		fprintf(stderr, "Problem searching rosetta runtime to determine offsets automatically.\nFalling back to macOS 26 defaults (This WILL crash your app if they are not correct!)\n");
-		return false;
+	// Strategy 2: search for MOV W1,#1 + MOV W0,#0x16 and scan nearby for ADRP+LDRB
+	if (!foundDisableAot) {
+		const std::vector<unsigned char> movPair = { 0x21, 0x00, 0x80, 0x52, 0xC0, 0x02, 0x80, 0x52 };
+		const std::boyer_moore_searcher searcher(movPair.begin(), movPair.end());
+		auto it = std::search(buffer.begin(), buffer.end(), searcher);
+		while (it != buffer.end() && !foundDisableAot) {
+			uint64_t movOffset = (uint64_t)std::distance(buffer.begin(), it);
+			// Scan both before (-12, -8) and after (+8, +12, +16, +20) the MOV pair
+			for (int32_t scan : {-12, -8, 8, 12, 16, 20}) {
+				int64_t checkOffset = (int64_t)movOffset + scan;
+				if (checkOffset < 0 || (uint64_t)checkOffset + 8 > buffer.size()) continue;
+				uintptr_t result;
+				if (decodeAdrpLdrb(buffer, (uint64_t)checkOffset, result)) {
+					// Sanity check: g_disable_aot should be in BSS (high offset, > 0x30000)
+					if (result > 0x30000) {
+						offsetDisableAot_ = result;
+						foundDisableAot = true;
+						break;
+					}
+				}
+			}
+			it = std::search(it + 1, buffer.end(), searcher);
+		}
 	}
 
-	// Set the offsets to the results that we've found now that we know they're "correct".
-	offsetExportsFetch_ = results[0];
-	offsetSvcCallEntry_ = results[1];
-	offsetSvcCallRet_ = offsetSvcCallEntry_ + 0xC;
-	
-	// extract the g_disable_aot offset from the disableAot pattern
-	/*
-
-	__text:0000000000019130 08 01 00 D0                             ADRP            X8, #g_disable_aot@PAGE
-	__text:0000000000019134 08 F1 49 39                             LDRB            W8, [X8,#g_disable_aot@PAGEOFF]	#
-
-	// __bss:000000000003B27C expected
-	*/
-	uint32_t adrp_offset = results[2] - 0x08;
-
-	uint32_t adrp_instruction = reinterpret_cast<uint32_t*>(&buffer.data()[adrp_offset])[0];
-	uint32_t ldrb_instruction = reinterpret_cast<uint32_t*>(&buffer.data()[adrp_offset + 4])[0];
-
-	// Decode ADRP: PC-relative page address
-	// immlo = bits [30:29], immhi = bits [23:5]
-	uint64_t immlo = (adrp_instruction >> 29) & 0x3;
-	uint64_t immhi = (adrp_instruction >> 5) & 0x7FFFF;
-	int64_t imm = (int64_t)((immhi << 2) | immlo) << 12;
-	// Sign-extend from 33 bits
-	if (imm & (1ULL << 32))
-		imm |= ~((1ULL << 33) - 1);
-
-	uint64_t adrp_page = (adrp_offset & ~0xFFF) + imm;
-
-	// Decode LDRB (unsigned offset): pageoff = imm12 (bits [21:10]), no shift for byte access
-	uint64_t ldrb_imm12 = (ldrb_instruction >> 10) & 0xFFF;
-
-	uintptr_t disable_aot_offset = adrp_page + ldrb_imm12;
-
-	offsetDisableAot_ = disable_aot_offset;
+	if (!foundDisableAot) {
+		fprintf(stderr, "Warning: could not determine g_disable_aot offset, using default 0x%llx\n",
+				(unsigned long long)offsetDisableAot_);
+	}
 
 	return true;
 }
