@@ -39,19 +39,16 @@ bool x87_cache_active(TranslationResult* tr) {
 
 uint32_t x87_cache_pinned_mask(TranslationResult* tr) {
     uint32_t mask = 0;
-    if (tr->x87_cache_base_gpr >= 0)
+    if (tr->x87_cache_gprs_valid) {
         mask |= (1u << tr->x87_cache_base_gpr);
-    if (tr->x87_cache_top_gpr >= 0)
         mask |= (1u << tr->x87_cache_top_gpr);
-    if (tr->x87_cache_st_base_gpr >= 0)
         mask |= (1u << tr->x87_cache_st_base_gpr);
+    }
     return mask;
 }
 
 void x87_cache_invalidate(TranslationResult* tr) {
-    tr->x87_cache_base_gpr = -1;
-    tr->x87_cache_top_gpr = -1;
-    tr->x87_cache_st_base_gpr = -1;
+    tr->x87_cache_gprs_valid = 0;
     tr->x87_cache_top_dirty = 0;
     tr->x87_cache_run_remaining = 0;
 }
@@ -65,9 +62,7 @@ void x87_cache_tick(TranslationResult* tr) {
     if (tr->x87_cache_run_remaining > 0) {
         tr->x87_cache_run_remaining--;
         if (tr->x87_cache_run_remaining == 0) {
-            tr->x87_cache_base_gpr = -1;
-            tr->x87_cache_top_gpr = -1;
-            tr->x87_cache_st_base_gpr = -1;
+            tr->x87_cache_gprs_valid = 0;
             tr->x87_cache_top_dirty = 0;
         }
     }
@@ -80,7 +75,7 @@ void x87_cache_tick(TranslationResult* tr) {
 // in a run, or singleton), allocates pool slots 0+1 and emits the full
 // ADD + LDRH + UBFX sequence.
 static auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<int, int> {
-    if (a1.x87_cache_run_remaining > 0 && a1.x87_cache_base_gpr >= 0) {
+    if (a1.x87_cache_run_remaining > 0 && a1.x87_cache_gprs_valid) {
         // Cache HIT — registers already hold Xbase and TOP.
         return {a1.x87_cache_base_gpr, a1.x87_cache_top_gpr};
     }
@@ -104,6 +99,7 @@ static auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<
         emit_add_imm(buf, /*is_64bit=*/1, /*is_sub=*/0, /*is_set_flags=*/0,
                      /*shift=*/0, kX87RegFileOff, Xbase, Xst_base);
         a1.x87_cache_st_base_gpr = static_cast<int8_t>(Xst_base);
+        a1.x87_cache_gprs_valid = 1;
     }
 
     return {Xbase, Wd_top};
@@ -111,7 +107,7 @@ static auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<
 
 // Returns the cached &st[0] pointer register, or -1 if not preloaded.
 static int x87_get_st_base(TranslationResult& a1) {
-    return a1.x87_cache_st_base_gpr;
+    return a1.x87_cache_gprs_valid ? a1.x87_cache_st_base_gpr : -1;
 }
 
 static void x87_end(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, int Wd_top,
@@ -132,18 +128,17 @@ static void x87_end(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, int 
 
 static void x87_cache_force_release(TranslationResult& a1, AssemblerBuffer& buf) {
     // OPT-C: flush deferred writeback using the cached registers
-    if (a1.x87_cache_top_dirty && a1.x87_cache_base_gpr >= 0) {
+    if (a1.x87_cache_top_dirty && a1.x87_cache_gprs_valid) {
         const int tmp = alloc_gpr(a1, 2);  // pool slot 2 is free here
         emit_store_top(buf, a1.x87_cache_base_gpr, a1.x87_cache_top_gpr, tmp);
         free_gpr(a1, tmp);
         a1.x87_cache_top_dirty = 0;
     }
-    if (a1.x87_cache_base_gpr >= 0)
+    if (a1.x87_cache_gprs_valid) {
         a1.free_gpr_mask |= (1u << a1.x87_cache_base_gpr);
-    if (a1.x87_cache_top_gpr >= 0)
         a1.free_gpr_mask |= (1u << a1.x87_cache_top_gpr);
-    if (a1.x87_cache_st_base_gpr >= 0)
         a1.free_gpr_mask |= (1u << a1.x87_cache_st_base_gpr);
+    }
     x87_cache_invalidate(&a1);
 }
 
@@ -1449,7 +1444,7 @@ auto translate_fstsw(TranslationResult* a1, IRInstr* a2) -> void {
     // OPT-1: fstsw only needs Xbase, not TOP.  Use the cache for Xbase if
     // active; allocate Wd_sw from the free pool (not pool slot 1, which is
     // pinned for TOP when the cache is active).
-    const bool base_cached = (a1->x87_cache_run_remaining > 0 && a1->x87_cache_base_gpr >= 0);
+    const bool base_cached = (a1->x87_cache_run_remaining > 0 && a1->x87_cache_gprs_valid);
     int Xbase;
     if (base_cached) {
         Xbase = a1->x87_cache_base_gpr;

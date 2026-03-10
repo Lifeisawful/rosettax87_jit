@@ -88,13 +88,17 @@ struct TranslationResult {
     uint64_t field_280;
 
     // ── OPT-1: Per-instance x87 base/TOP register cache ────────────────────────
-    int8_t x87_cache_base_gpr = -1;
-    int8_t x87_cache_top_gpr = -1;
-    int16_t x87_cache_run_remaining = 0;
-    int8_t x87_cache_st_base_gpr = -1;  // GPR holding &st[0] = Xbase + 8 for scaled addressing
-    int8_t x87_cache_top_dirty = 0;     // OPT-C: 1 = push skipped store_top, TOP in memory stale
-    int8_t _x87_pad[2] = {};            // padding
-    IRBlock* x87_cache_prev_block = nullptr;
+    // NOTE: All fields zero-initialise correctly (struct is memset to 0).
+    //       x87_cache_gprs_valid == 0 means base/top/st_base GPR numbers are
+    //       meaningless; the cache is inactive.  Set to 1 when GPRs are assigned.
+    int8_t x87_cache_base_gpr;
+    int8_t x87_cache_top_gpr;
+    int16_t x87_cache_run_remaining;
+    int8_t x87_cache_st_base_gpr;  // GPR holding &st[0] = Xbase + 8 for scaled addressing
+    int8_t x87_cache_top_dirty;    // OPT-C: 1 = push skipped store_top, TOP in memory stale
+    int8_t x87_cache_gprs_valid;   // 1 = base/top/st_base GPR numbers are meaningful
+    int8_t _x87_pad[1];            // padding
+    IRBlock* x87_cache_prev_block;
 };
 
 // sizeof changed from 0x288 due to OPT-1 cache fields appended at end.
