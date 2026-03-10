@@ -2444,7 +2444,9 @@ static bool is_handled_x87(uint16_t op) {
         case kOpcodeName_fstp:
         case kOpcodeName_fstp_stack:
         case kOpcodeName_fstsw:
-        // case kOpcodeName_fcom:  case kOpcodeName_fcomp: case kOpcodeName_fcompp:
+        case kOpcodeName_fcom:
+        case kOpcodeName_fcomp:
+        case kOpcodeName_fcompp:
         case kOpcodeName_fucom:
         case kOpcodeName_fucomp:
         case kOpcodeName_fucompp:
