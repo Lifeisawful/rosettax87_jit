@@ -21,71 +21,85 @@
 //          i.e. the top bits identify the element size, low bits the run length
 //
 // Returns false if value cannot be represented as a logical immediate.
-
+// Reimplemented from the original Rosetta binary at 0x1f18
+// Faithfully matches the disassembly logic.
 bool is_bitmask_immediate(bool is_64bit, uint64_t value, LogicalImmEncoding& out) {
-    // All-zeros and all-ones are not encodable (no immediate form exists)
+    unsigned int element_size;
+
     if (is_64bit) {
-        if (value == 0 || value == ~0ULL)
+        // value + 1 < 2  means value == 0 or value == 0xFFFFFFFFFFFFFFFF
+        if (value + 1 < 2)
             return false;
+        element_size = 64;
     } else {
-        uint32_t v32 = (uint32_t)value;
-        if (v32 == 0 || v32 == ~0U)
+        // 32-bit: truncate, then same check
+        if ((uint32_t)(value + 1) < 2)
             return false;
-        value = v32;
+        value = (uint32_t)value;
+        element_size = 32;
     }
 
-    // ── Step 1: find the smallest element size that tiles value ──────────────
-    // Start at full width (64 or 32) and halve until the upper half != lower half.
-    // When value == (value >> half) XOR'd low bits, the pattern repeats at that size.
-    uint32_t element_size = is_64bit ? 64 : 32;
-    while (element_size > 2) {
-        uint32_t half = element_size / 2;
-        uint64_t mask = ~(~0ULL << half);  // mask for lower half
-        if (((value ^ (value >> half)) & mask) != 0)
-            break;            // upper half differs → this is our element size
-        element_size = half;  // pattern repeats, try smaller
+    // Step 1: find smallest repeating element size (halve while pattern repeats)
+    do {
+        unsigned int half = element_size >> 1;
+        element_size &= ~1u;  // clear low bit (no-op for powers of 2 >= 4)
+
+        uint64_t mask = ~(0xFFFFFFFFFFFFFFFFULL << half);
+        if (((value >> half) ^ value) & mask) {
+            // Upper and lower halves differ — this is our element size
+            break;
+        }
+        element_size = half;
+    } while (element_size > 2);
+
+    // Step 2: isolate one element
+    uint64_t element_mask =
+        0xFFFFFFFFFFFFFFFFULL >> (-(char)element_size);  // same as >> (64 - element_size)
+    uint64_t element = element_mask & value;
+
+    uint8_t rotation;
+    uint8_t run_len;
+
+    if (element != 0) {
+        // Check if element is a contiguous run of 1s:
+        //   (filled + 1) & filled == 0   where filled = (element - 1) | element
+        uint64_t filled = (element - 1) | element;
+        if (((filled + 1) & filled) == 0) {
+            // Yes, contiguous 1s — count trailing zeros for rotation, then run length
+            rotation = (uint8_t)__builtin_ctzll(element);                // RBIT+CLZ
+            run_len = (uint8_t)__builtin_ctzll(~(element >> rotation));  // length of 1-run
+            goto encode;
+        }
     }
 
-    // ── Step 2: isolate one element and check it's a contiguous run of 1s ───
-    uint64_t element_mask = ~0ULL >> (64 - element_size);
-    uint64_t element = value & element_mask;
-
-    uint32_t run_len, rotation;
-
-    if (element != 0 && (element & (element - 1)) == 0 ||  // single bit — valid run
-        ((element | (element - 1)) + 1) & (element | (element - 1))) {
-        // element is NOT a contiguous run of 1s — try interpreting as run of 0s
-        // (equivalent: rotate so the 0s form the run, then adjust)
-        uint64_t zeros = element_mask & ~element;
+    // Not a contiguous run of 1s — try the complement (run of 0s)
+    {
+        uint64_t zeros = element_mask & ~value;
         if (zeros == 0)
             return false;
-        if (((zeros | (zeros - 1)) + 1) & (zeros | (zeros - 1)))
-            return false;  // zeros aren't contiguous either → not encodable
 
-        // Count trailing zeros to find rotation, count run of zeros for length
-        uint32_t tz = __builtin_ctzll(zeros);           // trailing zeros = rotation point
-        uint32_t oz = __builtin_ctzll(~(zeros >> tz));  // length of zero run
-        run_len = element_size - oz;
-        rotation = (element_size - tz) & (element_size - 1);
-    } else {
-        if (element == 0)
+        // Check if zeros is a contiguous run of 1s
+        uint64_t filled_z = (zeros - 1) | zeros;
+        if (((filled_z + 1) & filled_z) != 0)
             return false;
-        // Count trailing zeros for rotation, leading zeros in shifted value for run length
-        uint32_t tz = __builtin_ctzll(element);           // trailing 0s before the run
-        uint32_t ol = __builtin_ctzll(~(element >> tz));  // length of 1-run
-        run_len = ol;
-        rotation = (element_size - tz) & (element_size - 1);
+
+        // zeros is contiguous — decode rotation and run length
+        // Uses CLZ (not CTZ) — different from the 1s path
+        int lz = __builtin_clzll(zeros);                          // leading zeros
+        rotation = (uint8_t)(64 - lz);                            // position of highest set bit + 1
+        int tz = __builtin_clzll(__builtin_bitreverse64(zeros));  // trailing zeros via RBIT+CLZ
+        run_len = (uint8_t)(lz + tz - (64 - element_size));
     }
 
-    // ── Step 3: encode (N, immr, imms) ───────────────────────────────────────
-    // imms = ~(element_size - 1) | (run_len - 1), masked to 6 bits
-    //   the upper bits of imms encode element size: 64→0b111111x, 32→0b11111x, etc.
-    //   the lower bits encode run_length - 1
-    uint8_t imms_size_field = (uint8_t)(0xFE * element_size);  // ~(element_size-1) << 1
-    out.imms = (imms_size_field | (run_len - 1)) & 0x3F;
-    out.N = (imms_size_field & 0x40) == 0;  // N=1 only when element_size==64
-    // out.immr = (uint8_t)((element_size - rotation) & (element_size - 1));
-    out.immr = (uint8_t)(rotation);
+encode:
+    // Assertion: rotation must fit within element
+    assert(element_size >= rotation && "i should not exceed the element size");
+
+    // Step 3: encode (N, immr, imms)
+    uint8_t imms_raw = (uint8_t)((run_len - 1) | (uint8_t)(0xFE * element_size));
+    out.N = (imms_raw & 0x40) == 0;
+    out.immr = (uint8_t)((element_size - rotation) & (element_size - 1));
+    out.imms = imms_raw & 0x3F;
     return true;
 }
 
