@@ -29,23 +29,12 @@ auto OffsetFinder::setDefaultOffsets() -> void {
 	offsetTranslateInsn_ = 0x01A654;
 }
 
-/*
-__text:0000000000016720 28 01 00 B0                             ADRP            X8, #g_disable_aot@PAGE
-__text:0000000000016724 08 F1 4F 39                             LDRB            W8, [X8,#g_disable_aot@PAGEOFF]
-__text:0000000000016728 88 00 00 36                             TBZ             W8, #0, loc_16738
-__text:000000000001672C
-__text:000000000001672C                         loc_1672C                               ; CODE XREF: sub_16654+C8↑j
-__text:000000000001672C 21 00 80 52                             MOV             W1, #1
-__text:0000000000016730 C0 02 80 52                             MOV             W0, #0x16
-
-search for 88 00 00 36 21 00 80 52 C0 02 80 52 
-*/
 
 auto OffsetFinder::determineOffsets() -> bool {
 	// byte patterns in hex for the functions we need to find.
 	const std::vector<unsigned char> exportsFetch = {0x62, 0x06, 0x40, 0xF9, 0x63, 0x12, 0x40, 0xB9 };
 	const std::vector<unsigned char> svcCall = { 0xB0, 0x18, 0x80, 0xD2, 0x01, 0x10, 0x00, 0xD4, 0xE1, 0x37, 0x9F, 0x9A, 0xC0, 0x03, 0x5F, 0xD6 };
-	const std::vector<unsigned char> disableAot = { 0x88, 0x00, 0x00, 0x36, 0x21, 0x00, 0x80, 0x52, 0xC0, 0x02, 0x80, 0x52 };
+	const std::vector<unsigned char> disableAot = { 0x00, 0xD0, 0x29, 0x00, 0x80, 0x52 }; // ADRP + STRB pattern for g_disable_aot global variable
 	// For svc_call we need to check where this bitpattern starts in the code and also where it ends (we can just add 0xC to the start to get the end)
 
 	// Load rosetta runtime into an ifstream
@@ -97,16 +86,17 @@ auto OffsetFinder::determineOffsets() -> bool {
 	
 	// extract the g_disable_aot offset from the disableAot pattern
 	/*
+	00 D0 29 00 80 52
 
-	__text:0000000000019130 08 01 00 D0                             ADRP            X8, #g_disable_aot@PAGE
-	__text:0000000000019134 08 F1 49 39                             LDRB            W8, [X8,#g_disable_aot@PAGEOFF]	#
-
-	// __bss:000000000003B27C expected
+	26.4 beta
+	__text:000000000000D110 68 01 00 D0                 ADRP            X8, #disable_aot@PAGE
+	__text:000000000000D114 29 00 80 52                 MOV             W9, #1
+	__text:000000000000D118 09 F1 0F 39                 STRB            W9, [X8,#disable_aot@PAGEOFF]
 	*/
-	uint32_t adrp_offset = results[2] - 0x08;
+	uint32_t adrp_offset = results[2] - 0x02;
 
 	uint32_t adrp_instruction = reinterpret_cast<uint32_t*>(&buffer.data()[adrp_offset])[0];
-	uint32_t ldrb_instruction = reinterpret_cast<uint32_t*>(&buffer.data()[adrp_offset + 4])[0];
+	uint32_t strb_instruction = reinterpret_cast<uint32_t*>(&buffer.data()[adrp_offset + 8])[0];
 
 	// Decode ADRP: PC-relative page address
 	// immlo = bits [30:29], immhi = bits [23:5]
@@ -120,9 +110,8 @@ auto OffsetFinder::determineOffsets() -> bool {
 	uint64_t adrp_page = (adrp_offset & ~0xFFF) + imm;
 
 	// Decode LDRB (unsigned offset): pageoff = imm12 (bits [21:10]), no shift for byte access
-	uint64_t ldrb_imm12 = (ldrb_instruction >> 10) & 0xFFF;
-
-	uintptr_t disable_aot_offset = adrp_page + ldrb_imm12;
+	uint64_t strb_imm12 = (strb_instruction >> 10) & 0xFFF;
+	uintptr_t disable_aot_offset = adrp_page + strb_imm12;
 
 	offsetDisableAot_ = disable_aot_offset;
 
@@ -133,30 +122,6 @@ auto OffsetFinder::determineOffsets() -> bool {
 auto OffsetFinder::determineRuntimeOffsets() -> bool {
 	const std::vector<unsigned char> translation_result_size_pattern = { 0x01, 0x4D, 0x80, 0x52 };
 	const std::vector<unsigned char> translation_pattern = { 0xFF, 0x43, 0x03, 0xD1, 0xFC, 0x6F, 0x07, 0xA9, 0xfa, 0x67, 0x08, 0xa9, 0xF8, 0x5F, 0x09, 0xA9, 0xF6, 0x57, 0x0A, 0xA9, 0xF4, 0x4F, 0x0B, 0xA9, 0xFD, 0x7B, 0x0C, 0xA9, 0xFD, 0x03, 0x03, 0x91, 0xF3, 0x03, 0x00, 0xAA };
-
-	#if 0
-	std::ifstream file{"/Library/Apple/usr/libexec/oah/libRosettaRuntime", std::ios::binary};
-	if (!file) {
-		fprintf(stderr, "Problem accessing rosetta libRosettaRuntime to determine runtime offsets automatically.\n");
-		return false;
-	}
-	
-	// Determine size of rosetta runtime file
-	file.seekg(0, std::ios::end);
-	std::streampos size = file.tellg();
-	file.seekg(0, std::ios::beg);
-
-	// Set our buffer to the size of the file
-	std::vector<unsigned char> buffer(size);
-
-	// read into the buffer
-	if (!file.read(reinterpret_cast<char *>(buffer.data()), size)) {
-		fprintf(stderr, "Problem reading libRosettaRuntime to determine runtime offsets automatically.\n");
-		return false;
-	}
-
-
-	#endif
 
 	MachoLoader libRosettaRuntimeLoader;
 	if (!libRosettaRuntimeLoader.open("/Library/Apple/usr/libexec/oah/libRosettaRuntime")) {
