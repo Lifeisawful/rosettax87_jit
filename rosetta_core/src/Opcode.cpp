@@ -1,6 +1,6 @@
 #include "rosetta_core/Opcode.h"
 
-std::array<const char*, 0x298> kOpcodeNames = {
+std::array<const char*, 0x29c> kOpcodeNames = {
     "aaa",
     "aad",
     "aam",
@@ -662,7 +662,11 @@ std::array<const char*, 0x298> kOpcodeNames = {
     "wbinv",
     "wrmsr",
     "xchg",
+    "xgetbv",
     "xlat",
     "xorpd",
     "xorps",
+    "xrstor",
+    "xsave",
+    "xsetbv",
 };
