@@ -163,15 +163,20 @@ static void x87_push(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int
 
 // Pop: emit_store_top inside emit_x87_pop writes the correct current TOP
 // via BFI regardless of what was in memory, so dirty is cleared.
+// Wd_tmp2 is allocated from the free GPR pool for the tag word RMW.
 static void x87_pop(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
                     int Wd_tmp) {
-    emit_x87_pop(buf, Xbase, Wd_top, Wd_tmp);
+    const int Wd_tmp2 = alloc_free_gpr(a1);
+    emit_x87_pop(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+    free_gpr(a1, Wd_tmp2);
     a1.x87_cache_top_dirty = 0;
 }
 
 static void x87_pop_n(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
                       int Wd_tmp, int n) {
-    emit_x87_pop_n(buf, Xbase, Wd_top, Wd_tmp, n);
+    const int Wd_tmp2 = alloc_free_gpr(a1);
+    emit_x87_pop_n(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2, n);
+    free_gpr(a1, Wd_tmp2);
     a1.x87_cache_top_dirty = 0;
 }
 

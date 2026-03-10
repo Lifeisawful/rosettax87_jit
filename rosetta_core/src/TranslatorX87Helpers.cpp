@@ -295,10 +295,49 @@ void emit_x87_push_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_
 }
 
 // =============================================================================
-// 2i — x87 stack pop  (TOP increment)
+// 2i — x87 stack pop  (TOP increment + tag word set-empty)
+//
+// Mirrors the inverse of emit_x87_push: marks the popped slot as kEmpty
+// (tag bits = 0b11) so that subsequent pushes from the runtime helpers see
+// a free slot and do not raise a stack overflow fault.
+//
+// Sequence:
+//   1. Mark old TOP's tag bits as kEmpty:  tagWord |= (3 << (oldTop * 2))
+//   2. Compute newTop = (oldTop + 1) & 7
+//   3. Write newTop into statusWord[13:11]
+//
+// The tag update is done BEFORE incrementing TOP so that Wd_top still holds
+// oldTop and can be used for the bit position calculation.  Wd_tmp and
+// Wd_tmp2 are scratch registers for the tag word RMW.
+//
+// On return: Wd_top = newTop.  Wd_tmp and Wd_tmp2 are clobbered.
 // =============================================================================
 
-void emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp) {
+void emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2) {
+    // ── tagWord |= (3 << (oldTop * 2))  →  mark popped slot kEmpty ──────────
+
+    // LSL   Wd_tmp2, Wd_top, #1       ; bit_pos = oldTop * 2
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                  /*immr*/ 31, /*imms*/ 30, Wd_top, Wd_tmp2);
+
+    // MOVZ  Wd_tmp, #3                ; mask seed
+    emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp);
+
+    // LSLV  Wd_tmp, Wd_tmp, Wd_tmp2  ; mask = 3 << bit_pos
+    buf.emit(0x1AC02000u | (uint32_t(Wd_tmp2) << 16) | (uint32_t(Wd_tmp) << 5) | uint32_t(Wd_tmp));
+
+    // LDRH  Wd_tmp2, [Xbase, #4]      ; tagWord
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordImm12, Xbase, Wd_tmp2);
+
+    // ORR   Wd_tmp2, Wd_tmp2, Wd_tmp  ; tagWord |= mask  (set kEmpty = 0b11)
+    emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                             /*LSL*/ 0, Wd_tmp, /*shift_amt*/ 0, Wd_tmp2, Wd_tmp2);
+
+    // STRH  Wd_tmp2, [Xbase, #4]      ; write back tagWord
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87TagWordImm12, Xbase, Wd_tmp2);
+
+    // ── Compute newTop = (oldTop + 1) & 7 ────────────────────────────────────
+
     // ADD   Wd_top, Wd_top, #1
     emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
                  /*shift=*/0, 1, Wd_top, Wd_top);
@@ -313,12 +352,52 @@ void emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp) {
 // =============================================================================
 // 2i-fast — x87 fused multi-pop  (TOP += n, single status_word RMW)
 //
-// Combines n pops into a single ADD+AND+store_top sequence (5 insns total),
-// instead of n separate emit_x87_pop calls (5n insns).
-// Saves (n-1)*5 instructions for n>1.  Used by FCOMPP (n=2).
+// Marks n consecutive slots starting from old TOP as kEmpty in the tag word,
+// then increments TOP by n with a single status_word RMW.
+//
+// For n=1, equivalent to emit_x87_pop.  For n=2 (FCOMPP), marks both
+// old ST(0) and old ST(1) as empty.
+//
+// Each popped slot gets its own tag word load-ORR-store pass.  n is small
+// (1–2 in practice) so the extra memory traffic is negligible.
+//
+// On return: Wd_top = newTop.  Wd_tmp and Wd_tmp2 are clobbered.
 // =============================================================================
 
-void emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int n) {
+void emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2, int n) {
+    // ── Mark all n popped slots as kEmpty ─────────────────────────────────────
+
+    for (int i = 0; i < n; i++) {
+        // Compute bit_pos = ((oldTop + i) & 7) * 2 → Wd_tmp2
+        if (i == 0) {
+            // oldTop is already in Wd_top
+            emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                          /*immr*/ 31, /*imms*/ 30, Wd_top, Wd_tmp2);
+        } else {
+            // phys = (oldTop + i) & 7
+            emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                         /*shift=*/0, i, Wd_top, Wd_tmp2);
+            emit_and_imm(buf, /*is_64=*/0, Wd_tmp2,
+                         /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_tmp2);
+            // bit_pos = phys * 2
+            emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                          /*immr*/ 31, /*imms*/ 30, Wd_tmp2, Wd_tmp2);
+        }
+
+        // mask = 3 << bit_pos → Wd_tmp
+        emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp);
+        buf.emit(0x1AC02000u | (uint32_t(Wd_tmp2) << 16) | (uint32_t(Wd_tmp) << 5) |
+                 uint32_t(Wd_tmp));
+
+        // tagWord |= mask  (LDRH, ORR, STRH)
+        emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordImm12, Xbase, Wd_tmp2);
+        emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                                 /*LSL*/ 0, Wd_tmp, /*shift_amt*/ 0, Wd_tmp2, Wd_tmp2);
+        emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87TagWordImm12, Xbase, Wd_tmp2);
+    }
+
+    // ── Compute newTop = (oldTop + n) & 7 ────────────────────────────────────
+
     // ADD   Wd_top, Wd_top, #n
     emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
                  /*shift=*/0, n, Wd_top, Wd_top);

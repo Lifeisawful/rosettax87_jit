@@ -198,10 +198,11 @@ auto emit_x87_push_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_
 // Wd_tmp is scratch for the status_word read-modify-write inside emit_store_top.
 // =============================================================================
 
-auto emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp) -> void;
+auto emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2) -> void;
 
 // Fused multi-pop: TOP += n with a single status_word RMW (OPT-A).
-auto emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int n) -> void;
+auto emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2, int n)
+    -> void;
 
 // =============================================================================
 // 2j — FCMP result → x87 condition codes in status_word
