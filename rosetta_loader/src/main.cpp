@@ -65,28 +65,18 @@ public:
     bool attach(pid_t pid) {
         childPid_ = pid;
         LOG("Attempting to attach to %d\n", childPid_);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        if (ptrace(PT_ATTACH, childPid_, 0, 0) < 0) {
-#pragma clang diagnostic pop
-            perror("ptrace(PT_ATTACH)");
-            return false;
-        }
 
+        // Child already called PT_TRACE_ME, so we are the tracer.
+        // Wait for the child to stop at its execv (SIGTRAP).
         if (!waitForStopped()) {
             return false;
         }
-        LOG("Program stopped due to debugger being attached\n");
+        LOG("Program stopped due to execv\n");
 
-        if (!continueExecution()) {
-            fprintf(stderr, "Failed to continue execution\n");
-            return false;
-        }
         if (task_for_pid(mach_task_self(), childPid_, &taskPort_) != KERN_SUCCESS) {
             fprintf(stderr, "Failed to get task port for pid %d\n", childPid_);
             return false;
         }
-        LOG("Program stopped due to execv into rosetta process.\n");
         LOG("Started debugging process %d using port %d\n", childPid_, taskPort_);
         return true;
     }
