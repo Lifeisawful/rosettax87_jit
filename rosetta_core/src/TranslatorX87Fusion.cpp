@@ -242,7 +242,9 @@ static auto try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRIns
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_st0 = alloc_free_fpr(*a1);
     const int Dd_fld = alloc_free_fpr(*a1);
@@ -411,7 +413,9 @@ static auto try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_val = alloc_free_fpr(*a1);
 
@@ -713,7 +717,9 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
     const int Dd_src = alloc_free_fpr(*a1);
@@ -869,7 +875,9 @@ static auto try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
     const int Dd_st0 = alloc_free_fpr(*a1);
@@ -1037,8 +1045,9 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word.
-        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
+        // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+            x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -1155,8 +1164,9 @@ static auto try_fuse_fld_fcomp(TranslationResult* a1, IRInstr* fld_instr, IRInst
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word.
-        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
+        // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+            x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -1413,8 +1423,9 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word.
-        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
+        // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+            x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -1439,7 +1450,7 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     }
 
     // ── 4d: No push or pop (2 pushes + 2 pops = net zero) ───────────────────
-    // TOP is unchanged; status_word already has correct TOP from x87_flush_top.
+    // TOP is unchanged; memory already has correct TOP (OPT-D or flushed above).
 
     const int consumed = has_fstsw ? 4 : 3;
     x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, consumed);
