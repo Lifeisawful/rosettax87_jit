@@ -84,10 +84,10 @@ check_output() {
     local name="$1"
     local out="$2"
     TOTAL=$((TOTAL + 1))
-    if echo "$out" | grep -qE '^FAIL'; then
+    if echo "$out" | grep -qE 'FAIL'; then
         echo -e "${RED}FAIL${NC}  $name"
         FAILED=$((FAILED + 1))
-        echo "$out" | grep -E '^FAIL' | head -10 | sed 's/^/      /'
+        echo "$out" | grep -E 'FAIL' | head -10 | sed 's/^/      /'
     else
         echo -e "${GREEN}PASS${NC}  $name"
         PASSED=$((PASSED + 1))

@@ -250,10 +250,10 @@ run_one_test() {
         return
     fi
 
-    if echo "$OUT" | grep -qE '^FAIL'; then
+    if echo "$OUT" | grep -qE 'FAIL'; then
         echo -e "  ${RED}FAIL${NC}  $binary_name  [$config_name]"
         FAILED=$(( FAILED + 1 ))
-        echo "$OUT" | grep -E '^FAIL' | head -10 | sed 's/^/        /'
+        echo "$OUT" | grep -E 'FAIL' | head -10 | sed 's/^/        /'
     else
         echo -e "  ${GREEN}PASS${NC}  $binary_name"
         PASSED=$(( PASSED + 1 ))
