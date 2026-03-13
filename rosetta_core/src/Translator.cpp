@@ -54,6 +54,9 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 fused = TranslatorX87::try_fuse_fld_arith_fstp(
                              translation_result, cur_instr, next1, next2) != 0;
                 if (!fused)
+                    fused = TranslatorX87::try_fuse_fld_arith_arithp(
+                                 translation_result, cur_instr, next1, next2) != 0;
+                if (!fused)
                     fused = TranslatorX87::try_fuse_fld_fcomp_fstsw(
                                  translation_result, cur_instr, next1, next2) != 0;
                 if (fused)

@@ -3207,6 +3207,339 @@ int try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
 }
 
 // =============================================================================
+// Peephole: FLD + non-popping arithmetic (memory) + popping arithmetic
+//
+// Recognizes the multiply-accumulate pattern:
+//   FLD  [a]            — push value onto x87 stack
+//   FMUL [b]            — ST(0) *= mem  (non-popping, memory source)
+//   FADDP ST(1),ST(0)   — ST(1) += ST(0); pop
+//
+// Stack: FLD(+1) + arithp(-1) = net 0.  Push-pop cancel.
+// Result: old_ST(0) OP2 (fld_val OP1 arith_mem_val)
+//
+// Returns 1 if fused (3 instructions consumed), 0 otherwise.
+// =============================================================================
+
+int try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
+                               IRInstr* arith_instr, IRInstr* arithp_instr) {
+    // ── 1. Classify the FLD source ───────────────────────────────────────────
+
+    enum FldSource {
+        kFldReg,
+        kFldM32,
+        kFldM64,
+        kFldZero,
+        kFldOne,
+        kFldConst64,
+        kFildM16,
+        kFildM32,
+        kFildM64
+    };
+
+    const auto fld_op = fld_instr->opcode;
+    FldSource fld_src;
+    int fld_reg_depth = 0;
+    uint64_t fld_const_bits = 0;
+
+    switch (fld_op) {
+        case kOpcodeName_fld:
+            if (fld_instr->operands[0].kind == IROperandKind::Register) {
+                fld_src = kFldReg;
+                fld_reg_depth = fld_instr->operands[1].reg.reg.index();
+            } else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
+                fld_src = kFldM32;
+            else if (fld_instr->operands[0].mem.size == IROperandSize::S64)
+                fld_src = kFldM64;
+            else
+                return 0;  // m80 — not fusable
+            break;
+        case kOpcodeName_fild:
+            if (fld_instr->operands[0].mem.size == IROperandSize::S16)
+                fld_src = kFildM16;
+            else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
+                fld_src = kFildM32;
+            else
+                fld_src = kFildM64;
+            break;
+        case kOpcodeName_fldz:
+            fld_src = kFldZero;
+            break;
+        case kOpcodeName_fld1:
+            fld_src = kFldOne;
+            break;
+        case kOpcodeName_fldl2e:
+            fld_src = kFldConst64;
+            fld_const_bits = 0x3FF71547652B82FEULL;
+            break;
+        case kOpcodeName_fldl2t:
+            fld_src = kFldConst64;
+            fld_const_bits = 0x400A934F0979A371ULL;
+            break;
+        case kOpcodeName_fldlg2:
+            fld_src = kFldConst64;
+            fld_const_bits = 0x3FD34413509F79FFULL;
+            break;
+        case kOpcodeName_fldln2:
+            fld_src = kFldConst64;
+            fld_const_bits = 0x3FE62E42FEFA39EFULL;
+            break;
+        case kOpcodeName_fldpi:
+            fld_src = kFldConst64;
+            fld_const_bits = 0x400921FB54442D18ULL;
+            break;
+        default:
+            return 0;
+    }
+
+    // ── 2. Classify the non-popping arithmetic op (memory source) ────────────
+
+    enum ArithOp { kAdd, kSub, kSubR, kMul, kDiv, kDivR };
+
+    const auto arith1_opcode = arith_instr->opcode;
+    ArithOp arith1;
+
+    switch (arith1_opcode) {
+        case kOpcodeName_fadd:
+            arith1 = kAdd;
+            break;
+        case kOpcodeName_fsub:
+            arith1 = kSub;
+            break;
+        case kOpcodeName_fsubr:
+            arith1 = kSubR;
+            break;
+        case kOpcodeName_fmul:
+            arith1 = kMul;
+            break;
+        case kOpcodeName_fdiv:
+            arith1 = kDiv;
+            break;
+        case kOpcodeName_fdivr:
+            arith1 = kDivR;
+            break;
+        default:
+            return 0;
+    }
+
+    // Arithmetic must have a memory source operand (not register form).
+    if (arith_instr->operands[0].kind != IROperandKind::MemRef)
+        return 0;
+
+    // Only f32 or f64 memory operand sizes.
+    const auto arith_size = arith_instr->operands[0].mem.size;
+    if (arith_size != IROperandSize::S32 && arith_size != IROperandSize::S64)
+        return 0;
+
+    // ── 3. Classify the popping arithmetic op ────────────────────────────────
+
+    const auto arith2_opcode = arithp_instr->opcode;
+    ArithOp arith2;
+
+    switch (arith2_opcode) {
+        case kOpcodeName_faddp:
+            arith2 = kAdd;
+            break;
+        case kOpcodeName_fsubp:
+            arith2 = kSub;
+            break;
+        case kOpcodeName_fsubrp:
+            arith2 = kSubR;
+            break;
+        case kOpcodeName_fmulp:
+            arith2 = kMul;
+            break;
+        case kOpcodeName_fdivp:
+            arith2 = kDiv;
+            break;
+        case kOpcodeName_fdivrp:
+            arith2 = kDivR;
+            break;
+        default:
+            return 0;
+    }
+
+    // Must target ST(1) — that's old_ST(0) after the FLD push.
+    if (arithp_instr->operands[0].reg.reg.index() != 1)
+        return 0;
+
+    // ── 4. Emit fused code ──────────────────────────────────────────────────
+    //
+    // Net effect:  ST(0) = old_ST(0) OP2 (fld_val OP1 arith_mem_val)
+    // No TOP change — push and pop cancel.
+    //
+    // Strategy:
+    //   (a) materialise fld_value → Dd_fld
+    //   (b) load arith memory operand → Dd_mem
+    //   (c) OP1: Dd_fld = Dd_fld OP1 Dd_mem
+    //   (d) load old_ST(0) → Dd_st0 (last, so Wd_tmp retains key for store)
+    //   (e) OP2: Dd_st0 = Dd_st0 OP2 Dd_fld
+    //   (f) store result via emit_store_st_at_offset
+
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    // OPT-D: The fused instruction has net 0 stack effect (internal push-pop
+    // cancel).  If a prior push left tag_push_pending + top_dirty, preserve
+    // those flags — a subsequent FSTP can cancel the push's tag work entirely.
+    // Only flush if those conditions are NOT met (i.e., no pending cancel).
+    if (!(a1->x87_tag_push_pending && a1->x87_cache_top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+    const int Dd_fld = alloc_free_fpr(*a1);
+    const int Dd_mem = alloc_free_fpr(*a1);
+    const int Dd_st0 = alloc_free_fpr(*a1);
+
+    // ── 4a: Materialise FLD value → Dd_fld ──────────────────────────────────
+
+    switch (fld_src) {
+        case kFldReg:
+            emit_load_st(buf, Xbase, Wd_top, fld_reg_depth, Wd_tmp, Dd_fld, Xst_base);
+            break;
+        case kFldM32: {
+            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
+            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
+            emit_fldr_imm(buf, /*size=*/2 /*S*/, Dd_fld, addr, 0);
+            free_gpr(*a1, addr);
+            emit_fcvt_s_to_d(buf, Dd_fld, Dd_fld);
+            break;
+        }
+        case kFldM64: {
+            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
+            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
+            emit_fldr_imm(buf, /*size=*/3 /*D*/, Dd_fld, addr, 0);
+            free_gpr(*a1, addr);
+            break;
+        }
+        case kFildM16:
+        case kFildM32:
+        case kFildM64: {
+            const int Wd_int = alloc_free_gpr(*a1);
+            const int addr =
+                compute_operand_address(*a1, /*is_64bit=*/true, &fld_instr->operands[0], GPR::XZR);
+            if (fld_src == kFildM16) {
+                emit_ldr_str_imm(buf, 1, 0, 1, 0, addr, Wd_int);     // LDRH
+                emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);  // SXTH
+            } else if (fld_src == kFildM32) {
+                emit_ldr_str_imm(buf, 2, 0, 1, 0, addr, Wd_int);  // LDR W
+            } else {
+                emit_ldr_str_imm(buf, 3, 0, 1, 0, addr, Wd_int);  // LDR X
+            }
+            free_gpr(*a1, addr);
+            const int is_64 = (fld_src == kFildM64) ? 1 : 0;
+            emit_scvtf(buf, is_64, 1 /*f64*/, Dd_fld, Wd_int);
+            free_gpr(*a1, Wd_int);
+            break;
+        }
+        case kFldZero:
+            emit_movi_d_zero(buf, Dd_fld);
+            break;
+        case kFldOne:
+            emit_fmov_d_one(buf, Dd_fld);
+            break;
+        case kFldConst64: {
+            const uint16_t h3 = (uint16_t)(fld_const_bits >> 48);
+            const uint16_t h2 = (uint16_t)(fld_const_bits >> 32);
+            const uint16_t h1 = (uint16_t)(fld_const_bits >> 16);
+            const uint16_t h0 = (uint16_t)(fld_const_bits);
+            emit_movn(buf, 1, 2, 3, h3, Wd_tmp);
+            if (h2)
+                emit_movn(buf, 1, 3, 2, h2, Wd_tmp);
+            if (h1)
+                emit_movn(buf, 1, 3, 1, h1, Wd_tmp);
+            if (h0)
+                emit_movn(buf, 1, 3, 0, h0, Wd_tmp);
+            emit_fmov_x_to_d(buf, Dd_fld, Wd_tmp);
+            break;
+        }
+    }
+
+    // ── 4b: Load arithmetic memory operand → Dd_mem ─────────────────────────
+
+    {
+        const bool arith_is_f32 = (arith_size == IROperandSize::S32);
+        const bool a64 = (arith_instr->operands[0].mem.addr_size == IROperandSize::S64);
+        const int addr = compute_operand_address(*a1, a64, &arith_instr->operands[0], GPR::XZR);
+        emit_fldr_imm(buf, arith_is_f32 ? 2 : 3, Dd_mem, addr, 0);
+        free_gpr(*a1, addr);
+        if (arith_is_f32)
+            emit_fcvt_s_to_d(buf, Dd_mem, Dd_mem);
+    }
+
+    // ── 4c: OP1 — non-popping arith: Dd_fld = Dd_fld OP1 Dd_mem ────────────
+    //
+    // After virtual FLD push, ST(0) = fld_val.
+    // Non-popping arith computes ST(0) = ST(0) OP mem = fld_val OP mem.
+    // For reversed ops: ST(0) = mem OP ST(0) = mem OP fld_val.
+
+    switch (arith1) {
+        case kAdd:
+            emit_fadd_f64(buf, Dd_fld, Dd_fld, Dd_mem);
+            break;
+        case kSub:
+            emit_fsub_f64(buf, Dd_fld, Dd_fld, Dd_mem);
+            break;
+        case kSubR:
+            emit_fsub_f64(buf, Dd_fld, Dd_mem, Dd_fld);
+            break;
+        case kMul:
+            emit_fmul_f64(buf, Dd_fld, Dd_fld, Dd_mem);
+            break;
+        case kDiv:
+            emit_fdiv_f64(buf, Dd_fld, Dd_fld, Dd_mem);
+            break;
+        case kDivR:
+            emit_fdiv_f64(buf, Dd_fld, Dd_mem, Dd_fld);
+            break;
+    }
+
+    free_fpr(*a1, Dd_mem);
+
+    // ── 4d: Load old ST(0) → Dd_st0 (Wd_tmp now holds ST(0) key) ───────────
+
+    const int Wk24 = emit_load_st(buf, Xbase, Wd_top, /*depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+
+    // ── 4e: OP2 — popping arith: Dd_st0 = Dd_st0 OP2 Dd_fld ───────────────
+    //
+    // After virtual FLD push: new_ST(1) = old_ST(0).
+    // F*P ST(1),ST(0) computes f(new_ST(1), new_ST(0)) = f(old_ST(0), intermediate).
+    // For reversed ops: result = f(intermediate, old_ST(0)).
+
+    switch (arith2) {
+        case kAdd:
+            emit_fadd_f64(buf, Dd_st0, Dd_st0, Dd_fld);
+            break;
+        case kSub:
+            emit_fsub_f64(buf, Dd_st0, Dd_st0, Dd_fld);
+            break;
+        case kSubR:
+            emit_fsub_f64(buf, Dd_st0, Dd_fld, Dd_st0);
+            break;
+        case kMul:
+            emit_fmul_f64(buf, Dd_st0, Dd_st0, Dd_fld);
+            break;
+        case kDiv:
+            emit_fdiv_f64(buf, Dd_st0, Dd_st0, Dd_fld);
+            break;
+        case kDivR:
+            emit_fdiv_f64(buf, Dd_st0, Dd_fld, Dd_st0);
+            break;
+    }
+
+    // ── 4f: Store result to ST(0) using key from step 4d ────────────────────
+
+    emit_store_st_at_offset(buf, Xbase, Wk24, Dd_st0, Xst_base);
+
+    free_fpr(*a1, Dd_fld);
+    free_fpr(*a1, Dd_st0);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
+    free_gpr(*a1, Wd_tmp);
+
+    return 1;  // fused — caller consumes 3 instructions
+}
+
+// =============================================================================
 // Peephole: FXCH ST(1) + popping-arithmetic fusion
 //
 // FXCH ST(1) swaps ST(0) and ST(1). When followed by a popping arithmetic op

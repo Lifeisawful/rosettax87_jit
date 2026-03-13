@@ -43,7 +43,7 @@ target_link_options(libRuntimeRosettax87 PRIVATE
     "-static"
     "-nostdlib"
     "-Wl,-segaddr,__TEXT,0x0"
-    "-Wl,-segaddr,__DATA,0x20000"
+    "-Wl,-segaddr,__DATA,0x30000"
     "-Wl,-pagezero_size,0x0"
     "-Wl,-headerpad,0"
     "-Wl,-e,_start"

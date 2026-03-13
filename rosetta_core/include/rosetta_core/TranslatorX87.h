@@ -43,6 +43,13 @@ int try_fuse_fxch_fstp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* fstp
 // post-pop TOP in a single RMW.  Saves ~8-10 ARM64 instructions.
 int try_fuse_fcomp_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRInstr* fstsw_instr);
 
+// ── Peephole fusion: FLD + non-popping arith(mem) + popping arith ────────
+// Recognizes FLD + FMUL/FADD/etc.(mem) + FADDP/FMULP/etc. and emits a single
+// fused multiply-accumulate sequence. Push-pop cancellation (net 0).
+// Returns 1 if the triple was fused (3 instructions consumed), 0 otherwise.
+int try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
+                               IRInstr* arith_instr, IRInstr* arithp_instr);
+
 // ── Peephole fusion: FLD variant + FCOMP/FUCOMP + FNSTSW AX ─────────────
 // Push-pop cancellation + status_word bypass.  Saves ~22-28 ARM64 instructions.
 int try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
