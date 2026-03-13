@@ -36,6 +36,7 @@ ALL_TESTS=(
     test_deep_stack
     test_x87_full
     test_fstpt
+    test_fxam
     test_peephole7
 )
 

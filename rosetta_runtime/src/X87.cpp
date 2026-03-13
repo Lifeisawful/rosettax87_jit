@@ -1601,7 +1601,12 @@ void x87_fxam(X87State* state) {
     }
 
     // Set C3,C2,C0 based on value type
-    if (x87_is_nan(value)) {
+    // NOTE: also check value == 0.0 here because the inline JIT fld path sets
+    // kValid tags for all pushed values (including zero), so kZero may never
+    // be set even for a genuine zero.
+    if (value == 0.0) {
+        state->statusWord |= X87StatusWordFlag::kConditionCode3;  // 100 (zero)
+    } else if (x87_is_nan(value)) {
         state->statusWord |= X87StatusWordFlag::kConditionCode0;  // 001
     } else if (x87_is_inf(value)) {
         state->statusWord |=
