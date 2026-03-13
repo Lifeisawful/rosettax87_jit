@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <unistd.h>
 
 // clang-format off
 #include "rosetta_core/RuntimeLibC.h"
@@ -331,14 +332,14 @@ int rt_printf(const char* fmt, ...) {
     va_start(ap, fmt);
     int r = _vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    _syscall3(SYS_write, 1, (long)buf, r);
+    _syscall3(SYS_write, STDERR_FILENO, (long)buf, r);
     return r;
 }
 
 [[noreturn]] void rt_assert_fail(const char* expr, const char* file, int line) {
     char buf[512];
     int n = rt_snprintf(buf, sizeof(buf), "Assertion failed: %s (%s:%d)\n", expr, file, line);
-    _syscall3(SYS_write, 2 /*stderr*/, (long)buf, n);
+    _syscall3(SYS_write, STDERR_FILENO, (long)buf, n);
     long pid = _syscall3(SYS_getpid, 0, 0, 0);
     _syscall3(SYS_kill, pid, 6 /*SIGABRT*/, 0);
     __builtin_unreachable();
