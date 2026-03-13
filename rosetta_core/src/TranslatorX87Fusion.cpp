@@ -810,7 +810,7 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
 // Peephole: FLD + non-popping ARITH + popping ARITHp fusion
 //
 // The pattern  FLD src / ARITH ST(0),ST(1) / ARITHp ST(1)  appears ~1555+
-// times in WoW 1.12.1 (fld|fmul|faddp alone = 1555).
+// times in a real-world MMO binary (fld|fmul|faddp alone = 1555).
 // After FLD push: ST(0)=fld_value, ST(1)=old_ST(0).
 // Non-popping arith: ST(0) = op1(fld_value, old_ST0).  No stack change.
 // Popping arith (ARITHp ST(1)): ST(1) = op2(old_ST0, intermediate), pop.
@@ -1098,7 +1098,7 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
 // =============================================================================
 // Peephole: FLD + FCOMP/FUCOMP fusion (no FSTSW)
 //
-// The pattern  FLD src / FCOMP ST(1)  appears ~1649 times in WoW 1.12.1.
+// The pattern  FLD src / FCOMP ST(1)  appears ~1649 times in a real-world MMO binary.
 // After FLD push, ST(0)=loaded value and ST(1)=old_ST(0).
 // FCOMP compares ST(0) vs ST(1) and pops.
 // Net stack change: push + pop = zero.

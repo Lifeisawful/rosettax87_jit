@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_benchmarks.sh -- Run x87 benchmarks in 3 configurations and print a comparison table.
 #

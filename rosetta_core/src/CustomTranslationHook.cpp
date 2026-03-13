@@ -26,7 +26,7 @@ int64_t hook_translate_insn(TranslationResult* result, IRBlock* block, IRInstr* 
         Translator::translate_instruction(result, block, instr_array, num_instrs, insn_idx);
 
     if (new_insn_idx.has_value()) {
-        return new_insn_idx.value();
+        return *new_insn_idx;
     }
 #if defined(ROSETTA_RUNTIME)
     static bool reset_executable_flag = false;

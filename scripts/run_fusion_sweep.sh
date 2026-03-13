@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_fusion_sweep.sh -- Systematically test fusion translations and their interaction with opcodes.
 #
@@ -50,6 +50,7 @@ ALL_TESTS=(
     test_peephole5
     test_deep_stack
     test_x87_full
+    test_fstpt
 )
 
 ALL_FUSIONS=(
@@ -93,11 +94,11 @@ OPCODE_TESTS[fldl2t]="test_fld_fst test_fldconst test_x87_full test_peephole4"
 OPCODE_TESTS[fldlg2]="test_fld_fst test_fldconst test_x87_full test_peephole4"
 OPCODE_TESTS[fldln2]="test_fld_fst test_fldconst test_x87_full test_peephole4"
 OPCODE_TESTS[fldpi]="test_fld_fst test_fldconst test_x87_full test_peephole4"
-OPCODE_TESTS[fld]="test_fld_fst test_fld test_fld_m80fp test_x87_full test_deep_stack test_peephole6"
+OPCODE_TESTS[fld]="test_fld_fst test_fld test_fld_m80fp test_x87_full test_deep_stack test_peephole6 test_fstpt"
 OPCODE_TESTS[fild]="test_fld_fst test_fild test_x87_full test_peephole4 test_peephole6"
 OPCODE_TESTS[fst]="test_fld_fst test_x87_full"
 OPCODE_TESTS[fst_stack]="test_fld_fst test_x87_full"
-OPCODE_TESTS[fstp]="test_fld_fst test_fcomp_mem test_x87_full"
+OPCODE_TESTS[fstp]="test_fld_fst test_fcomp_mem test_x87_full test_fstpt"
 OPCODE_TESTS[fstp_stack]="test_fld_fst test_x87_full"
 OPCODE_TESTS[fist]="test_compare_unary test_x87_full"
 OPCODE_TESTS[fistp]="test_fld_fst test_x87_full"
@@ -249,10 +250,10 @@ run_one_test() {
         return
     fi
 
-    if echo "$OUT" | grep -qE '^FAIL'; then
+    if echo "$OUT" | grep -qE 'FAIL'; then
         echo -e "  ${RED}FAIL${NC}  $binary_name  [$config_name]"
         FAILED=$(( FAILED + 1 ))
-        echo "$OUT" | grep -E '^FAIL' | head -10 | sed 's/^/        /'
+        echo "$OUT" | grep -E 'FAIL' | head -10 | sed 's/^/        /'
     else
         echo -e "  ${GREEN}PASS${NC}  $binary_name"
         PASSED=$(( PASSED + 1 ))

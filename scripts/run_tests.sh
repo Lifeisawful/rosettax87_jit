@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_tests.sh -- run all x87 test binaries under native Rosetta and the
 # custom runtime_loader, checking self-reported PASS/FAIL output.
@@ -35,6 +35,7 @@ ALL_TESTS=(
     test_peephole6
     test_deep_stack
     test_x87_full
+    test_fstpt
 )
 
 RED='\033[0;31m'
@@ -83,10 +84,10 @@ check_output() {
     local name="$1"
     local out="$2"
     TOTAL=$((TOTAL + 1))
-    if echo "$out" | grep -qE '^FAIL'; then
+    if echo "$out" | grep -qE 'FAIL'; then
         echo -e "${RED}FAIL${NC}  $name"
         FAILED=$((FAILED + 1))
-        echo "$out" | grep -E '^FAIL' | head -10 | sed 's/^/      /'
+        echo "$out" | grep -E 'FAIL' | head -10 | sed 's/^/      /'
     else
         echo -e "${GREEN}PASS${NC}  $name"
         PASSED=$((PASSED + 1))
