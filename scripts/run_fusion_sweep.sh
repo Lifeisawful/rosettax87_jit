@@ -95,7 +95,7 @@ OPCODE_TESTS[fldl2t]="test_fld_fst test_fldconst test_x87_full test_peephole4"
 OPCODE_TESTS[fldlg2]="test_fld_fst test_fldconst test_x87_full test_peephole4"
 OPCODE_TESTS[fldln2]="test_fld_fst test_fldconst test_x87_full test_peephole4"
 OPCODE_TESTS[fldpi]="test_fld_fst test_fldconst test_x87_full test_peephole4"
-OPCODE_TESTS[fld]="test_fld_fst test_fld test_fld_m80fp test_x87_full test_deep_stack test_peephole6 test_fstpt test_peephole7"
+OPCODE_TESTS[fld]="test_fld_fst test_fld test_fld_m80fp test_x87_full test_deep_stack test_peephole5 test_peephole6 test_fstpt test_peephole7"
 OPCODE_TESTS[fild]="test_fld_fst test_fild test_x87_full test_peephole4 test_peephole6 test_peephole7"
 OPCODE_TESTS[fst]="test_fld_fst test_x87_full"
 OPCODE_TESTS[fst_stack]="test_fld_fst test_x87_full"
@@ -103,7 +103,7 @@ OPCODE_TESTS[fstp]="test_fld_fst test_fcomp_mem test_x87_full test_fstpt test_pe
 OPCODE_TESTS[fstp_stack]="test_fld_fst test_x87_full"
 OPCODE_TESTS[fist]="test_compare_unary test_x87_full"
 OPCODE_TESTS[fistp]="test_fld_fst test_x87_full"
-OPCODE_TESTS[fstsw]="test_fcom test_x87_full test_peephole6 test_peephole7"
+OPCODE_TESTS[fstsw]="test_fcom test_x87_full test_peephole5 test_peephole6 test_peephole7"
 OPCODE_TESTS[fadd]="test_arith test_deep_stack test_peephole6"
 OPCODE_TESTS[faddp]="test_arith test_deep_stack test_peephole6 test_peephole7"
 OPCODE_TESTS[fiadd]="test_arith"
@@ -125,10 +125,10 @@ OPCODE_TESTS[fisubr]="test_arith test_x87_full"
 OPCODE_TESTS[frndint]="test_compare_unary test_x87_full"
 OPCODE_TESTS[fcom]="test_fcom test_fcomp_mem test_x87_full test_deep_stack test_peephole4"
 OPCODE_TESTS[fcomp]="test_fcom test_fcomp_mem test_x87_full test_deep_stack test_peephole6 test_peephole7"
-OPCODE_TESTS[fcompp]="test_fcom test_x87_full"
+OPCODE_TESTS[fcompp]="test_fcom test_x87_full test_peephole5"
 OPCODE_TESTS[fucom]="test_fcom test_x87_full test_deep_stack test_peephole4"
 OPCODE_TESTS[fucomp]="test_fcom test_x87_full test_deep_stack test_peephole6"
-OPCODE_TESTS[fucompp]="test_fcom test_x87_full"
+OPCODE_TESTS[fucompp]="test_fcom test_x87_full test_peephole5"
 OPCODE_TESTS[fcomi]="test_compare_unary test_x87_full"
 OPCODE_TESTS[fcomip]="test_compare_unary test_x87_full"
 OPCODE_TESTS[fucomi]="test_compare_unary test_x87_full"
@@ -184,7 +184,7 @@ done
 if [[ $ALL_TESTS_IN_SWEEPS -eq 1 ]]; then
     SWEEP_TESTS=("${ALL_TESTS[@]}")
 else
-    SWEEP_TESTS=("${SWEEP_TESTS[@]}")
+    SWEEP_TESTS=("${FUSION_TESTS[@]}")
 fi
 
 if [[ $DO_BUILD -eq 1 ]]; then
