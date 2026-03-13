@@ -36,6 +36,7 @@ ALL_TESTS=(
     test_deep_stack
     test_x87_full
     test_fstpt
+    test_peephole7
 )
 
 RED='\033[0;31m'
