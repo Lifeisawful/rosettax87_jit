@@ -21,15 +21,13 @@ cmake -B build
 cmake --build build
 ```
 
-### Sample Test Program
+### Benchmarks
 
-```clang -v -arch x86_64 -mno-sse -mfpmath=387 ./sample/math.c -o ./build/math```
+Benchmarks (in `benchmarks/`) are built automatically as part of the CMake build. Each benchmark targets different x87 instruction patterns.
 
-## Running
-
-Run the target program from the build folder:
+Run any benchmark with the loader:
 ```
-./runtime_loader ./math
+./build/bin/runtime_loader ./build/bin/mmo
 ```
 
 You will see a popup asking you to authorize debugging. Once approved, the process granted debug session.
