@@ -1159,33 +1159,124 @@ auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
     const bool is_fstp = (a2->opcode == kOpcodeName_fstp || a2->opcode == kOpcodeName_fstp_stack);
 
     // -------------------------------------------------------------------------
-    // FST/FSTP m80fp — DB /6, DB /7  (early-out, handed off to runtime routine)
+    // FSTP m80fp — DB /7  (inline double → f80 conversion + store + pop)
     //
-    // Without this guard the S80 operand falls through to the S64 path and
-    // emit_fstr_imm writes only 8 bytes, leaving the 2-byte exponent field at
-    // addr+8 as garbage and producing a completely wrong bit pattern.
+    // Converts the IEEE 754 double in ST(0) to x87 80-bit extended format and
+    // writes the 10-byte result directly to the destination memory address.
+    //
+    // IEEE 754 double:  [63] sign | [62:52] exp (11-bit, bias 1023) | [51:0] mantissa
+    // x87 f80:          bytes 0-7 mantissa (64-bit, explicit integer bit at 63)
+    //                   bytes 8-9 [15] sign | [14:0] exp (15-bit, bias 16383)
+    //
+    // Instruction layout (22 instructions, 3 paths):
+    //   [0-4]   extract sign/exp/mantissa from double bits
+    //   [5-7]   dispatch: CBZ→zero/denorm, B.EQ→inf/nan
+    //   [8-14]  normal: set integer bit, bias-adjust exp, store, B .done
+    //   [15-17] zero/denorm: store zero mantissa + sign, B .done
+    //   [18-21] inf/nan: set integer bit, store, sign|0x7FFF, store
+    //   [22]    .done: pop + end
     // -------------------------------------------------------------------------
     if (a2->operands[0].kind != IROperandKind::Register &&
         a2->operands[0].mem.size == IROperandSize::S80) {
-        // OPT-1: Release any cached base/top GPRs — the BL below clobbers
-        // all scratch registers, and we need pool slot 0 for Xaddr.
-        x87_cache_force_release(*a1, buf);
+        auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+        const int Xst_base = x87_get_st_base(*a1);
+        const int Wd_tmp = alloc_gpr(*a1, 2);   // sign scratch, then pop scratch
+        const int Xbits  = alloc_gpr(*a1, 3);   // raw double bits → f80 mantissa
+        const int Wexp   = alloc_gpr(*a1, 4);   // exponent → f80 exponent word
+        const int Dd_src = alloc_free_fpr(*a1);
 
-        const int Xaddr = alloc_gpr(*a1, 0);
-        const int addr_reg =
+        // Load ST(0) as double
+        emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_src, Xst_base);
+
+        // Compute destination address
+        const int Xaddr =
             compute_operand_address(*a1, /*is_64bit=*/true, &a2->operands[0], GPR::XZR);
-        if (addr_reg != Xaddr)
-            emit_mov_reg(buf, /*is_64bit=*/1, Xaddr, addr_reg);
-        free_gpr(*a1, addr_reg);
 
-        Fixup fixup;
-        fixup.kind = FixupKind::Branch26;
-        fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
-        fixup.target = kRuntimeRoutine_fst_fp80;
-        a1->_fixups.push_back(fixup);
-        a1->insn_buf.emit(0x94000000u);
+        // [0] FMOV Xbits, Dd_src — raw double bits to GPR
+        emit_fmov_d_to_x(buf, Xbits, Dd_src);
+        free_fpr(*a1, Dd_src);
 
+        // [1] UBFX Xexp, Xbits, #52, #11 — extract 11-bit exponent
+        emit_bitfield(buf, /*is_64bit=*/1, /*opc=*/2, /*N=*/1, /*immr=*/52, /*imms=*/62,
+                      Xbits, Wexp);
+
+        // [2] LSR Wd_tmp, Xbits, #48 — shift sign from bit 63 to bit 15
+        emit_bitfield(buf, 1, 2, 1, 48, 63, Xbits, Wd_tmp);
+
+        // [3] AND Wd_tmp, Wd_tmp, #0x8000 — isolate sign at bit 15
+        LogicalImmEncoding enc_sign;
+        is_bitmask_immediate(/*is_64bit=*/false, 0x8000, enc_sign);
+        emit_and_imm(buf, 0, Wd_tmp, enc_sign.N, enc_sign.immr, enc_sign.imms, Wd_tmp);
+
+        // [4] LSL Xbits, Xbits, #11 — position 52-bit mantissa for f80 (bits [63:12])
+        //     UBFM Xd, Xn, #53, #52 is the alias for LSL Xd, Xn, #11
+        emit_bitfield(buf, 1, 2, 1, 53, 52, Xbits, Xbits);
+
+        // [5] CBZ Wexp, .zero_denorm (+10 insns = +40 bytes)
+        buf.emit(0x34000000u | (10u << 5) | uint32_t(Wexp));
+
+        // [6] CMP Wexp, #0x7FF  (SUBS WZR, Wexp, #2047)
+        emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/1, /*is_set_flags=*/1,
+                     /*shift=*/0, /*imm12=*/0x7FF, Wexp, /*Rd=*/31);
+
+        // [7] B.EQ .inf_nan (+11 insns = +44 bytes)
+        buf.emit(0x54000000u | (11u << 5) | 0x0u);
+
+        // ── Normal number ──
+        // [8] ORR Xbits, Xbits, #0x8000000000000000 — set explicit integer bit
+        LogicalImmEncoding enc_intbit;
+        is_bitmask_immediate(/*is_64bit=*/true, 0x8000000000000000ULL, enc_intbit);
+        emit_orr_imm(buf, 1, Xbits, Xbits, enc_intbit.N, enc_intbit.immr, enc_intbit.imms);
+
+        // [9]  ADD Wexp, Wexp, #3, LSL#12  (+12288)
+        emit_add_imm(buf, 0, 0, 0, /*shift=*/1, /*imm12=*/3, Wexp, Wexp);
+        // [10] ADD Wexp, Wexp, #0xC00      (+3072; total +15360 = 16383−1023)
+        emit_add_imm(buf, 0, 0, 0, 0, 0xC00, Wexp, Wexp);
+
+        // [11] ORR Wexp, Wexp, Wd_tmp — combine biased exponent + sign
+        emit_logical_shifted_reg(buf, 0, /*opc=*/1, /*n=*/0, /*shift_type=*/0,
+                                 Wd_tmp, /*shift_amount=*/0, Wexp, Wexp);
+
+        // [12] STR Xbits, [Xaddr] — 8-byte mantissa
+        emit_str_imm(buf, /*size=*/3, Xbits, Xaddr, /*imm12=*/0);
+        // [13] STRH Wexp, [Xaddr, #8] — 2-byte exponent (imm12=4, scaled by 2)
+        emit_str_imm(buf, /*size=*/1, Wexp, Xaddr, /*imm12=*/4);
+
+        // [14] B .done (+8 insns = +32 bytes)
+        buf.emit(0x14000000u | 8u);
+
+        // ── Zero / denormal (treated as ±0.0) ──
+        // [15] STR XZR, [Xaddr] — mantissa = 0
+        emit_str_imm(buf, 3, /*Rt=*/31, Xaddr, 0);
+        // [16] STRH Wd_tmp, [Xaddr, #8] — exponent = sign only
+        emit_str_imm(buf, 1, Wd_tmp, Xaddr, 4);
+        // [17] B .done (+5 insns = +20 bytes)
+        buf.emit(0x14000000u | 5u);
+
+        // ── Infinity / NaN ──
+        // [18] ORR Xbits, Xbits, #0x8000000000000000 — set explicit integer bit
+        emit_orr_imm(buf, 1, Xbits, Xbits, enc_intbit.N, enc_intbit.immr, enc_intbit.imms);
+        // [19] STR Xbits, [Xaddr] — mantissa
+        emit_str_imm(buf, 3, Xbits, Xaddr, 0);
+        // [20] ORR Wexp, Wd_tmp, #0x7FFF — sign | max exponent
+        LogicalImmEncoding enc_7fff;
+        is_bitmask_immediate(/*is_64bit=*/false, 0x7FFF, enc_7fff);
+        emit_orr_imm(buf, 0, Wexp, Wd_tmp, enc_7fff.N, enc_7fff.immr, enc_7fff.imms);
+        // [21] STRH Wexp, [Xaddr, #8] — exponent
+        emit_str_imm(buf, 1, Wexp, Xaddr, 4);
+
+        // ── .done ──
         free_gpr(*a1, Xaddr);
+        free_gpr(*a1, Wexp);
+        free_gpr(*a1, Xbits);
+
+        // Pop (always true for m80fp — there is no non-popping FST m80fp)
+        if (is_fstp)
+            x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+        free_fpr(*a1, Dd_src);
+        x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+        free_gpr(*a1, Wd_tmp);
         return;
     }
 
