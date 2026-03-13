@@ -975,11 +975,18 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     if (fcomp_op != kOpcodeName_fcomp && fcomp_op != kOpcodeName_fucomp)
         return std::nullopt;
 
-    // After FLD push, FCOMP must compare ST(0) vs ST(1) (register form).
-    if (fcomp_instr->operands[0].kind != IROperandKind::Register)
-        return std::nullopt;
-    if (fcomp_instr->operands[1].reg.reg.index() != 1)
-        return std::nullopt;
+    // After FLD push, FCOMP can be:
+    //   Register form: FCOMP ST(0), ST(1)  — compares fld_value vs old_ST(0)
+    //   Memory form:   FCOMP ST(0), m32/m64 — compares fld_value vs memory
+    // Rosetta IR: operands[0] = ST(0) (implicit), operands[1] = comparand.
+    const bool fcomp_is_mem = (fcomp_instr->operands[1].kind != IROperandKind::Register);
+    if (!fcomp_is_mem) {
+        if (fcomp_instr->operands[1].reg.reg.index() != 1)
+            return std::nullopt;
+    } else {
+        if (fcomp_instr->operands[1].mem.size == IROperandSize::S80)
+            return std::nullopt;
+    }
 
     // ── 2. Validate FNSTSW AX ───────────────────────────────────────────────
     if (fstsw_instr->opcode != kOpcodeName_fstsw)
@@ -1002,20 +1009,29 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     const int Wd_tmp = alloc_gpr(*a1, 2);
     const int Wd_tmp2 = alloc_gpr(*a1, 3);
     const int Dd_fld = alloc_free_fpr(*a1);
-    const int Dd_st0 = alloc_free_fpr(*a1);
+    const int Dd_cmp = alloc_free_fpr(*a1);
 
     // ── 4a: Materialise FLD value → Dd_fld ──────────────────────────────────
     emit_fld_value(buf, *a1, cls, fld_instr, Xbase, Wd_top, Wd_tmp, Dd_fld, Xst_base);
 
-    // ── 4b: Load old ST(0) → Dd_st0 ────────────────────────────────────────
-    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+    // ── 4b: Load comparand → Dd_cmp ────────────────────────────────────────
+    if (fcomp_is_mem) {
+        const bool is_f32 = (fcomp_instr->operands[1].mem.size == IROperandSize::S32);
+        const int addr_reg =
+            compute_operand_address(*a1, /*is_64bit=*/true, &fcomp_instr->operands[1], GPR::XZR);
+        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_cmp, addr_reg, /*imm12=*/0);
+        free_gpr(*a1, addr_reg);
+        if (is_f32)
+            emit_fcvt_s_to_d(buf, Dd_cmp, Dd_cmp);
+    } else {
+        emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_cmp, Xst_base);
+    }
 
     // ── 4c: Save NZCV, FCMP, branchless CC mapping, restore NZCV ───────────
-    // (Same sequence as try_fuse_fcom_fstsw)
     buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
-    emit_fcmp_f64(buf, Dd_fld, Dd_st0);
+    emit_fcmp_f64(buf, Dd_fld, Dd_cmp);
 
-    free_fpr(*a1, Dd_st0);
+    free_fpr(*a1, Dd_cmp);
     free_fpr(*a1, Dd_fld);
 
     const int Wd_cc = alloc_free_gpr(*a1);
