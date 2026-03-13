@@ -487,6 +487,69 @@ void emit_x87_pop_n_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd
 }
 
 // =============================================================================
+// 2h-fully-deferred — x87 stack push: TOP decrement ONLY (OPT-D)
+//
+// Emits only the 2-instruction TOP decrement (SUB + AND).  Both the
+// status_word writeback (store_top) AND the tag word update (mark kValid)
+// are deferred.  The caller sets top_dirty = 1 and tag_push_pending = 1
+// on x87_cache.
+//
+// The pending tag must be resolved before any code that reads the tag word:
+// - Cancelled by a subsequent pop on the same slot (emit_x87_pop_top_only)
+// - Flushed by emit_x87_tag_clear if the push is consumed by non-pop code
+// =============================================================================
+void emit_x87_push_fully_deferred(AssemblerBuffer& buf, int Wd_top) {
+    // SUB  Wd_top, Wd_top, #1
+    emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/1, /*is_set_flags=*/0,
+                 /*shift=*/0, 1, Wd_top, Wd_top);
+    // AND  Wd_top, Wd_top, #7
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_top,
+                 /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_top);
+}
+
+// =============================================================================
+// 2i-top-only — x87 stack pop: TOP increment ONLY (OPT-D)
+//
+// Emits only the 2-instruction TOP increment (ADD + AND).  No tag word
+// update, no store_top.  Used for push-pop cancellation where both the
+// push's tag-clear and the pop's tag-set operate on the same slot and cancel.
+// =============================================================================
+void emit_x87_pop_top_only(AssemblerBuffer& buf, int Wd_top) {
+    // ADD   Wd_top, Wd_top, #1
+    emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                 /*shift=*/0, 1, Wd_top, Wd_top);
+    // AND   Wd_top, Wd_top, #7
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_top,
+                 /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_top);
+}
+
+// =============================================================================
+// 2h-tag — Emit deferred tag-valid update for a prior push (OPT-D)
+//
+// This is the 6-instruction tag word portion of emit_x87_push, factored out
+// for lazy emission.  Marks the slot at Wd_top (the current TOP, which is
+// the slot the push decremented into) as kValid in the tag word.
+//
+// tagWord &= ~(3 << (Wd_top * 2))
+// =============================================================================
+void emit_x87_tag_clear(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2) {
+    // LSL   Wd_tmp2, Wd_top, #1
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                  /*immr*/ 31, /*imms*/ 30, Wd_top, Wd_tmp2);
+    // MOVZ  Wd_tmp, #3
+    emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp);
+    // LSLV  Wd_tmp, Wd_tmp, Wd_tmp2
+    buf.emit(0x1AC02000u | (uint32_t(Wd_tmp2) << 16) | (uint32_t(Wd_tmp) << 5) | uint32_t(Wd_tmp));
+    // LDRH  Wd_tmp2, [Xbase, #4]  (tagWord)
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordImm12, Xbase, Wd_tmp2);
+    // BIC   Wd_tmp2, Wd_tmp2, Wd_tmp  (tagWord &= ~mask → kValid)
+    emit_logical_shifted_reg(buf, /*is_64=*/0, /*AND*/ 0, /*N=invert*/ 1,
+                             /*LSL*/ 0, Wd_tmp, /*shift_amt*/ 0, Wd_tmp2, Wd_tmp2);
+    // STRH  Wd_tmp2, [Xbase, #4]
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87TagWordImm12, Xbase, Wd_tmp2);
+}
+
+// =============================================================================
 // 2j — FCMP result → x87 condition codes in status_word
 // =============================================================================
 

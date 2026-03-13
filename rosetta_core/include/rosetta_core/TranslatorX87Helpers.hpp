@@ -213,6 +213,23 @@ auto emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int
 auto emit_x87_pop_n_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2,
                              int n) -> void;
 
+// OPT-D: Fully-deferred push — only TOP decrement (2 instrs).
+// Skips BOTH store_top AND tag word update.  Caller sets tag_push_pending
+// and top_dirty on x87_cache.  The pending tag must be flushed (or cancelled
+// by a subsequent pop on the same slot) before any code that reads the tag word.
+auto emit_x87_push_fully_deferred(AssemblerBuffer& buf, int Wd_top) -> void;
+
+// OPT-D: Tag-only pop — TOP increment (2 instrs), no tag update, no store_top.
+// Used when a deferred push-tag cancels against the pop's set-empty on the
+// same slot.  Caller must set top_dirty or write store_top.
+auto emit_x87_pop_top_only(AssemblerBuffer& buf, int Wd_top) -> void;
+
+// OPT-D: Emit the tag-valid (kValid = clear 2 bits) update for a deferred push.
+// This is the tag-word portion of emit_x87_push, factored out so it can be
+// emitted lazily when the push-pop cancellation doesn't fire.
+auto emit_x87_tag_clear(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2)
+    -> void;
+
 // =============================================================================
 // 2j — FCMP result → x87 condition codes in status_word
 //

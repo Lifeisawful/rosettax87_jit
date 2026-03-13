@@ -18,8 +18,8 @@ struct X87Cache {
     int16_t run_remaining = 0;  // Countdown; 0 = inactive
     int8_t st_base_gpr = 0;     // GPR holding &st[0] = Xbase + kX87RegFileOff
     int8_t top_dirty = 0;       // OPT-C: 1 = push skipped store_top, TOP in memory stale
-    int8_t gprs_valid = 0;      // 1 = base/top/st_base GPR numbers are meaningful
-    int8_t _pad[1] = {};
+    int8_t gprs_valid = 0;           // 1 = base/top/st_base GPR numbers are meaningful
+    int8_t tag_push_pending = 0;     // OPT-D: 1 = push's tag-valid update deferred (cancel on next pop)
     IRBlock* prev_block = nullptr;
 
     bool active() const;

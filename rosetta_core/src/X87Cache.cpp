@@ -86,6 +86,7 @@ bool X87Cache::active() const {
 void X87Cache::invalidate() {
     gprs_valid = 0;
     top_dirty = 0;
+    tag_push_pending = 0;
     run_remaining = 0;
 }
 
@@ -105,6 +106,7 @@ void X87Cache::tick() {
         if (run_remaining == 0) {
             gprs_valid = 0;
             top_dirty = 0;
+            tag_push_pending = 0;
         }
     }
 }
