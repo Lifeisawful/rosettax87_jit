@@ -9,6 +9,7 @@ namespace TranslatorX87 {
 // ── OPT-1: Cross-instruction x87 base/TOP register cache ─────────────────
 bool x87_cache_active(TranslationResult* tr);
 void x87_cache_invalidate(TranslationResult* tr);
+void x87_cache_flush_and_invalidate(TranslationResult* tr);
 void x87_cache_set_run(TranslationResult* tr, int run_length);
 void x87_cache_tick(TranslationResult* tr);
 uint32_t x87_cache_pinned_mask(TranslationResult* tr);

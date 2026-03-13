@@ -97,7 +97,7 @@ struct TranslationResult {
     int8_t x87_cache_st_base_gpr;  // GPR holding &st[0] = Xbase + 8 for scaled addressing
     int8_t x87_cache_top_dirty;    // OPT-C: 1 = push skipped store_top, TOP in memory stale
     int8_t x87_cache_gprs_valid;   // 1 = base/top/st_base GPR numbers are meaningful
-    int8_t _x87_pad[1];            // padding
+    int8_t x87_tag_push_pending;   // OPT-D: 1 = push's tag-valid update deferred (cancel on next pop)
     IRBlock* x87_cache_prev_block;
 };
 

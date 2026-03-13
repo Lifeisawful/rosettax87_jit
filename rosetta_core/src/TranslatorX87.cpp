@@ -50,6 +50,7 @@ uint32_t x87_cache_pinned_mask(TranslationResult* tr) {
 void x87_cache_invalidate(TranslationResult* tr) {
     tr->x87_cache_gprs_valid = 0;
     tr->x87_cache_top_dirty = 0;
+    tr->x87_tag_push_pending = 0;
     tr->x87_cache_run_remaining = 0;
 }
 
@@ -64,6 +65,7 @@ void x87_cache_tick(TranslationResult* tr) {
         if (tr->x87_cache_run_remaining == 0) {
             tr->x87_cache_gprs_valid = 0;
             tr->x87_cache_top_dirty = 0;
+            tr->x87_tag_push_pending = 0;
         }
     }
 }
@@ -111,12 +113,20 @@ static int x87_get_st_base(TranslationResult& a1) {
 }
 
 static void x87_end(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, int Wd_top,
-                    int Wd_tmp) {
-    // OPT-C: If this is the last instruction in the run (run_remaining == 1,
-    // will become 0 after tick), flush any deferred status_word writeback.
-    if (a1.x87_cache_top_dirty && a1.x87_cache_run_remaining <= 1) {
+                    int Wd_tmp, int consumed = 1) {
+    // OPT-C: If this is the last instruction in the run (run_remaining <= consumed,
+    // will reach 0 after tick×consumed), flush any deferred status_word writeback.
+    if (a1.x87_cache_top_dirty && a1.x87_cache_run_remaining <= consumed) {
         emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
         a1.x87_cache_top_dirty = 0;
+    }
+
+    // OPT-D: Flush any pending tag-valid update at end of run.
+    if (a1.x87_tag_push_pending && a1.x87_cache_run_remaining <= consumed) {
+        const int Wd_tmp2 = alloc_free_gpr(a1);
+        emit_x87_tag_clear(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(a1, Wd_tmp2);
+        a1.x87_tag_push_pending = 0;
     }
 
     if (a1.x87_cache_run_remaining > 0) {
@@ -127,6 +137,15 @@ static void x87_end(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, int 
 }
 
 static void x87_cache_force_release(TranslationResult& a1, AssemblerBuffer& buf) {
+    // OPT-D: flush any deferred tag-valid update from a prior push.
+    if (a1.x87_tag_push_pending && a1.x87_cache_gprs_valid) {
+        const int tmp = alloc_gpr(a1, 2);
+        const int tmp2 = alloc_gpr(a1, 3);
+        emit_x87_tag_clear(buf, a1.x87_cache_base_gpr, a1.x87_cache_top_gpr, tmp, tmp2);
+        free_gpr(a1, tmp2);
+        free_gpr(a1, tmp);
+        a1.x87_tag_push_pending = 0;
+    }
     // OPT-C: flush deferred writeback using the cached registers
     if (a1.x87_cache_top_dirty && a1.x87_cache_gprs_valid) {
         const int tmp = alloc_gpr(a1, 2);  // pool slot 2 is free here
@@ -142,33 +161,92 @@ static void x87_cache_force_release(TranslationResult& a1, AssemblerBuffer& buf)
     x87_cache_invalidate(&a1);
 }
 
-// ── OPT-C: Push/pop wrappers that manage the deferred writeback flag ─────────
+// ── OPT-C/D: Push/pop wrappers that manage deferred writeback + tag flags ────
 
-// Push: when cache is active, skip the 3-insn store_top (deferred to next pop
-// or end-of-run flush in x87_end).  When not cached, use full push.
+// Push: when cache is active, use fully-deferred push (OPT-D) — only the
+// 2-instruction TOP decrement.  Both store_top and the tag-valid update are
+// deferred.  When not cached, use the full push.
 static void x87_push(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top, int Wd_tmp,
                      int Wd_tmp2) {
     if (a1.x87_cache_run_remaining > 0) {
-        emit_x87_push_deferred(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        // OPT-D: If there's already a pending tag from a prior push, flush it
+        // before creating a new one.  Also flush store_top so that the
+        // push-pop cancellation in x87_pop sees the correct memory TOP.
+        // Without this, two consecutive pushes followed by one pop would
+        // leave memory TOP desynced (pointing to the pre-first-push value
+        // instead of the post-first-push value).
+        if (a1.x87_tag_push_pending) {
+            emit_x87_tag_clear(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+            a1.x87_tag_push_pending = 0;
+        }
+        if (a1.x87_cache_top_dirty) {
+            emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
+            a1.x87_cache_top_dirty = 0;
+        }
+        emit_x87_push_fully_deferred(buf, Wd_top);
         a1.x87_cache_top_dirty = 1;
+        a1.x87_tag_push_pending = 1;
     } else {
         emit_x87_push(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
     }
 }
 
-// Pop: emit_store_top inside emit_x87_pop writes the correct current TOP
-// via BFI regardless of what was in memory, so dirty is cleared.
-// Wd_tmp2 is allocated from the free GPR pool for the tag word RMW.
+// OPT-D: Flush the pending tag-valid update from a deferred push.
+// Must be called before any instruction that reads/writes the tag word
+// (FXAM, FFREE, another push, etc.) when x87_tag_push_pending is set.
+static void x87_flush_pending_tag(AssemblerBuffer& buf, TranslationResult& a1, int Xbase,
+                                   int Wd_top, int Wd_tmp, int Wd_tmp2) {
+    if (a1.x87_tag_push_pending) {
+        emit_x87_tag_clear(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        a1.x87_tag_push_pending = 0;
+    }
+}
+
+// Pop: when a tag-push is pending from a prior deferred push, the push's
+// tag-clear (kValid) and the pop's tag-set (kEmpty) operate on the same slot
+// and cancel.  Also, if top_dirty is set (memory has pre-push TOP), the pop
+// restores TOP to its original value — memory is already correct.
+// In that case, emit only a 2-instruction TOP increment (OPT-D).
 static void x87_pop(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
                     int Wd_tmp) {
-    const int Wd_tmp2 = alloc_free_gpr(a1);
-    emit_x87_pop(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
-    free_gpr(a1, Wd_tmp2);
-    a1.x87_cache_top_dirty = 0;
+    if (a1.x87_tag_push_pending && a1.x87_cache_top_dirty) {
+        // OPT-D: Push-pop cancellation.  Both tag updates cancel, and memory
+        // already has the correct final TOP (pre-push value = post-pop value).
+        emit_x87_pop_top_only(buf, Wd_top);
+        a1.x87_tag_push_pending = 0;
+        a1.x87_cache_top_dirty = 0;
+    } else {
+        if (a1.x87_tag_push_pending) {
+            // Tag pending but TOP already flushed — can't cancel store_top,
+            // but tag updates still cancel.  Do pop without tag, with store_top.
+            // TOP increment + store_top (5 instrs)
+            emit_x87_pop_top_only(buf, Wd_top);
+            emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
+            a1.x87_tag_push_pending = 0;
+            a1.x87_cache_top_dirty = 0;
+        } else {
+            const int Wd_tmp2 = alloc_free_gpr(a1);
+            emit_x87_pop(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+            free_gpr(a1, Wd_tmp2);
+            a1.x87_cache_top_dirty = 0;
+        }
+    }
 }
 
 static void x87_pop_n(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
                       int Wd_tmp, int n) {
+    // OPT-D: For n=1 with pending push-tag, delegate to x87_pop for cancellation.
+    if (n == 1) {
+        x87_pop(buf, a1, Xbase, Wd_top, Wd_tmp);
+        return;
+    }
+    // For n>=2, flush any pending tag first, then do the full multi-pop.
+    if (a1.x87_tag_push_pending) {
+        const int Wd_tmp2 = alloc_free_gpr(a1);
+        emit_x87_tag_clear(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(a1, Wd_tmp2);
+        a1.x87_tag_push_pending = 0;
+    }
     const int Wd_tmp2 = alloc_free_gpr(a1);
     emit_x87_pop_n(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2, n);
     free_gpr(a1, Wd_tmp2);
@@ -1553,6 +1631,17 @@ auto translate_fstsw(TranslationResult* a1, IRInstr* a2) -> void {
         a1->x87_cache_top_dirty = 0;
     }
 
+    // OPT-D: FSTSW doesn't call x87_end, so it must flush the pending tag
+    // itself.  Otherwise, if FSTSW is the last instruction in the cache run,
+    // x87_cache_tick clears tag_push_pending without emitting the tag-clear,
+    // leaving the tag word in memory with kEmpty for the pushed slot.
+    if (a1->x87_tag_push_pending && base_cached) {
+        const int Wd_tag_tmp = alloc_free_gpr(*a1);
+        emit_x87_tag_clear(buf, Xbase, a1->x87_cache_top_gpr, Wd_sw, Wd_tag_tmp);
+        free_gpr(*a1, Wd_tag_tmp);
+        a1->x87_tag_push_pending = 0;
+    }
+
     // LDRH Wd_sw, [Xbase, #0x02]   — load status_word (16-bit halfword)
     // imm12=1 because LDRH scales by 2: byte offset = 1*2 = 2
     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=*/1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -2697,9 +2786,16 @@ int try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* arit
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    // OPT-C: flush any deferred TOP writeback from a prior push.  The fused
-    // instruction doesn't push/pop so it won't set or clear dirty, but if the
-    // cache run expires after this pair the dirty writeback would be lost.
+    // OPT-C/D: flush any deferred TOP writeback and pending tag from a prior
+    // push.  The fused instruction doesn't push/pop so it won't set or clear
+    // dirty, but if the cache run expires after this pair the dirty writeback
+    // would be lost.  The tag must also be flushed because the push's tag-clear
+    // won't be cancelled by a pop (the fused pattern absorbs the pop internally).
+    {
+        const int Wd_tmp2 = alloc_free_gpr(*a1);
+        x87_flush_pending_tag(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(*a1, Wd_tmp2);
+    }
     x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_st0 = alloc_free_fpr(*a1);
@@ -2816,7 +2912,7 @@ int try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* arit
 
     free_fpr(*a1, Dd_fld);
     free_fpr(*a1, Dd_st0);
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 1;  // fused — caller consumes 2 instructions
@@ -2974,7 +3070,12 @@ int try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    // Flush any deferred TOP writeback from a prior push.
+    // Flush any deferred tag and TOP writeback from a prior push.
+    {
+        const int Wd_tmp2 = alloc_free_gpr(*a1);
+        x87_flush_pending_tag(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(*a1, Wd_tmp2);
+    }
     x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
@@ -3099,7 +3200,7 @@ int try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
 
     free_fpr(*a1, Dd_arith);
     free_fpr(*a1, Dd_fld);
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
     free_gpr(*a1, Wd_tmp);
 
     return 1;  // fused — caller consumes 3 instructions
@@ -3303,6 +3404,12 @@ int try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* fstp_i
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
+    // Flush any deferred tag and TOP writeback from a prior push.
+    {
+        const int Wd_tmp2 = alloc_free_gpr(*a1);
+        x87_flush_pending_tag(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(*a1, Wd_tmp2);
+    }
     x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_val = alloc_free_fpr(*a1);
@@ -3387,7 +3494,7 @@ int try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* fstp_i
     }
 
     free_fpr(*a1, Dd_val);
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 1;
@@ -3446,7 +3553,7 @@ int try_fuse_fxch_fstp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* fstp
     x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
     x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 1;
@@ -3460,6 +3567,10 @@ int x87_cache_lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
         count++;
     }
     return count;
+}
+
+void x87_cache_flush_and_invalidate(TranslationResult* tr) {
+    x87_cache_force_release(*tr, tr->insn_buf);
 }
 
 };  // namespace TranslatorX87

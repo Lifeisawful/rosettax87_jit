@@ -21,7 +21,7 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     // consecutive x87 run.  x87_cache_set_run only activates if run >= 2.
     {
         if (block != translation_result->x87_cache_prev_block) {
-            TranslatorX87::x87_cache_invalidate(translation_result);
+            TranslatorX87::x87_cache_flush_and_invalidate(translation_result);
             translation_result->free_gpr_mask = kGprScratchMask;
             translation_result->x87_cache_prev_block = block;
         }
