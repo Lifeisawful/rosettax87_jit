@@ -1,4 +1,5 @@
 set(ROSETTA_CORE_SOURCES
+    src/CoreConfig.cpp
     src/CoreLog.cpp
     src/CustomTranslationHook.cpp
     src/hook.cpp
@@ -18,7 +19,9 @@ set(ROSETTA_CORE_SOURCES
     src/Register.cpp
     src/Translator.cpp
     src/TranslatorX87.cpp
+    src/TranslatorX87Fusion.cpp
     src/TranslatorX87Helpers.cpp
+    src/X87Cache.cpp
     src/RuntimeRoutine.cpp
     src/RuntimeLibC.cpp
     src/IRModuleData.cpp
@@ -29,6 +32,7 @@ add_library(rosetta_core STATIC ${ROSETTA_CORE_SOURCES})
 target_include_directories(rosetta_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(rosetta_core PUBLIC cxx_std_23)
 target_compile_options(rosetta_core PRIVATE -g)
+target_link_libraries(rosetta_core PUBLIC rosetta_config)
 
 # --- Runtime build (used by rosetta_runtime / libRuntimeRosettax87) ---
 add_library(rosetta_core_runtime STATIC ${ROSETTA_CORE_SOURCES})
@@ -36,7 +40,7 @@ target_include_directories(rosetta_core_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 target_compile_features(rosetta_core_runtime PUBLIC cxx_std_23)
 target_compile_options(rosetta_core_runtime PRIVATE
     -fvisibility=hidden
-    -O3
+    # -O0 # causes undefined behaivor - we can neglect performance for translation anyway
     -funroll-loops
     -march=native
     -mtune=native
@@ -53,10 +57,12 @@ target_compile_options(rosetta_core_runtime PRIVATE
     -fno-exceptions
     -fno-unwind-tables
     -fno-asynchronous-unwind-tables
-    -flto
 )
+target_link_libraries(rosetta_core_runtime PUBLIC rosetta_config)
 target_compile_definitions(rosetta_core_runtime PRIVATE ROSETTA_RUNTIME=1)
 target_sources(rosetta_core_runtime PRIVATE
     src/RuntimeOperatorNew.cpp
     src/RuntimeSymbols.cpp
 )
+set_property(TARGET rosetta_core_runtime PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+ 

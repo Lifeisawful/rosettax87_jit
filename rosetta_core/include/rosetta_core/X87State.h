@@ -41,15 +41,6 @@ enum X87ControlWord : uint16_t {
     kInfinityControl = 0x1000
 };
 
-// Legacy 80-bit type — used only by fld_fp80 / fst_fp80 runtime helpers.
-#pragma pack(push, 1)
-struct X87Float80 {
-    uint64_t mantissa;
-    uint16_t exponent;
-};
-#pragma pack(pop)
-static_assert(sizeof(X87Float80) == 0x0A, "Invalid size for X87Float80");
-
 // ── x87 state — stride-8 layout ─────────────────────────────────────────────
 //
 // All x87 values are stored as IEEE 754 double (64-bit).  The 80-bit extended

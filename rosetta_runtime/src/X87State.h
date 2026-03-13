@@ -10,6 +10,26 @@
 #include "X87Float80.h"
 #include "X87StackRegister.h"
 
+// Bit-manipulation helpers — safe under -ffast-math (std::isnan/isinf/fpclassify are not)
+static inline bool x87_is_nan(double v) {
+    uint64_t b = std::bit_cast<uint64_t>(v);
+    return (b & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL
+        && (b & 0x000FFFFFFFFFFFFFULL) != 0;
+}
+static inline bool x87_is_inf(double v) {
+    uint64_t b = std::bit_cast<uint64_t>(v);
+    return (b & 0x7FFFFFFFFFFFFFFFULL) == 0x7FF0000000000000ULL;
+}
+static inline bool x87_is_nan_or_inf(double v) {
+    uint64_t b = std::bit_cast<uint64_t>(v);
+    return (b & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL;
+}
+static inline bool x87_is_subnormal(double v) {
+    uint64_t b = std::bit_cast<uint64_t>(v);
+    return (b & 0x7FF0000000000000ULL) == 0
+        && (b & 0x000FFFFFFFFFFFFFULL) != 0;
+}
+
 // Option to convert 64 bit float to 80 bit x87 format to be compatible with
 // original rosetta x87 implementation This must be used if you want to
 // selectively enable x87 instructions.
@@ -250,8 +270,7 @@ struct X87State {
         X87TagState tag;
         if (value == 0.0) {
             tag = X87TagState::kZero;
-        } else if (std::isnan(value) || std::isinf(value) ||
-                   std::fpclassify(value) == FP_SUBNORMAL) {
+        } else if (x87_is_nan_or_inf(value) || x87_is_subnormal(value)) {
             tag = X87TagState::kSpecial;
         } else {
             tag = X87TagState::kValid;

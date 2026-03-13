@@ -12,9 +12,9 @@
 #include "macho_loader.hpp"
 #include "offset_finder.hpp"
 #include "types.h"
+#include <rosetta_config/Config.h>
 
 const char* logsEnabled = nullptr;
-const char* jitOnly = nullptr;
 
 #define LOG(fmt, ...)                   \
     do {                                \
@@ -489,7 +489,6 @@ int main(int argc, char* argv[]) {
     }
 
     logsEnabled = getenv("ROSETTA_X87_LOGS");
-    jitOnly = getenv("ROSETTA_X87_JIT_ONLY");
 
     LOG("Launching debugger.\n");
 
@@ -540,13 +539,88 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to find Rosetta runtime\n");
         return 1;
     }
-
-    // disable ahead of time compiler to always force JIT
     uint8_t g_disable_aot_value = 1;
 
     dbg.writeMemory(runtimeBase + offsetFinder.offsetDisableAot_, &g_disable_aot_value,
                     sizeof(g_disable_aot_value));
+#if 0
 
+// __bss:000000000003B280 ??                      g_print_ir      % 1                     ; DATA XREF: sub_D048:loc_D408↑o
+    const uintptr_t g_print_ir_offset = 0x3B280;
+    uint8_t g_print_ir_value = 0;
+
+    dbg.writeMemory(runtimeBase + g_print_ir_offset, &g_print_ir_value, sizeof(g_print_ir_value));
+
+// __bss:000000000003B281 ??                      g_print_seg     % 1    
+    const uintptr_t g_print_seg_offset = 0x3B281;
+    uint8_t g_print_seg_value = 0;
+
+    dbg.writeMemory(runtimeBase + g_print_seg_offset, &g_print_seg_value, sizeof(g_print_seg_value));
+
+    // __bss:000000000003B282 ??                      g_scribble_translation % 1 
+    const uintptr_t g_scribble_translation_offset = 0x3B282;
+    uint8_t g_scribble_translation_value = 1;
+
+    dbg.writeMemory(runtimeBase + g_scribble_translation_offset, &g_scribble_translation_value,
+                    sizeof(g_scribble_translation_value));
+
+/*
+              if ( (int)sub_1F57C(g_trace_path, 0xFF, "%s.%d", v26, v33) >= 0xFF )
+                ERROR("trace filename too long");
+              g_write_trace = 1;
+
+__bss:000000000003B27F ??                      g_write_trace   % 1   
+
+__bss:000000000003B283                         ; char g_trace_path[256]
+__bss:000000000003B283 ?? ?? ?? ?? ?? ?? ?? ?? g_trace_path    % 0x100 
+*/
+    char trace_path_buffer[256] = {};
+  // extract only the file name from argv[1]
+    std::filesystem::path inputPath(argv[1]);
+    std::string filename = inputPath.filename().string();
+
+    sprintf(trace_path_buffer, "trace.%s.%d", filename.c_str(), child);
+    printf("Setting trace path to: %s\n", trace_path_buffer);
+
+    const uintptr_t g_trace_path_offset = 0x3B283;
+
+    dbg.writeMemory(runtimeBase + g_trace_path_offset, trace_path_buffer, sizeof(trace_path_buffer));
+
+    const uintptr_t g_write_trace_offset = 0x3B27F;
+    uint8_t g_write_trace_value = 1;
+    dbg.writeMemory(runtimeBase + g_write_trace_offset, &g_write_trace_value, sizeof(g_write_trace_value));
+
+    // 3B279 ??                      g_aot_errors_are_fatal
+    const uintptr_t g_aot_errors_are_fatal_offset = 0x3B279;
+    uint8_t g_aot_errors_are_fatal_value = 1;
+
+    dbg.writeMemory(runtimeBase + g_aot_errors_are_fatal_offset, &g_aot_errors_are_fatal_value,
+                    sizeof(g_aot_errors_are_fatal_value));
+
+    // ..
+    const uintptr_t namespace_offset = 0x2CA3F;
+    char namespace_buffer[16] = {};
+
+    uintptr_t namespace_addr = runtimeBase + namespace_offset;
+
+    dbg.readMemory(namespace_addr, namespace_buffer, sizeof(namespace_buffer));
+    LOG("Namespace: %s\n", namespace_buffer);
+
+    if (!dbg.adjustMemoryProtection(namespace_addr, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                                    sizeof(uint32_t))) {
+        LOG("Failed to adjust memory protection for namespace\n");
+        return 1;
+    }
+
+    namespace_buffer[5] = 'b';
+    dbg.writeMemory(namespace_addr, namespace_buffer, sizeof(namespace_buffer));
+    LOG("Namespace patched to: %s\n", namespace_buffer);
+
+    // re-read to verify
+    char verify_buffer[16] = {};
+    dbg.readMemory(namespace_addr, verify_buffer, sizeof(verify_buffer));
+    LOG("Namespace after patch: %s\n", verify_buffer);
+#endif
     dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
     dbg.continueExecution();
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
@@ -743,6 +817,13 @@ int main(int argc, char* argv[]) {
         .transaction_result_size_addr = offsetFinder.offsetTransactionResultSize_};
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));
+
+    // Write runtime feature config to __DATA,config
+    if (auto* configSection = machoLoader.getSection("__DATA", "config")) {
+        RosettaConfig runtimeConfig = parse_config_from_env();
+        uint64_t machoConfigAddress = machoBase + configSection->addr;
+        dbg.writeMemory(machoConfigAddress, &runtimeConfig, sizeof(runtimeConfig));
+    }
 
     // fix up Exports segment of mapped macho
     uint64_t machoExportsAddress = machoBase + machoLoader.getSection("__DATA", "exports")->addr;

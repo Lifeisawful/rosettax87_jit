@@ -10,180 +10,9 @@
 #include "rosetta_core/TranslationResult.h"
 #include "rosetta_core/TranslatorHelpers.hpp"
 #include "rosetta_core/TranslatorX87Helpers.hpp"
+#include "TranslatorX87Internal.hpp"
 
 namespace TranslatorX87 {
-
-// =============================================================================
-// OPT-1: Cross-instruction x87 base/TOP register cache
-//
-// When consecutive x87 instructions appear in a block, the base address
-// (X18 + x87_state_offset) and the TOP field never change between instructions
-// except through our own push/pop (which update the register in-place).
-// Caching these two values across instructions saves 3-4 emitted AArch64
-// instructions per x87 opcode after the first in a run:
-//   - 1-2 insns for emit_x87_base (ADD Xbase, X18, #offset)
-//   - 2 insns for emit_load_top (LDRH + UBFX)
-//
-// The cache is managed by Translator::translate_instruction, which:
-//   1. Invalidates on block change or non-x87 opcodes
-//   2. Scans ahead to find consecutive x87 run length
-//   3. Pins pool slots 0 (Xbase) and 1 (Wd_top) across the run
-//   4. Excludes them from the free_gpr_mask reset between instructions
-// =============================================================================
-
-// ── Cache query/control (called from Translator.cpp) ─────────────────────────
-
-bool x87_cache_active(TranslationResult* tr) {
-    return tr->x87_cache_run_remaining > 0;
-}
-
-uint32_t x87_cache_pinned_mask(TranslationResult* tr) {
-    uint32_t mask = 0;
-    if (tr->x87_cache_gprs_valid) {
-        mask |= (1u << tr->x87_cache_base_gpr);
-        mask |= (1u << tr->x87_cache_top_gpr);
-        mask |= (1u << tr->x87_cache_st_base_gpr);
-    }
-    return mask;
-}
-
-void x87_cache_invalidate(TranslationResult* tr) {
-    tr->x87_cache_gprs_valid = 0;
-    tr->x87_cache_top_dirty = 0;
-    tr->x87_cache_run_remaining = 0;
-}
-
-void x87_cache_set_run(TranslationResult* tr, int run_length) {
-    if (run_length >= 2)
-        tr->x87_cache_run_remaining = static_cast<int16_t>(run_length);
-}
-
-void x87_cache_tick(TranslationResult* tr) {
-    if (tr->x87_cache_run_remaining > 0) {
-        tr->x87_cache_run_remaining--;
-        if (tr->x87_cache_run_remaining == 0) {
-            tr->x87_cache_gprs_valid = 0;
-            tr->x87_cache_top_dirty = 0;
-        }
-    }
-}
-
-// ── Preamble / epilogue used by every translate_* function ───────────────────
-
-// Acquires Xbase and Wd_top.  On a cache hit, returns the cached register
-// numbers without emitting any instructions.  On a miss (first instruction
-// in a run, or singleton), allocates pool slots 0+1 and emits the full
-// ADD + LDRH + UBFX sequence.
-static auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<int, int> {
-    if (a1.x87_cache_run_remaining > 0 && a1.x87_cache_gprs_valid) {
-        // Cache HIT — registers already hold Xbase and TOP.
-        return {a1.x87_cache_base_gpr, a1.x87_cache_top_gpr};
-    }
-
-    // Cache MISS — allocate and emit the preamble.
-    const int Xbase = alloc_gpr(a1, 0);
-    const int Wd_top = alloc_gpr(a1, 1);
-    emit_x87_base(buf, a1, Xbase);
-    emit_load_top(buf, a1, Xbase, Wd_top);
-
-    if (a1.x87_cache_run_remaining > 0) {
-        // First instruction in a new run — store registers in cache.
-        a1.x87_cache_base_gpr = static_cast<int8_t>(Xbase);
-        a1.x87_cache_top_gpr = static_cast<int8_t>(Wd_top);
-
-        // Stride-8: Allocate and compute pointer to &st[0] = Xbase + 8.
-        // Pool slot 6 = X28, never used by any translate_* via alloc_gpr().
-        // Enables LDR Dd, [Xst_base, Widx, SXTW #3] — scaled indexed addressing.
-        const int Xst_base = alloc_gpr(a1, 6);
-        // ADD Xst_base, Xbase, #8  (64-bit ADD — Xst_base is a pointer)
-        emit_add_imm(buf, /*is_64bit=*/1, /*is_sub=*/0, /*is_set_flags=*/0,
-                     /*shift=*/0, kX87RegFileOff, Xbase, Xst_base);
-        a1.x87_cache_st_base_gpr = static_cast<int8_t>(Xst_base);
-        a1.x87_cache_gprs_valid = 1;
-    }
-
-    return {Xbase, Wd_top};
-}
-
-// Returns the cached &st[0] pointer register, or -1 if not preloaded.
-static int x87_get_st_base(TranslationResult& a1) {
-    return a1.x87_cache_gprs_valid ? a1.x87_cache_st_base_gpr : -1;
-}
-
-static void x87_end(TranslationResult& a1, AssemblerBuffer& buf, int Xbase, int Wd_top,
-                    int Wd_tmp) {
-    // OPT-C: If this is the last instruction in the run (run_remaining == 1,
-    // will become 0 after tick), flush any deferred status_word writeback.
-    if (a1.x87_cache_top_dirty && a1.x87_cache_run_remaining <= 1) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1.x87_cache_top_dirty = 0;
-    }
-
-    if (a1.x87_cache_run_remaining > 0) {
-        return;
-    }
-    free_gpr(a1, Wd_top);
-    free_gpr(a1, Xbase);
-}
-
-static void x87_cache_force_release(TranslationResult& a1, AssemblerBuffer& buf) {
-    // OPT-C: flush deferred writeback using the cached registers
-    if (a1.x87_cache_top_dirty && a1.x87_cache_gprs_valid) {
-        const int tmp = alloc_gpr(a1, 2);  // pool slot 2 is free here
-        emit_store_top(buf, a1.x87_cache_base_gpr, a1.x87_cache_top_gpr, tmp);
-        free_gpr(a1, tmp);
-        a1.x87_cache_top_dirty = 0;
-    }
-    if (a1.x87_cache_gprs_valid) {
-        a1.free_gpr_mask |= (1u << a1.x87_cache_base_gpr);
-        a1.free_gpr_mask |= (1u << a1.x87_cache_top_gpr);
-        a1.free_gpr_mask |= (1u << a1.x87_cache_st_base_gpr);
-    }
-    x87_cache_invalidate(&a1);
-}
-
-// ── OPT-C: Push/pop wrappers that manage the deferred writeback flag ─────────
-
-// Push: when cache is active, skip the 3-insn store_top (deferred to next pop
-// or end-of-run flush in x87_end).  When not cached, use full push.
-static void x87_push(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top, int Wd_tmp,
-                     int Wd_tmp2) {
-    if (a1.x87_cache_run_remaining > 0) {
-        emit_x87_push_deferred(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
-        a1.x87_cache_top_dirty = 1;
-    } else {
-        emit_x87_push(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
-    }
-}
-
-// Pop: emit_store_top inside emit_x87_pop writes the correct current TOP
-// via BFI regardless of what was in memory, so dirty is cleared.
-// Wd_tmp2 is allocated from the free GPR pool for the tag word RMW.
-static void x87_pop(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
-                    int Wd_tmp) {
-    const int Wd_tmp2 = alloc_free_gpr(a1);
-    emit_x87_pop(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
-    free_gpr(a1, Wd_tmp2);
-    a1.x87_cache_top_dirty = 0;
-}
-
-static void x87_pop_n(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
-                      int Wd_tmp, int n) {
-    const int Wd_tmp2 = alloc_free_gpr(a1);
-    emit_x87_pop_n(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2, n);
-    free_gpr(a1, Wd_tmp2);
-    a1.x87_cache_top_dirty = 0;
-}
-
-// Flush: emit deferred writeback if dirty.  Must be called before any
-// instruction that reads status_word from memory (translate_fstsw).
-static void x87_flush_top(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, int Wd_top,
-                          int Wd_tmp) {
-    if (a1.x87_cache_top_dirty) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1.x87_cache_top_dirty = 0;
-    }
-}
 
 // FLDZ -- push +0.0 onto the x87 stack.
 //
@@ -1444,10 +1273,10 @@ auto translate_fstsw(TranslationResult* a1, IRInstr* a2) -> void {
     // OPT-1: fstsw only needs Xbase, not TOP.  Use the cache for Xbase if
     // active; allocate Wd_sw from the free pool (not pool slot 1, which is
     // pinned for TOP when the cache is active).
-    const bool base_cached = (a1->x87_cache_run_remaining > 0 && a1->x87_cache_gprs_valid);
+    const bool base_cached = (a1->x87_cache.run_remaining > 0 && a1->x87_cache.gprs_valid);
     int Xbase;
     if (base_cached) {
-        Xbase = a1->x87_cache_base_gpr;
+        Xbase = a1->x87_cache.base_gpr;
     } else {
         Xbase = alloc_gpr(*a1, 0);
         emit_x87_base(buf, *a1, Xbase);
@@ -1457,9 +1286,9 @@ auto translate_fstsw(TranslationResult* a1, IRInstr* a2) -> void {
     // OPT-C: If a prior deferred push left TOP dirty, flush it now — FSTSW
     // reads status_word from memory and needs the correct TOP.
     // Use Wd_sw as scratch for store_top (it hasn't been loaded yet).
-    if (a1->x87_cache_top_dirty && base_cached) {
-        emit_store_top(buf, Xbase, a1->x87_cache_top_gpr, Wd_sw);
-        a1->x87_cache_top_dirty = 0;
+    if (a1->x87_cache.top_dirty && base_cached) {
+        emit_store_top(buf, Xbase, a1->x87_cache.top_gpr, Wd_sw);
+        a1->x87_cache.top_dirty = 0;
     }
 
     // LDRH Wd_sw, [Xbase, #0x02]   — load status_word (16-bit halfword)
@@ -1600,7 +1429,7 @@ auto translate_fcom(TranslationResult* a1, IRInstr* a2) -> void {
             emit_fcvt_s_to_d(buf, Dd_src, Dd_src);
     }
 
-    // Step 3: Save host NZCV, compare, map flags, restore NZCV.
+    // Step 3: Save host NZCV, compare, map flags branchlessly, restore NZCV.
     //
     // CRITICAL: Rosetta maps x86 EFLAGS to AArch64 NZCV.  Non-x87 instructions
     // like TEST/CMP set NZCV, and subsequent Jcc reads it.  If an x87 FCOM sits
@@ -1627,41 +1456,54 @@ auto translate_fcom(TranslationResult* a1, IRInstr* a2) -> void {
     free_fpr(*a1, Dd_src);
     free_fpr(*a1, Dd_st0);
 
-    // Step 4: Map FCMP NZCV → x87 CC bits via conditional branches, then
-    // restore the saved NZCV so subsequent x86 Jcc sees the correct flags.
+    // Step 4: Branchless FCMP NZCV → x87 CC bit mapping.
     //
     // AArch64 FCMP sets NZCV:
-    //   GT: 0010  LT: 1000  EQ: 0110  UN: 0011
+    //   GT: N=0, Z=0, C=1, V=0
+    //   LT: N=1, Z=0, C=0, V=0
+    //   EQ: N=0, Z=1, C=1, V=0
+    //   UN: N=0, Z=0, C=1, V=1
     //
-    // B.GT  = !(Z) && (N==V) — true for GT only  (excludes UN: N=0,V=1)
-    // B.MI  = N==1           — true for LT only
-    // B.VC  = V==0           — true for GT, LT, EQ (excludes UN)
+    // x87 CC derivation:
+    //   C0 (bit 8)  = CC | VS  = (C==0) | (V==1)   → 1 for LT and UN
+    //   C2 (bit 10) = VS       = (V==1)             → 1 for UN only
+    //   C3 (bit 14) = EQ | VS  = (Z==1) | (V==1)   → 1 for EQ and UN
     //
-    // Code layout (7 insns for flag mapping + 1 for MSR restore):
-    //   pos 0: MOVZ  Wd_tmp, #0x0000       GT
-    //   pos 1: B.GT  +6 → pos 7            GT confirmed
-    //   pos 2: MOVZ  Wd_tmp, #0x0100       LT (C0=1)
-    //   pos 3: B.MI  +4 → pos 7            LT confirmed (N==1)
-    //   pos 4: MOVZ  Wd_tmp, #0x4000       EQ (C3=1)
-    //   pos 5: B.VC  +2 → pos 7            EQ confirmed (V==0)
-    //   pos 6: MOVZ  Wd_tmp, #0x4500       UN (C0|C2|C3) — fallthrough
-    //   pos 7: MSR   NZCV, Wd_tmp2         restore saved flags
+    // All three CSET instructions must execute before MSR restores NZCV,
+    // since CSET reads the condition flags.
+    //
+    // 9 instructions, fully branchless — eliminates 3 conditional branches
+    // that cause ~14-cycle misprediction stalls on Apple M-series.
 
-    // B.cond encoding: 0x54000000 | (imm19 << 5) | cond
-    //   GT=0xC, MI=0x4, VC=0x7
+    const int Wd_cc = alloc_free_gpr(*a1);   // CC flag result
+    const int Wd_vs = alloc_free_gpr(*a1);   // VS flag result
 
-    emit_movn(buf, 0, 2, 0, 0x0000, Wd_tmp);   // pos 0
-    buf.emit(0x54000000u | (6u << 5) | 0xCu);  // pos 1: B.GT +6
-    emit_movn(buf, 0, 2, 0, 0x0100, Wd_tmp);   // pos 2
-    buf.emit(0x54000000u | (4u << 5) | 0x4u);  // pos 3: B.MI +4
-    emit_movn(buf, 0, 2, 0, 0x4000, Wd_tmp);   // pos 4
-    buf.emit(0x54000000u | (2u << 5) | 0x7u);  // pos 5: B.VC +2
-    emit_movn(buf, 0, 2, 0, 0x4500, Wd_tmp);   // pos 6
+    // Extract individual flag conditions (all 3 must precede MSR)
+    emit_cset(buf, /*is_64bit=*/0, /*CC=*/3, Wd_cc);   // 1 if carry clear (LT)
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);   // 1 if overflow (UN)
+    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_tmp);  // 1 if equal
 
-    // pos 7: MSR NZCV, Wd_tmp2 — restore the saved x86 EFLAGS
+    // MSR NZCV, Wd_tmp2 — restore saved x86 EFLAGS (all CSETs done)
     buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));
 
     free_gpr(*a1, Wd_tmp2);
+
+    // C0 = CC | VS
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_cc, Wd_cc);
+    // C3 = EQ | VS
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_tmp, Wd_tmp);
+
+    // Pack: Wd_tmp = (C0 << 8) | (C2 << 10) | (C3 << 14)
+    // Step 1: C0 << 8
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
+                  /*immr=*/24, /*imms=*/23, Wd_cc, Wd_cc);  // LSL #8
+    // Step 2: ORR with C2(=VS) << 10
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
+    // Step 3: ORR with C3 << 14, result in Wd_tmp
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_tmp, 14, Wd_cc, Wd_tmp);
+
+    free_gpr(*a1, Wd_vs);
+    free_gpr(*a1, Wd_cc);
 
     // Wd_tmp holds the new CC bits (0x0000 / 0x0100 / 0x4000 / 0x4500).
     // RMW status_word: load, clear C0|C2|C3, OR in new bits, store.
@@ -1671,10 +1513,11 @@ auto translate_fcom(TranslationResult* a1, IRInstr* a2) -> void {
         // LDRH Wd_sw, [Xbase, #0x02]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
 
-        // Clear bits 8, 10, 14 (C0, C2, C3) — matches helper library
-        emit_bitfield(buf, 0, 1, 0, 24, 0, GPR::XZR, Wd_sw);  // bit 8
-        emit_bitfield(buf, 0, 1, 0, 22, 0, GPR::XZR, Wd_sw);  // bit 10
-        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);  // bit 14
+        // OPT-F1: Clear bits [10:8] (C0, C1, C2) with a single BFI, then bit 14 (C3).
+        // C1 (bit 9) is "cleared" per Intel SDM for all FCOM variants.
+        // BFI from XZR, lsb=8, width=3 → immr=(32-8)%32=24, imms=2
+        emit_bitfield(buf, 0, 1, 0, 24, 2, GPR::XZR, Wd_sw);   // clear bits [10:8]
+        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);   // clear bit 14
 
         // ORR Wd_sw, Wd_sw, Wd_tmp
         emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);
@@ -2412,680 +2255,412 @@ auto translate_frndint(TranslationResult* a1, IRInstr* /*a2*/) -> void {
 }
 
 // =============================================================================
-// OPT-1: Lookahead — count consecutive x87 instructions we handle inline
+// FCOMI / FUCOMI / FCOMIP / FUCOMIP — compare and set EFLAGS directly
+//
+// x86 semantics:
+//   FCOMI:   compare ST(0) vs ST(i), set EFLAGS (ZF, PF, CF)
+//   FCOMIP:  same + pop ST(0)
+//   FUCOMI:  same as FCOMI (unordered quiet — AArch64 FCMP handles this)
+//   FUCOMIP: same + pop
+//
+// Unlike FCOM (which writes to x87 status_word), FCOMI writes directly to
+// EFLAGS, which Rosetta maps to AArch64 NZCV.  This is far simpler — no
+// status_word RMW needed, no NZCV save/restore.
+//
+// Rosetta EFLAGS → NZCV mapping:  N=SF, Z=ZF, C=!CF, V=OF
+// For FCOMI, SF=0 and OF is used for PF (parity = unordered):
+//   N=0 always, Z=ZF, C=!CF, V=PF
+//
+// Desired NZCV for each FCOMI outcome:
+//   GT: CF=0,ZF=0,PF=0 → N=0,Z=0,C=1,V=0
+//   LT: CF=1,ZF=0,PF=0 → N=0,Z=0,C=0,V=0
+//   EQ: CF=0,ZF=1,PF=0 → N=0,Z=1,C=1,V=0
+//   UN: CF=1,ZF=1,PF=1 → N=0,Z=1,C=0,V=1
+//
+// AArch64 FCMP output NZCV:
+//   GT: N=0,Z=0,C=1,V=0 → matches ✓
+//   LT: N=1,Z=0,C=0,V=0 → N wrong (need 0)
+//   EQ: N=0,Z=1,C=1,V=0 → matches ✓
+//   UN: N=0,Z=0,C=1,V=1 → Z wrong (need 1), C wrong (need 0)
+//
+// Fix: N_new=0, Z_new=Z|V, C_new=C&!V, V_new=V
+//
+// 9 emitted instructions (branchless) vs ~30+ for runtime BL round-trip.
+//
+// Register allocation:
+//   Xbase   (gpr pool 0) — X87State base
+//   Wd_top  (gpr pool 1) — current TOP; updated by pop if FCOMIP/FUCOMIP
+//   Wd_tmp  (gpr pool 2) — scratch for emit_load_st, pop RMW
+//   Wd_z, Wd_v, Wd_c (free pool) — CSET results; freed after packing
+//   Dd_st0  (fpr free)   — ST(0) value
+//   Dd_src  (fpr free)   — ST(i) value
 // =============================================================================
+auto translate_fcomi(TranslationResult* a1, IRInstr* a2) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
 
-static bool is_handled_x87(uint16_t op) {
-    switch (op) {
-        case kOpcodeName_fldz:
-        case kOpcodeName_fld1:
-        case kOpcodeName_fldl2e:
-        case kOpcodeName_fldl2t:
-        case kOpcodeName_fldlg2:
-        case kOpcodeName_fldln2:
-        case kOpcodeName_fldpi:
-        case kOpcodeName_fld:
-        case kOpcodeName_fild:
-        case kOpcodeName_fadd:
-        case kOpcodeName_faddp:
-        case kOpcodeName_fiadd:
-        case kOpcodeName_fsub:
-        case kOpcodeName_fsubr:
-        case kOpcodeName_fsubp:
-        case kOpcodeName_fsubrp:
-        case kOpcodeName_fdiv:
-        case kOpcodeName_fdivr:
-        case kOpcodeName_fdivp:
-        case kOpcodeName_fdivrp:
-        case kOpcodeName_fmul:
-        case kOpcodeName_fmulp:
-        case kOpcodeName_fst:
-        case kOpcodeName_fst_stack:
-        case kOpcodeName_fstp:
-        case kOpcodeName_fstp_stack:
-        case kOpcodeName_fstsw:
-        case kOpcodeName_fcom:
-        case kOpcodeName_fcomp:
-        case kOpcodeName_fcompp:
-        case kOpcodeName_fucom:
-        case kOpcodeName_fucomp:
-        case kOpcodeName_fucompp:
-        case kOpcodeName_fxch:
-        case kOpcodeName_fchs:
-        case kOpcodeName_fabs:
-        case kOpcodeName_fsqrt:
-        case kOpcodeName_fistp:
-        case kOpcodeName_fidiv:
-        case kOpcodeName_fimul:
-        case kOpcodeName_fisub:
-        case kOpcodeName_fidivr:
-        case kOpcodeName_frndint:
-            return true;
-        default:
-            return false;
-    }
+    const bool is_popping = (a2->opcode == kOpcodeName_fcomip || a2->opcode == kOpcodeName_fucomip);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Dd_st0 = alloc_free_fpr(*a1);
+    const int Dd_src = alloc_free_fpr(*a1);
+
+    // Load ST(0) and ST(i).
+    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+    const int depth = a2->operands[1].reg.reg.index();
+    emit_load_st(buf, Xbase, Wd_top, depth, Wd_tmp, Dd_src, Xst_base);
+
+    // FCMP Dd_st0, Dd_src — clobbers NZCV with FP comparison result
+    emit_fcmp_f64(buf, Dd_st0, Dd_src);
+
+    free_fpr(*a1, Dd_src);
+    free_fpr(*a1, Dd_st0);
+
+    // Branchless NZCV fixup: extract conditions while NZCV is live.
+    const int Wd_z = alloc_free_gpr(*a1);
+    const int Wd_v = alloc_free_gpr(*a1);
+    const int Wd_c = alloc_free_gpr(*a1);
+
+    // All three CSETs must execute before any MSR clobbers NZCV.
+    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_z);     // 1 if equal
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);     // 1 if overflow (unordered)
+    emit_cset(buf, /*is_64bit=*/0, /*CS=*/2, Wd_c);     // 1 if carry set
+
+    // Z_new = Z | V  (EQ or unordered)
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 0, Wd_z, Wd_z);
+    // C_new = C & !V  (carry clear for unordered)
+    emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=invert*/1, /*LSL*/0, Wd_v, 0, Wd_c, Wd_c);
+
+    // Pack into NZCV format: [31]=N=0, [30]=Z, [29]=C, [28]=V=PF, [26]=PF
+    // Two consumers of this NZCV value use different bit positions for the
+    // unordered/PF flag:
+    //   bit 26: Rosetta's jp/jnp translation reads PF via ubfx w, w, #26, #1
+    //   bit 28: AArch64 FCSEL VS/VC conditions (used by translate_fcmov)
+    // Set Wd_v at both positions to satisfy both consumers.
+    // LSL Wd_z, Wd_z, #30
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
+                  /*immr=*/2, /*imms=*/1, Wd_z, Wd_z);
+    // ORR Wd_z, Wd_z, Wd_c, LSL #29
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_c, 29, Wd_z, Wd_z);
+    // ORR Wd_z, Wd_z, Wd_v, LSL #28  (V = PF, for FCMOV FCSEL VS/VC)
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 28, Wd_z, Wd_z);
+    // ORR Wd_z, Wd_z, Wd_v, LSL #26  (PF slot, for Rosetta jp/jnp ubfx #26)
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 26, Wd_z, Wd_z);
+
+    // MSR NZCV, Wd_z — set the corrected flags
+    buf.emit(0xD51B4200u | uint32_t(Wd_z));
+
+    free_gpr(*a1, Wd_c);
+    free_gpr(*a1, Wd_v);
+    free_gpr(*a1, Wd_z);
+
+    // Pop if FCOMIP / FUCOMIP.
+    if (is_popping)
+        x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
 }
 
 // =============================================================================
-// Peephole: FLD + popping-arithmetic fusion
+// FTST — compare ST(0) against +0.0, set x87 condition codes
 //
-// Recognises pairs like  FLD ST(i) + FADDP ST(1)  whose push and pop cancel,
-// and emits the net effect as a single non-pushing/non-popping arithmetic:
+// x87 semantics:
+//   FTST  D9 E4   Compare ST(0) with 0.0, set C0/C2/C3 in status_word.
+//   No stack mutation. No explicit operands.
 //
-//   load old_ST(0) → Dd_st0
-//   load/materialise fld_value → Dd_fld
-//   <arithmetic> Dd_st0, Dd_st0, Dd_fld   (or reversed for FSUBR/FDIVR)
-//   store Dd_st0 → ST(0)
+// This is equivalent to FCOM but with 0.0 as the comparand. We use
+// FCMP Dd, #0.0 (single instruction) instead of loading a zero register.
 //
-// Saves ~14 emitted AArch64 instructions per fused pair (push=8 + pop=5 + the
-// extra load/store overhead = eliminated).
+// Uses the same branchless flag mapping as translate_fcom.
 //
-// Returns 1 if the pair was fused (caller must consume 2 IR instructions).
-// Returns 0 if the pair is not fusable (caller translates individually).
+// Register allocation:
+//   Xbase   (gpr pool 0) — X87State base
+//   Wd_top  (gpr pool 1) — current TOP (read-only; no push/pop)
+//   Wd_tmp  (gpr pool 2) — scratch
+//   Wd_tmp2 (gpr pool 3) — saved NZCV
+//   Dd_st0  (fpr free)   — ST(0) value
 // =============================================================================
-
-int try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* arithp_instr) {
-    // ── 1. Classify the FLD source ───────────────────────────────────────────
-
-    enum FldSource {
-        kFldReg,
-        kFldM32,
-        kFldM64,
-        kFldZero,
-        kFldOne,
-        kFldConst64,
-        kFildM16,
-        kFildM32,
-        kFildM64
-    };
-
-    const auto fld_op = fld_instr->opcode;
-    FldSource fld_src;
-    int fld_reg_depth = 0;
-    uint64_t fld_const_bits = 0;
-
-    switch (fld_op) {
-        case kOpcodeName_fld:
-            if (fld_instr->operands[0].kind == IROperandKind::Register) {
-                fld_src = kFldReg;
-                fld_reg_depth = fld_instr->operands[1].reg.reg.index();
-            } else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
-                fld_src = kFldM32;
-            else if (fld_instr->operands[0].mem.size == IROperandSize::S64)
-                fld_src = kFldM64;
-            else
-                return 0;  // m80 — not fusable
-            break;
-        case kOpcodeName_fild:
-            if (fld_instr->operands[0].mem.size == IROperandSize::S16)
-                fld_src = kFildM16;
-            else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
-                fld_src = kFildM32;
-            else
-                fld_src = kFildM64;
-            break;
-        case kOpcodeName_fldz:
-            fld_src = kFldZero;
-            break;
-        case kOpcodeName_fld1:
-            fld_src = kFldOne;
-            break;
-        case kOpcodeName_fldl2e:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x3FF71547652B82FEULL;
-            break;
-        case kOpcodeName_fldl2t:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x400A934F0979A371ULL;
-            break;
-        case kOpcodeName_fldlg2:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x3FD34413509F79FFULL;
-            break;
-        case kOpcodeName_fldln2:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x3FE62E42FEFA39EFULL;
-            break;
-        case kOpcodeName_fldpi:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x400921FB54442D18ULL;
-            break;
-        default:
-            return 0;
-    }
-
-    // ── 2. Classify the popping arithmetic op ────────────────────────────────
-
-    enum ArithOp { kAdd, kSub, kSubR, kMul, kDiv, kDivR };
-
-    const auto arith_opcode = arithp_instr->opcode;
-    ArithOp arith;
-
-    switch (arith_opcode) {
-        case kOpcodeName_faddp:
-            arith = kAdd;
-            break;
-        case kOpcodeName_fsubp:
-            arith = kSub;
-            break;
-        case kOpcodeName_fsubrp:
-            arith = kSubR;
-            break;
-        case kOpcodeName_fmulp:
-            arith = kMul;
-            break;
-        case kOpcodeName_fdivp:
-            arith = kDiv;
-            break;
-        case kOpcodeName_fdivrp:
-            arith = kDivR;
-            break;
-        default:
-            return 0;
-    }
-
-    // Must target ST(1) — that's old_ST(0) after the FLD push.
-    // If depth != 1, the result goes to a different slot and the
-    // push/pop don't cancel into a simple overwrite of ST(0).
-    if (arithp_instr->operands[0].reg.reg.index() != 1)
-        return 0;
-
-    // ── 3. Emit fused code ───────────────────────────────────────────────────
-    //
-    // Net effect:  ST(0) = arith(old_ST(0), fld_value)
-    // No TOP change — push and pop cancel.
-    //
-    // Strategy:
-    //   (a) materialise fld_value → Dd_fld  (may use Wd_tmp as scratch)
-    //   (b) load old_ST(0) → Dd_st0 last, so Wd_tmp retains its key for store
-    //   (c) arithmetic
-    //   (d) store result via emit_store_st_at_offset using Wd_tmp key
+auto translate_ftst(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;
 
     AssemblerBuffer& buf = a1->insn_buf;
     auto [Xbase, Wd_top] = x87_begin(*a1, buf);
     const int Xst_base = x87_get_st_base(*a1);
+
     const int Wd_tmp = alloc_gpr(*a1, 2);
-
-    // OPT-C: flush any deferred TOP writeback from a prior push.  The fused
-    // instruction doesn't push/pop so it won't set or clear dirty, but if the
-    // cache run expires after this pair the dirty writeback would be lost.
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
-
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
     const int Dd_st0 = alloc_free_fpr(*a1);
-    const int Dd_fld = alloc_free_fpr(*a1);
 
-    // ── 3a: Load / materialise fld_value → Dd_fld ───────────────────────────
+    // Load ST(0).
+    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
 
-    switch (fld_src) {
-        case kFldReg:
-            emit_load_st(buf, Xbase, Wd_top, fld_reg_depth, Wd_tmp, Dd_fld, Xst_base);
-            break;
+    // MRS Wd_tmp2, NZCV — save current NZCV
+    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));
 
-        case kFldM32: {
-            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
-            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, /*size=*/2 /*S*/, Dd_fld, addr, 0);
-            free_gpr(*a1, addr);
-            emit_fcvt_s_to_d(buf, Dd_fld, Dd_fld);
-            break;
-        }
-        case kFldM64: {
-            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
-            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, /*size=*/3 /*D*/, Dd_fld, addr, 0);
-            free_gpr(*a1, addr);
-            break;
-        }
+    // FCMP Dd_st0, #0.0 — single instruction, no need to load a zero FPR
+    emit_fcmp_zero_f64(buf, Dd_st0);
 
-        case kFildM16:
-        case kFildM32:
-        case kFildM64: {
-            // Integer load + sign-extend + SCVTF, mirroring translate_fild.
-            const int Wd_int = alloc_free_gpr(*a1);
-            const int addr =
-                compute_operand_address(*a1, /*is_64bit=*/true, &fld_instr->operands[0], GPR::XZR);
-            if (fld_src == kFildM16) {
-                emit_ldr_str_imm(buf, 1, 0, 1, 0, addr, Wd_int);     // LDRH
-                emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);  // SXTH
-            } else if (fld_src == kFildM32) {
-                emit_ldr_str_imm(buf, 2, 0, 1, 0, addr, Wd_int);  // LDR W
-            } else {
-                emit_ldr_str_imm(buf, 3, 0, 1, 0, addr, Wd_int);  // LDR X
-            }
-            free_gpr(*a1, addr);
-            const int is_64 = (fld_src == kFildM64) ? 1 : 0;
-            emit_scvtf(buf, is_64, 1 /*f64*/, Dd_fld, Wd_int);
-            free_gpr(*a1, Wd_int);
-            break;
-        }
+    free_fpr(*a1, Dd_st0);
 
-        case kFldZero:
-            emit_movi_d_zero(buf, Dd_fld);
-            break;
+    // Branchless flag mapping (same as translate_fcom)
+    const int Wd_cc = alloc_free_gpr(*a1);
+    const int Wd_vs = alloc_free_gpr(*a1);
 
-        case kFldOne:
-            emit_fmov_d_one(buf, Dd_fld);
-            break;
+    emit_cset(buf, /*is_64bit=*/0, /*CC=*/3, Wd_cc);   // 1 if carry clear (LT)
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);   // 1 if overflow (UN)
+    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_tmp);  // 1 if equal
 
-        case kFldConst64: {
-            // Use Wd_tmp for MOVZ+MOVK chain — overwritten by ST(0) load below.
-            const uint16_t h3 = (uint16_t)(fld_const_bits >> 48);
-            const uint16_t h2 = (uint16_t)(fld_const_bits >> 32);
-            const uint16_t h1 = (uint16_t)(fld_const_bits >> 16);
-            const uint16_t h0 = (uint16_t)(fld_const_bits);
-            emit_movn(buf, 1, 2, 3, h3, Wd_tmp);
-            if (h2)
-                emit_movn(buf, 1, 3, 2, h2, Wd_tmp);
-            if (h1)
-                emit_movn(buf, 1, 3, 1, h1, Wd_tmp);
-            if (h0)
-                emit_movn(buf, 1, 3, 0, h0, Wd_tmp);
-            emit_fmov_x_to_d(buf, Dd_fld, Wd_tmp);
-            break;
-        }
+    // MSR NZCV, Wd_tmp2 — restore saved flags
+    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));
+
+    free_gpr(*a1, Wd_tmp2);
+
+    // C0 = CC | VS
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_cc, Wd_cc);
+    // C3 = EQ | VS
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_tmp, Wd_tmp);
+
+    // Pack: Wd_tmp = (C0 << 8) | (C2 << 10) | (C3 << 14)
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
+                  /*immr=*/24, /*imms=*/23, Wd_cc, Wd_cc);  // LSL #8
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_tmp, 14, Wd_cc, Wd_tmp);
+
+    free_gpr(*a1, Wd_vs);
+    free_gpr(*a1, Wd_cc);
+
+    // RMW status_word
+    {
+        const int Wd_sw = alloc_free_gpr(*a1);
+        emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
+        // OPT-F1: Clear bits [10:8] (C0, C1, C2) with a single BFI, then bit 14 (C3).
+        emit_bitfield(buf, 0, 1, 0, 24, 2, GPR::XZR, Wd_sw);   // clear bits [10:8]
+        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);   // clear bit 14
+        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);
+        emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
+        free_gpr(*a1, Wd_sw);
     }
 
-    // ── 3b: Load old ST(0) → Dd_st0  (Wd_tmp now holds ST(0) key) ──────────
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
 
-    const int Wk24 = emit_load_st(buf, Xbase, Wd_top, /*depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+// =============================================================================
+// FIST — store ST(0) as signed integer to memory (non-popping)
+//
+// x87 semantics:
+//   mem ← (int) ST(0)   using current rounding mode (RC in control_word)
+//   TOP is NOT modified (unlike FISTP).
+//
+// Operand encoding (memory destination at operands[0]):
+//   DF /2   FIST m16int   operands[0].mem.size = S16
+//   DB /2   FIST m32int   operands[0].mem.size = S32
+//
+// Identical to translate_fistp but without the emit_x87_pop at the end.
+// The rounding mode dispatch (CBZ/SUB chain) is shared.
+//
+// Register allocation: identical to translate_fistp.
+// =============================================================================
+auto translate_fist(TranslationResult* a1, IRInstr* a2) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
 
-    // ── 3c: Arithmetic ──────────────────────────────────────────────────────
-    //
-    // After FLD src + F*P ST(1):
-    //   new_ST(0) = fld_val,  new_ST(1) = old_ST(0)
-    //   F*P ST(1),ST(0) computes f(new_ST(1), new_ST(0)) = f(old_ST(0), fld_val)
-    //
-    // So for non-reversed ops: result = old_ST(0) OP fld_val
-    //    for reversed ops:     result = fld_val OP old_ST(0)
+    const IROperandSize int_size = a2->operands[0].mem.size;
 
-    switch (arith) {
-        case kAdd:
-            emit_fadd_f64(buf, Dd_st0, Dd_st0, Dd_fld);
-            break;
-        case kSub:
-            emit_fsub_f64(buf, Dd_st0, Dd_st0, Dd_fld);
-            break;
-        case kSubR:
-            emit_fsub_f64(buf, Dd_st0, Dd_fld, Dd_st0);
-            break;
-        case kMul:
-            emit_fmul_f64(buf, Dd_st0, Dd_st0, Dd_fld);
-            break;
-        case kDiv:
-            emit_fdiv_f64(buf, Dd_st0, Dd_st0, Dd_fld);
-            break;
-        case kDivR:
-            emit_fdiv_f64(buf, Dd_st0, Dd_fld, Dd_st0);
-            break;
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Wd_int = alloc_free_gpr(*a1);
+    const int Dd_val = alloc_free_fpr(*a1);
+
+    // Load ST(0)
+    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_val, Xst_base);
+
+    // Rounding mode dispatch — same CBZ/SUB chain as translate_fistp.
+    const int is_64bit_int = (int_size == IROperandSize::S64) ? 1 : 0;
+    const int Wd_rc = Wd_tmp;
+
+    // [0] LDRH Wd_rc, [Xbase, #0]
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, /*imm12=*/0, Xbase, Wd_rc);
+    // [1] UBFX Wd_rc, Wd_rc, #10, #2
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11, Wd_rc, Wd_rc);
+
+    // [2] CBZ Wd_rc, +28 → [9] FCVTNS
+    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    // [3] SUB Wd_rc, Wd_rc, #1
+    emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
+    // [4] CBZ Wd_rc, +28 → [11] FCVTMS
+    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    // [5] SUB Wd_rc, Wd_rc, #1
+    emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
+    // [6] CBZ Wd_rc, +28 → [13] FCVTPS
+    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+
+    const uint32_t fcvt_base = 0x1E200000u | (uint32_t(is_64bit_int) << 31) |
+                               (1u << 22) | (uint32_t(Dd_val & 0x1F) << 5) |
+                               uint32_t(Wd_int & 0x1F);
+
+    buf.emit(fcvt_base | (3u << 19));   // [7] FCVTZS (RC=3)
+    buf.emit(0x14000000u | 6u);         // [8] B +24 → done
+    buf.emit(fcvt_base | (0u << 19));   // [9] FCVTNS (RC=0)
+    buf.emit(0x14000000u | 4u);         // [10] B +16 → done
+    buf.emit(fcvt_base | (2u << 19));   // [11] FCVTMS (RC=1)
+    buf.emit(0x14000000u | 2u);         // [12] B +8 → done
+    buf.emit(fcvt_base | (1u << 19));   // [13] FCVTPS (RC=2)
+    // [14] done
+
+    // Store integer to memory
+    const int addr_reg =
+        compute_operand_address(*a1, /*is_64bit=*/true, &a2->operands[0], GPR::XZR);
+    const int store_size = (int_size == IROperandSize::S16)   ? 1
+                           : (int_size == IROperandSize::S32) ? 2
+                                                              : 3;
+    emit_str_imm(buf, store_size, Wd_int, addr_reg, /*imm12=*/0);
+    free_gpr(*a1, addr_reg);
+
+    // NO POP — this is FIST, not FISTP.
+
+    free_fpr(*a1, Dd_val);
+    free_gpr(*a1, Wd_int);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+// =============================================================================
+// FISUBR — reverse-subtract: integer - ST(0)
+//
+// x87 semantics:
+//   ST(0) ← (double)(signed integer at mem) - ST(0)
+//
+// Operand encoding (memory source at operands[0]):
+//   DE /5   FISUBR m16int   operands[0].mem.size = S16
+//   DA /5   FISUBR m32int   operands[0].mem.size = S32
+//
+// Identical to translate_fisub except the FSUB operand order is swapped:
+//   fisub:  FSUB Dd_st0, Dd_st0, Dd_int   (ST(0) - int)
+//   fisubr: FSUB Dd_st0, Dd_int,  Dd_st0  (int   - ST(0))
+// =============================================================================
+auto translate_fisubr(TranslationResult* a1, IRInstr* a2) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const bool is_m16 = (a2->operands[0].mem.size == IROperandSize::S16);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Dd_st0 = alloc_free_fpr(*a1);
+    const int Dd_int = alloc_free_fpr(*a1);
+
+    // Step 1: load ST(0)
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+
+    // Step 2: compute source address
+    const int addr_reg =
+        compute_operand_address(*a1, /*is_64bit=*/true, &a2->operands[0], GPR::XZR);
+
+    // Step 3: load integer from memory
+    if (is_m16) {
+        emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=*/1 /*LDR*/,
+                         /*imm12=*/0, addr_reg, addr_reg);
+        emit_bitfield(buf, /*is_64bit=*/0, /*opc=*/0 /*SBFM*/, /*N=*/0,
+                      /*immr=*/0, /*imms=*/15, addr_reg, addr_reg);
+    } else {
+        emit_ldr_str_imm(buf, /*size=*/2, /*is_fp=*/0, /*opc=*/1 /*LDR*/,
+                         /*imm12=*/0, addr_reg, addr_reg);
     }
 
-    // ── 3d: Store result to ST(0) using key from step 3b ────────────────────
+    // Step 4: SCVTF
+    emit_scvtf(buf, /*is_64bit_int=*/0, /*ftype=*/1, Dd_int, addr_reg);
+    free_gpr(*a1, addr_reg);
 
-    emit_store_st_at_offset(buf, Xbase, Wk24, Dd_st0, Xst_base);
+    // Step 5: FSUB Dd_st0, Dd_int, Dd_st0 — integer - ST(0) (REVERSED)
+    emit_fsub_f64(buf, Dd_st0, Dd_int, Dd_st0);
 
-    free_fpr(*a1, Dd_fld);
+    // Step 6: store result
+    emit_store_st_at_offset(buf, Xbase, Wk, Dd_st0, Xst_base);
+
+    free_fpr(*a1, Dd_int);
     free_fpr(*a1, Dd_st0);
     x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
     free_gpr(*a1, Wd_tmp);
-
-    return 1;  // fused — caller consumes 2 instructions
 }
 
 // =============================================================================
-// Peephole: FXCH ST(1) + popping-arithmetic fusion
+// FCMOV — conditional move: ST(0) ← ST(i) if condition is true
 //
-// FXCH ST(1) swaps ST(0) and ST(1). When followed by a popping arithmetic op
-// targeting ST(1), the swap can be eliminated entirely:
+// All 8 variants (fcmovb, fcmovbe, fcmove, fcmovnb, fcmovnbe, fcmovne,
+// fcmovu, fcmovnu) are handled here. The condition is implicit in the opcode.
 //
-//   Commutative (FADDP, FMULP): operand order doesn't matter → skip FXCH.
-//   Non-commutative: FXCH + FSUBP = FSUBRP, FXCH + FSUBRP = FSUBP, etc.
+// x87 semantics:
+//   if (condition) ST(0) ← ST(i)
 //
-// Implementation: dispatch to the existing translate_* function with the
-// original (commutative) or opcode-swapped (non-commutative) instruction.
-// For the swap case, we make a shallow copy of the IRInstr with the modified
-// opcode so the translator's `a2->opcode == kOpcodeName_fsubrp` check works.
+// Operand encoding:
+//   operands[0] = ST(0) destination (implicit)
+//   operands[1] = ST(i) source
 //
-// Returns 1 if fused (2 instructions consumed), 0 otherwise.
+// x86 condition → Rosetta NZCV condition code mapping:
+//   FCMOVB   (CF=1)          → CC (C=0, since Rosetta C=!CF) = condition 3
+//   FCMOVBE  (CF=1 | ZF=1)  → LS (C=0 | Z=1)                = condition 9
+//   FCMOVE   (ZF=1)          → EQ (Z=1)                      = condition 0
+//   FCMOVNB  (CF=0)          → CS (C=1)                      = condition 2
+//   FCMOVNBE (CF=0 & ZF=0)  → HI (C=1 & Z=0)                = condition 8
+//   FCMOVNE  (ZF=0)          → NE (Z=0)                      = condition 1
+//   FCMOVU   (PF=1)          → VS (V=1)                      = condition 6
+//   FCMOVNU  (PF=0)          → VC (V=0)                      = condition 7
+//
+// AArch64 FCSEL Dd, Dn, Dm, cond selects Dn if cond, else Dm.
+//   FCSEL Dd_st0, Dd_src, Dd_st0, cond
+//   = if (cond) Dd_st0 = Dd_src; else Dd_st0 = Dd_st0 (no change)
+//
+// Register allocation:
+//   Xbase  (gpr pool 0) — X87State base
+//   Wd_top (gpr pool 1) — current TOP (read-only; no push/pop)
+//   Wd_tmp (gpr pool 2) — offset scratch for emit_{load,store}_st
+//   Dd_st0 (fpr free)   — current ST(0) value
+//   Dd_src (fpr free)   — ST(i) value (the candidate replacement)
 // =============================================================================
-
-int try_fuse_fxch_arithp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* next_instr) {
-    // Only fuse FXCH ST(1) — other depths change which slots the arith op sees.
-    if (fxch_instr->opcode != kOpcodeName_fxch)
-        return 0;
-    if (fxch_instr->operands[1].reg.reg.index() != 1)
-        return 0;
-
-    // The popping op must target ST(1) (the standard form).
-    const auto next_op = next_instr->opcode;
-    bool is_popping_arith = false;
-    switch (next_op) {
-        case kOpcodeName_faddp:
-        case kOpcodeName_fmulp:
-        case kOpcodeName_fsubp:
-        case kOpcodeName_fsubrp:
-        case kOpcodeName_fdivp:
-        case kOpcodeName_fdivrp:
-            is_popping_arith = true;
-            break;
-        default:
-            break;
-    }
-    if (!is_popping_arith)
-        return 0;
-    if (next_instr->operands[0].reg.reg.index() != 1)
-        return 0;
-
-    // Determine what to emit.  For commutative ops, emit as-is.
-    // For non-commutative, swap normal↔reversed.
-    switch (next_op) {
-        case kOpcodeName_faddp:
-            translate_faddp(a1, next_instr);
-            break;
-        case kOpcodeName_fmulp:
-            translate_fmul(a1, next_instr);  // translate_fmul handles fmulp via opcode check
-            break;
-        case kOpcodeName_fsubp: {
-            // FXCH + FSUBP = FSUBRP: swap operand order.
-            IRInstr copy = *next_instr;
-            copy.opcode = kOpcodeName_fsubrp;
-            translate_fsubp(a1, &copy);
-            break;
-        }
-        case kOpcodeName_fsubrp: {
-            IRInstr copy = *next_instr;
-            copy.opcode = kOpcodeName_fsubp;
-            translate_fsubp(a1, &copy);
-            break;
-        }
-        case kOpcodeName_fdivp: {
-            IRInstr copy = *next_instr;
-            copy.opcode = kOpcodeName_fdivrp;
-            translate_fdivp(a1, &copy);
-            break;
-        }
-        case kOpcodeName_fdivrp: {
-            IRInstr copy = *next_instr;
-            copy.opcode = kOpcodeName_fdivp;
-            translate_fdivp(a1, &copy);
-            break;
-        }
-        default:
-            return 0;
-    }
-
-    return 1;
-}
-
-// =============================================================================
-// Peephole: FLD + FSTP fusion (register copy / memory load-store)
-//
-// When FLD pushes a value and the immediately following FSTP pops it, the
-// push and pop cancel.  The net effect depends on the FSTP destination:
-//
-//   FSTP ST(1)  → ST(0) overwritten with fld_value   (register copy)
-//   FSTP m32/m64 → fld_value stored to memory         (memory write)
-//
-// Only FSTP ST(1) is handled for register destinations (the push/pop only
-// cancel to a TOP-preserving overwrite of ST(0) when j == 1).
-// FSTP m32/m64 is handled for any memory destination.
-//
-// NOT handled: FSTP m80 (runtime helper), FSTP ST(j) with j != 1.
-//
-// Returns 1 if fused (2 instructions consumed), 0 otherwise.
-// =============================================================================
-
-int try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* fstp_instr) {
-    // The second instruction must be FSTP (popping store).
-    if (fstp_instr->opcode != kOpcodeName_fstp && fstp_instr->opcode != kOpcodeName_fstp_stack)
-        return 0;
-
-    // Determine FSTP destination.
-    const bool fstp_is_reg = (fstp_instr->operands[0].kind == IROperandKind::Register);
-    const bool fstp_is_mem = !fstp_is_reg;
-
-    if (fstp_is_reg) {
-        // Only handle FSTP ST(1) — push/pop cancel for this depth only.
-        if (fstp_instr->operands[0].reg.reg.index() != 1)
-            return 0;
-    } else {
-        // Memory FSTP — reject m80 (runtime helper).
-        if (fstp_instr->operands[0].mem.size == IROperandSize::S80)
-            return 0;
-    }
-
-    // ── Classify the FLD source (same as try_fuse_fld_arithp) ────────────────
-
-    enum FldSource {
-        kFldReg,
-        kFldM32,
-        kFldM64,
-        kFldZero,
-        kFldOne,
-        kFldConst64,
-        kFildM16,
-        kFildM32,
-        kFildM64
-    };
-
-    const auto fld_op = fld_instr->opcode;
-    FldSource fld_src;
-    int fld_reg_depth = 0;
-    uint64_t fld_const_bits = 0;
-
-    switch (fld_op) {
-        case kOpcodeName_fld:
-            if (fld_instr->operands[0].kind == IROperandKind::Register) {
-                fld_src = kFldReg;
-                fld_reg_depth = fld_instr->operands[1].reg.reg.index();
-            } else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
-                fld_src = kFldM32;
-            else if (fld_instr->operands[0].mem.size == IROperandSize::S64)
-                fld_src = kFldM64;
-            else
-                return 0;  // m80
-            break;
-        case kOpcodeName_fild:
-            if (fld_instr->operands[0].mem.size == IROperandSize::S16)
-                fld_src = kFildM16;
-            else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
-                fld_src = kFildM32;
-            else
-                fld_src = kFildM64;
-            break;
-        case kOpcodeName_fldz:
-            fld_src = kFldZero;
-            break;
-        case kOpcodeName_fld1:
-            fld_src = kFldOne;
-            break;
-        case kOpcodeName_fldl2e:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x3FF71547652B82FEULL;
-            break;
-        case kOpcodeName_fldl2t:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x400A934F0979A371ULL;
-            break;
-        case kOpcodeName_fldlg2:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x3FD34413509F79FFULL;
-            break;
-        case kOpcodeName_fldln2:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x3FE62E42FEFA39EFULL;
-            break;
-        case kOpcodeName_fldpi:
-            fld_src = kFldConst64;
-            fld_const_bits = 0x400921FB54442D18ULL;
-            break;
-        default:
-            return 0;
-    }
-
-    // ── Emit fused code ──────────────────────────────────────────────────────
-
+auto translate_fcmov(TranslationResult* a1, IRInstr* a2) -> void {
     AssemblerBuffer& buf = a1->insn_buf;
     auto [Xbase, Wd_top] = x87_begin(*a1, buf);
     const int Xst_base = x87_get_st_base(*a1);
+
+    // Map opcode to AArch64 condition code.
+    int aarch64_cond;
+    switch (a2->opcode) {
+        case kOpcodeName_fcmovb:   aarch64_cond = 3;  break;  // CC
+        case kOpcodeName_fcmovbe:  aarch64_cond = 9;  break;  // LS
+        case kOpcodeName_fcmove:   aarch64_cond = 0;  break;  // EQ
+        case kOpcodeName_fcmovnb:  aarch64_cond = 2;  break;  // CS
+        case kOpcodeName_fcmovnbe: aarch64_cond = 8;  break;  // HI
+        case kOpcodeName_fcmovne:  aarch64_cond = 1;  break;  // NE
+        case kOpcodeName_fcmovu:   aarch64_cond = 6;  break;  // VS
+        case kOpcodeName_fcmovnu:  aarch64_cond = 7;  break;  // VC
+        default:                   aarch64_cond = 14; break;  // AL (should never happen)
+    }
+
+    const int depth_src = a2->operands[1].reg.reg.index();
+
     const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Dd_st0 = alloc_free_fpr(*a1);
+    const int Dd_src = alloc_free_fpr(*a1);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // Load ST(i) FIRST — its key is discarded (Opt 3 pattern).
+    emit_load_st(buf, Xbase, Wd_top, depth_src, Wd_tmp, Dd_src, Xst_base);
+    // Load ST(0) LAST — Wd_tmp retains ST(0) key for emit_store_st_at_offset.
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
 
-    const int Dd_val = alloc_free_fpr(*a1);
+    // FCSEL: if (cond) result = Dd_src, else result = Dd_st0
+    // NZCV is live from prior x86 ALU/FCOMI — this is what FCMOV tests.
+    emit_fcsel_f64(buf, Dd_st0, Dd_src, Dd_st0, aarch64_cond);
 
-    // ── Materialise the FLD value into Dd_val ────────────────────────────────
+    // Store result back to ST(0).
+    emit_store_st_at_offset(buf, Xbase, Wk, Dd_st0, Xst_base);
 
-    switch (fld_src) {
-        case kFldReg:
-            emit_load_st(buf, Xbase, Wd_top, fld_reg_depth, Wd_tmp, Dd_val, Xst_base);
-            break;
-        case kFldM32: {
-            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
-            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, 2, Dd_val, addr, 0);
-            free_gpr(*a1, addr);
-            emit_fcvt_s_to_d(buf, Dd_val, Dd_val);
-            break;
-        }
-        case kFldM64: {
-            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
-            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
-            emit_fldr_imm(buf, 3, Dd_val, addr, 0);
-            free_gpr(*a1, addr);
-            break;
-        }
-        case kFildM16:
-        case kFildM32:
-        case kFildM64: {
-            const int Wd_int = alloc_free_gpr(*a1);
-            const int addr = compute_operand_address(*a1, true, &fld_instr->operands[0], GPR::XZR);
-            if (fld_src == kFildM16) {
-                emit_ldr_str_imm(buf, 1, 0, 1, 0, addr, Wd_int);
-                emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);
-            } else if (fld_src == kFildM32) {
-                emit_ldr_str_imm(buf, 2, 0, 1, 0, addr, Wd_int);
-            } else {
-                emit_ldr_str_imm(buf, 3, 0, 1, 0, addr, Wd_int);
-            }
-            free_gpr(*a1, addr);
-            emit_scvtf(buf, (fld_src == kFildM64) ? 1 : 0, 1, Dd_val, Wd_int);
-            free_gpr(*a1, Wd_int);
-            break;
-        }
-        case kFldZero:
-            emit_movi_d_zero(buf, Dd_val);
-            break;
-        case kFldOne:
-            emit_fmov_d_one(buf, Dd_val);
-            break;
-        case kFldConst64: {
-            const uint16_t h3 = (uint16_t)(fld_const_bits >> 48);
-            const uint16_t h2 = (uint16_t)(fld_const_bits >> 32);
-            const uint16_t h1 = (uint16_t)(fld_const_bits >> 16);
-            const uint16_t h0 = (uint16_t)(fld_const_bits);
-            emit_movn(buf, 1, 2, 3, h3, Wd_tmp);
-            if (h2)
-                emit_movn(buf, 1, 3, 2, h2, Wd_tmp);
-            if (h1)
-                emit_movn(buf, 1, 3, 1, h1, Wd_tmp);
-            if (h0)
-                emit_movn(buf, 1, 3, 0, h0, Wd_tmp);
-            emit_fmov_x_to_d(buf, Dd_val, Wd_tmp);
-            break;
-        }
-    }
-
-    // ── Store to destination ─────────────────────────────────────────────────
-
-    if (fstp_is_reg) {
-        // FSTP ST(1) → net effect: ST(0) = fld_value. Store to ST(0).
-        emit_store_st(buf, Xbase, Wd_top, /*depth=*/0, Wd_tmp, Dd_val, Xst_base);
-    } else {
-        // FSTP m32/m64 → net effect: mem = fld_value. Store to memory.
-        const bool is_f32 = (fstp_instr->operands[0].mem.size == IROperandSize::S32);
-        if (is_f32)
-            emit_fcvt_d_to_s(buf, Dd_val, Dd_val);
-
-        const int addr =
-            compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
-        emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_val, addr, 0);
-        free_gpr(*a1, addr);
-    }
-
-    free_fpr(*a1, Dd_val);
+    free_fpr(*a1, Dd_src);
+    free_fpr(*a1, Dd_st0);
     x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
     free_gpr(*a1, Wd_tmp);
-
-    return 1;
-}
-
-// =============================================================================
-// Peephole: FXCH ST(1) + FSTP ST(1) → just pop
-//
-// FXCH ST(1) swaps the contents of ST(0) and ST(1).  When followed by
-// FSTP ST(1), the FSTP stores the new ST(0) (= old_ST(1)) back into
-// ST(1)'s slot, then pops.  This means ST(1)'s slot ends up containing
-// old_ST(1) — exactly what was there before the FXCH.  The pop then
-// promotes ST(1) to the new ST(0), giving new ST(0) = old_ST(1).
-//
-// This is identical to a plain pop (which also gives new ST(0) = old_ST(1)).
-//
-// State trace:
-//   Before:           slot[T]=A, slot[T+1]=B
-//   After FXCH:       slot[T]=B, slot[T+1]=A
-//   FSTP ST(1):       store slot[T]=B → slot[T+1].  slot[T+1]=B.  TOP++.
-//   New ST(0) =       slot[T+1] = B
-//   Plain pop:        TOP++.  New ST(0) = slot[T+1] = B.  ✓ Same.
-//
-// NOT safe for FSTP m32/m64: the FXCH puts old_ST(0)=A into slot[T+1],
-// which becomes new ST(0) after pop.  A naive fusion that skips the FXCH
-// would leave slot[T+1]=B, giving the wrong new ST(0).
-//
-// Savings: eliminates FXCH (6 insns) + the redundant load/store in FSTP
-// (which stores B to the slot that already contains B).  Emits only the
-// pop sequence (5 insns) instead of FXCH(6) + FSTP(~10) = ~16 insns.
-//
-// Returns 1 if fused (2 instructions consumed), 0 otherwise.
-// =============================================================================
-
-int try_fuse_fxch_fstp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* fstp_instr) {
-    // Must be FXCH ST(1).
-    if (fxch_instr->opcode != kOpcodeName_fxch)
-        return 0;
-    if (fxch_instr->operands[1].reg.reg.index() != 1)
-        return 0;
-
-    // Must be FSTP ST(1) (register, popping).
-    if (fstp_instr->opcode != kOpcodeName_fstp_stack)
-        return 0;
-    if (fstp_instr->operands[0].kind != IROperandKind::Register)
-        return 0;
-    if (fstp_instr->operands[0].reg.reg.index() != 1)
-        return 0;
-
-    // ── Emit: just a pop ─────────────────────────────────────────────────────
-
-    AssemblerBuffer& buf = a1->insn_buf;
-    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
-    const int Wd_tmp = alloc_gpr(*a1, 2);
-
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
-    x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
-    free_gpr(*a1, Wd_tmp);
-
-    return 1;
-}
-
-int x87_cache_lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx) {
-    int count = 0;
-    for (int64_t i = insn_idx; i < num_instrs; i++) {
-        if (!is_handled_x87(instr_array[i].opcode))
-            break;
-        count++;
-    }
-    return count;
 }
 
 };  // namespace TranslatorX87

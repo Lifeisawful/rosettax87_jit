@@ -350,6 +350,41 @@ void emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int W
 }
 
 // =============================================================================
+// 2i-deferred — x87 stack pop WITHOUT status_word writeback (OPT-C)
+//
+// Same as emit_x87_pop but skips the 3-instruction emit_store_top call.
+// The caller is responsible for ensuring status_word is written before any
+// code path that reads it (via x87_flush_top or x87_end).
+//
+// Saves 3 emitted instructions per pop when the cache is active and the
+// next instruction will read TOP from the register, not memory.
+//
+// On return: Wd_top = newTop (register only — memory is stale).
+//            Wd_tmp and Wd_tmp2 are clobbered.
+// =============================================================================
+void emit_x87_pop_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2) {
+    // ── tagWord |= (3 << (oldTop * 2))  →  mark popped slot kEmpty ──────────
+
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                  /*immr*/ 31, /*imms*/ 30, Wd_top, Wd_tmp2);
+    emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp);
+    buf.emit(0x1AC02000u | (uint32_t(Wd_tmp2) << 16) | (uint32_t(Wd_tmp) << 5) | uint32_t(Wd_tmp));
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordImm12, Xbase, Wd_tmp2);
+    emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                             /*LSL*/ 0, Wd_tmp, /*shift_amt*/ 0, Wd_tmp2, Wd_tmp2);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87TagWordImm12, Xbase, Wd_tmp2);
+
+    // ── Compute newTop = (oldTop + 1) & 7  (register only) ──────────────────
+
+    emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                 /*shift=*/0, 1, Wd_top, Wd_top);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_top,
+                 /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_top);
+
+    // NOTE: emit_store_top SKIPPED — caller manages writeback (OPT-C)
+}
+
+// =============================================================================
 // 2i-fast — x87 fused multi-pop  (TOP += n, single status_word RMW)
 //
 // Marks n consecutive slots starting from old TOP as kEmpty in the tag word,
@@ -407,6 +442,48 @@ void emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int
                  /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_top);
 
     emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
+}
+
+// =============================================================================
+// 2i-fast-deferred — x87 fused multi-pop WITHOUT status_word writeback (OPT-C)
+//
+// Same as emit_x87_pop_n but skips the emit_store_top call.
+// =============================================================================
+
+void emit_x87_pop_n_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2,
+                             int n) {
+    for (int i = 0; i < n; i++) {
+        if (i == 0) {
+            emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                          /*immr*/ 31, /*imms*/ 30, Wd_top, Wd_tmp2);
+        } else {
+            emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                         /*shift=*/0, i, Wd_top, Wd_tmp2);
+            emit_and_imm(buf, /*is_64=*/0, Wd_tmp2,
+                         /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_tmp2);
+            emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                          /*immr*/ 31, /*imms*/ 30, Wd_tmp2, Wd_tmp2);
+        }
+
+        emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp);
+        buf.emit(0x1AC02000u | (uint32_t(Wd_tmp2) << 16) |
+                 (uint32_t(Wd_tmp) << 5) | uint32_t(Wd_tmp));
+
+        emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1,
+                         kX87TagWordImm12, Xbase, Wd_tmp2);
+        emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                                 /*LSL*/ 0, Wd_tmp, /*shift_amt*/ 0,
+                                 Wd_tmp2, Wd_tmp2);
+        emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0,
+                         kX87TagWordImm12, Xbase, Wd_tmp2);
+    }
+
+    emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                 /*shift=*/0, n, Wd_top, Wd_top);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_top,
+                 /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_top);
+
+    // NOTE: emit_store_top SKIPPED — caller manages writeback (OPT-C)
 }
 
 // =============================================================================

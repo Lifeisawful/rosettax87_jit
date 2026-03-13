@@ -166,6 +166,20 @@ auto emit_fmov_d_to_x(AssemblerBuffer& buf, int Xd, int Dn) -> void;
 auto emit_movi_d_zero(AssemblerBuffer& buf, int Dd) -> void;
 auto emit_fmov_d_one(AssemblerBuffer& buf, int Dd) -> void;
 
+// CSET Wd, cond — set Wd to 1 if condition holds, else 0
+// Encodes as CSINC Rd, XZR, XZR, invert(cond)
+// AArch64 cond codes: EQ=0 NE=1 CS=2 CC=3 MI=4 PL=5 VS=6 VC=7
+//                     HI=8 LS=9 GE=10 LT=11 GT=12 LE=13
+auto emit_cset(AssemblerBuffer& buf, int is_64bit, int cond, int Rd) -> void;
+
+// FCSEL Dd, Dn, Dm, cond — conditional FP select (f64)
+// Dd = cond ? Dn : Dm
+// AArch64 cond codes same as above
+auto emit_fcsel_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm, int cond) -> void;
+
+// FCMP Dn, #0.0 — compare FP register against zero, sets NZCV
+auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void;
+
 // SCVTF — signed integer GPR → FP
 // is_64bit_int: 1=64-bit source  0=32-bit
 // ftype:        0=f32  1=f64

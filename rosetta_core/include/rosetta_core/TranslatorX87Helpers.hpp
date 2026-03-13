@@ -15,10 +15,10 @@
 //   +0x00  uint16_t  control_word
 //   +0x02  uint16_t  status_word    ← TOP in bits [13:11]
 //   +0x04  int16_t   tag_word
-//   +0x06  X87Float80 st[8]         ← stride 0x0A bytes each
+//   +0x06  padding for alignment
+//   +0x08  double st[8]         ← stride 0x08 bytes each
 //
-//   st[i] mantissa offset = 0x06 + i * 0x0A
-//   Stride is 10 — no clean power-of-two shift, use LSL#3 + LSL#1 + 6
+//   st[i] mantissa offset = 0x08 + i * 0x08
 //
 //   X18 = thread context pointer (Apple AArch64 ABI, always valid, never clobber)
 //   Xbase = X18 + result.thread_context_offsets->x87_state_offset
@@ -200,9 +200,18 @@ auto emit_x87_push_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_
 
 auto emit_x87_pop(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2) -> void;
 
-// Fused multi-pop: TOP += n with a single status_word RMW (OPT-A).
+// OPT-C: Pop without status_word writeback. Caller must ensure writeback
+// before any path that reads status_word from memory (x87_flush_top / x87_end).
+auto emit_x87_pop_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2)
+    -> void;
+
+// Fused multi-pop: TOP += n with a single status_word RMW.
 auto emit_x87_pop_n(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2, int n)
     -> void;
+
+// OPT-C: Fused multi-pop without status_word writeback.
+auto emit_x87_pop_n_deferred(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp, int Wd_tmp2,
+                             int n) -> void;
 
 // =============================================================================
 // 2j — FCMP result → x87 condition codes in status_word

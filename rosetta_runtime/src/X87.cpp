@@ -1,4 +1,3 @@
-
 // clang-format off
 #include "X87.h"
 
@@ -21,9 +20,11 @@
 #include "openlibm/e_fmod.h"
 #include "openlibm/s_ilogb.h"
 
+#include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/CustomTranslationHook.h"
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/RuntimeLibC.h"
+#include "RuntimeConfig.h"
 // clang-format on
 
 #define X87_TRAMPOLINE(NAME, REGISTER)                                 \
@@ -44,9 +45,14 @@
                      "br " #REGISTER);                                 \
     }
 
+#include "rosetta_core/CustomTranslationHook.h"
+#include "rosetta_core/Opcode.h"
+#include "rosetta_core/RuntimeLibC.h"
+
 void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const* a3) {
     SIMDGuardFull simdGuard;
     exportsInit();
+    rosetta_set_config(&kConfig);
 
     printf("RosettaRuntimex87 built %s\n", __DATE__ " " __TIME__);
 
@@ -56,7 +62,7 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
     uintptr_t transaction_result_size_addr =
         runtime_library_base + kOffsets.transaction_result_size_addr;
 
-    printf("Installing JIT Translation Hook at %p\n", translation_ptr);
+    printf("Installing JIT Translation Hook at 0x%lx\n", (unsigned long)translation_ptr);
     init_custom_translation_hook(translation_ptr, transaction_result_size_addr);
     printf("JIT Translation Hook installed\n");
 
@@ -237,7 +243,7 @@ uint128_t x87_fbstp(X87State* state) {
     bool is_negative = signbit(st0);
 
     // Handle special cases
-    if (isnan(st0) || isinf(st0)) {
+    if (x87_is_nan_or_inf(st0)) {
         // Set to indefinite BCD value
         memset(bcd, 0, 10);
         if (is_negative) {
@@ -344,7 +350,7 @@ void x87_fcom_ST(X87State* state, uint32_t st_offset, uint32_t number_of_pops) {
     }
 
     if ((state->controlWord & kInvalidOpMask) == kInvalidOpMask) {
-        if (isnan(st0) || isnan(src)) {
+        if (x87_is_nan(st0) || x87_is_nan(src)) {
             state->statusWord |=
                 kConditionCode0 | kConditionCode2 | kConditionCode3;  // Set C0=C2=C3=1
         }
@@ -374,7 +380,7 @@ void x87_fcom_f32(X87State* state, uint32_t fp32, bool pop) {
     }
 
     if ((state->controlWord & kInvalidOpMask) == kInvalidOpMask) {
-        if (isnan(st0) || isnan(src)) {
+        if (x87_is_nan(st0) || x87_is_nan(src)) {
             state->statusWord |=
                 kConditionCode0 | kConditionCode2 | kConditionCode3;  // Set C0=C2=C3=1
         }
@@ -403,7 +409,7 @@ void x87_fcom_f64(X87State* state, uint64_t fp64, bool pop) {
     }
 
     if ((state->controlWord & kInvalidOpMask) == kInvalidOpMask) {
-        if (isnan(st0) || isnan(src)) {
+        if (x87_is_nan(st0) || x87_is_nan(src)) {
             state->statusWord |=
                 kConditionCode0 | kConditionCode2 | kConditionCode3;  // Set C0=C2=C3=1
         }
@@ -435,7 +441,9 @@ uint32_t x87_fcomi(X87State* state, uint32_t st_offset, bool pop) {
     x87_fcomi result: 0x000000060000000
     */
 
-    if (st0_val < sti_val) {
+    if (x87_is_nan(st0_val) || x87_is_nan(sti_val)) {
+        flags = 0x54000000;  // unordered: bit26=PF for x87_fcmov path, V=1 for translated fcsel VS/VC path
+    } else if (st0_val < sti_val) {
         flags = 0x000000000000000;
     } else if (st0_val > sti_val) {
         flags = 0x000000020000000;
@@ -603,7 +611,7 @@ void x87_ficom(X87State* state, int32_t src, bool pop) {
     state->statusWord &= ~(kConditionCode0 | kConditionCode2 | kConditionCode3);
 
     // Set condition codes based on comparison
-    if (isnan(st0)) {
+    if (x87_is_nan(st0)) {
         state->statusWord |= kConditionCode0 | kConditionCode2 | kConditionCode3;  // Set C0=C2=C3=1
     } else if (st0 > src) {
         // Leave C0=C2=C3=0
@@ -1081,7 +1089,7 @@ void x87_fprem(X87State* state) {
     double st1 = state->getSt(1);
 
     // 2) Special cases: NaN/div0/∞ → #IA, ∞ divisor → pass through
-    if (isnan(st0) || isnan(st1) || isinf(st0) || st1 == 0.0) {
+    if (x87_is_nan(st0) || x87_is_nan(st1) || x87_is_inf(st0) || st1 == 0.0) {
         state->setSt(0, std::numeric_limits<double>::quiet_NaN());
         state->statusWord |= kInvalidOperation;
         return;
@@ -1128,7 +1136,7 @@ void x87_fprem1(X87State* state) {
     double st1 = state->getSt(1);
 
     // 2) special cases: NaN/div0/∞ → #IA or pass through
-    if (isnan(st0) || isnan(st1) || isinf(st0) || st1 == 0.0) {
+    if (x87_is_nan(st0) || x87_is_nan(st1) || x87_is_inf(st0) || st1 == 0.0) {
         state->setSt(0, std::numeric_limits<double>::quiet_NaN());
         state->statusWord |= kInvalidOperation;
         return;
@@ -1498,7 +1506,7 @@ void x87_fucom(X87State* state, uint32_t st_offset, uint32_t pop) {
     state->statusWord &= ~(kConditionCode0 | kConditionCode2 | kConditionCode3);
 
     // Set condition codes based on comparison
-    if (isnan(st0) || isnan(src)) {
+    if (x87_is_nan(st0) || x87_is_nan(src)) {
         state->statusWord |= kConditionCode0 | kConditionCode2 | kConditionCode3;  // Set C0=C2=C3=1
     } else if (st0 > src) {
         // Leave C0=C2=C3=0
@@ -1513,6 +1521,8 @@ void x87_fucom(X87State* state, uint32_t st_offset, uint32_t pop) {
         state->pop();
     }
 }
+
+
 
 uint32_t x87_fucomi(X87State* state, uint32_t st_offset, bool pop_stack) {
     SIMDGuard simdGuard;
@@ -1536,7 +1546,9 @@ uint32_t x87_fucomi(X87State* state, uint32_t st_offset, bool pop_stack) {
     x87_fcomi result: 0x000000060000000
     */
 
-    if (st0_val < sti_val) {
+    if (x87_is_nan(st0_val) || x87_is_nan(sti_val)) {
+        flags = 0x54000000;  // unordered: bit26=PF for x87_fcmov path, V=1 for translated fcsel VS/VC path
+    } else if (st0_val < sti_val) {
         flags = 0x000000000000000;
     } else if (st0_val > sti_val) {
         flags = 0x000000020000000;
@@ -1589,12 +1601,12 @@ void x87_fxam(X87State* state) {
     }
 
     // Set C3,C2,C0 based on value type
-    if (isnan(value)) {
+    if (x87_is_nan(value)) {
         state->statusWord |= X87StatusWordFlag::kConditionCode0;  // 001
-    } else if (isinf(value)) {
+    } else if (x87_is_inf(value)) {
         state->statusWord |=
             X87StatusWordFlag::kConditionCode2 | X87StatusWordFlag::kConditionCode0;  // 011
-    } else if (fpclassify(value) == FP_SUBNORMAL) {
+    } else if (x87_is_subnormal(value)) {
         state->statusWord |=
             X87StatusWordFlag::kConditionCode3 | X87StatusWordFlag::kConditionCode2;  // 110
     } else {

@@ -31,6 +31,7 @@ add_executable(libRuntimeRosettax87
     src/Log.cpp
     src/SIMDGuard.cpp
     src/Offsets.cpp
+    src/RuntimeConfig.cpp
 )
 
 target_include_directories(libRuntimeRosettax87 PRIVATE
@@ -42,14 +43,16 @@ target_link_options(libRuntimeRosettax87 PRIVATE
 #    "-Wl,-no_pie"
     "-static"
     "-nostdlib"
-    "-Wl,-segaddr,__TEXT,0x0"
-    "-Wl,-segaddr,__DATA,0x20000"
+#    "-Wl,-segaddr,__TEXT,0x0"
+#    "-Wl,-segaddr,__DATA,0x50000"
     "-Wl,-pagezero_size,0x0"
     "-Wl,-headerpad,0"
     "-Wl,-e,_start"
     "-Wl,-segalign,10"
     "-Wl,-fixup_chains_section"          # emit LC_DYLD_CHAINED_FIXUPS so we can rebase
 )
+
+set_property(TARGET libRuntimeRosettax87 PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 target_compile_options(libRuntimeRosettax87 PRIVATE
     ${OPTIMIZATION_FLAGS}

@@ -367,6 +367,51 @@ auto emit_fcmp_f64(AssemblerBuffer& buf, int Dn, int Dm) -> void {
     emit_fp_cmp(buf, /*type=*/1, Dn, Dm);
 }
 
+// =============================================================================
+// CSET Wd, cond — conditional set (1 if cond, else 0)
+//
+// Encodes as CSINC Rd, XZR, XZR, invert(cond).
+// CSINC encoding: sf | 0 | 0 | 11010100 | Rm | cond | 0 | 1 | Rn | Rd
+//   sf = is_64bit
+//   Rm = XZR (31), Rn = XZR (31)
+//   cond = inverted condition (flip bit 0)
+// =============================================================================
+auto emit_cset(AssemblerBuffer& buf, int is_64bit, int cond, int Rd) -> void {
+    const uint32_t inv_cond = cond ^ 1;
+    uint32_t insn = 0x1A9F07E0u;  // CSINC Rd, XZR, XZR, AL (base with XZR in Rm and Rn)
+    insn |= (uint32_t)(is_64bit & 1) << 31;
+    insn |= (inv_cond & 0xFu) << 12;
+    insn |= (uint32_t)(Rd & 0x1F);
+    buf.emit(insn);
+}
+
+// =============================================================================
+// FCSEL Dd, Dn, Dm, cond — conditional FP select (f64)
+//
+// Encoding: M=0, S=0, 11110, type=01(f64), 1, Rm, cond, 11, Rn, Rd
+// Base: 0x1E600C00
+// =============================================================================
+auto emit_fcsel_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm, int cond) -> void {
+    uint32_t insn = 0x1E600C00u;
+    insn |= (uint32_t)(Dm & 0x1F) << 16;
+    insn |= (uint32_t)(cond & 0xF) << 12;
+    insn |= (uint32_t)(Dn & 0x1F) << 5;
+    insn |= (uint32_t)(Dd & 0x1F);
+    buf.emit(insn);
+}
+
+// =============================================================================
+// FCMP Dn, #0.0 — compare FP register against zero
+//
+// Encoding: same as FCMP but bit[3]=1, Rm field=00000
+// 0x1E602008 | (Rn << 5)  for f64
+// =============================================================================
+auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void {
+    uint32_t insn = 0x1E602008u;
+    insn |= (uint32_t)(Dn & 0x1F) << 5;
+    buf.emit(insn);
+}
+
 auto emit_fcvt(AssemblerBuffer& buf, int dst_type, int src_type, int Rd, int Rn) -> void {
     // FCVT: same encoding as emit_fp_dp1 but opcode encodes destination type
     // [31:24]=0x1E [23:22]=src_type [21]=1 [20:15]=0001|dst_type<<2 [14:10]=10000
