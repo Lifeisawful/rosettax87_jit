@@ -1382,6 +1382,17 @@ auto translate_fstsw(TranslationResult* a1, IRInstr* a2) -> void {
         a1->x87_cache.top_dirty = 0;
     }
 
+    // OPT-D: FSTSW doesn't call x87_end, so it must flush the pending tag
+    // itself.  Otherwise, if FSTSW is the last instruction in the cache run,
+    // x87_cache_tick clears tag_push_pending without emitting the tag-clear,
+    // leaving the tag word in memory with kEmpty for the pushed slot.
+    if (a1->x87_cache.tag_push_pending && base_cached) {
+        const int Wd_tag_tmp = alloc_free_gpr(*a1);
+        emit_x87_tag_clear(buf, Xbase, a1->x87_cache.top_gpr, Wd_sw, Wd_tag_tmp);
+        free_gpr(*a1, Wd_tag_tmp);
+        a1->x87_cache.tag_push_pending = 0;
+    }
+
     // LDRH Wd_sw, [Xbase, #0x02]   — load status_word (16-bit halfword)
     // imm12=1 because LDRH scales by 2: byte offset = 1*2 = 2
     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=*/1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -2482,6 +2493,11 @@ auto translate_ftst(TranslationResult* a1, IRInstr* /*a2*/) -> void {
 
     const int Wd_tmp = alloc_gpr(*a1, 2);
     const int Wd_tmp2 = alloc_gpr(*a1, 3);
+
+    // OPT-D: flush deferred tag and TOP before FTST (reads status_word/tag).
+    x87_flush_tags(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
     const int Dd_st0 = alloc_free_fpr(*a1);
 
     // Load ST(0).
@@ -2736,6 +2752,14 @@ auto translate_fcmov(TranslationResult* a1, IRInstr* a2) -> void {
     const int Dd_st0 = alloc_free_fpr(*a1);
     const int Dd_src = alloc_free_fpr(*a1);
 
+    // OPT-D: flush deferred tag and TOP before FCMOV.
+    {
+        const int Wd_tmp2 = alloc_free_gpr(*a1);
+        x87_flush_tags(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+        free_gpr(*a1, Wd_tmp2);
+    }
+    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
     // Load ST(i) FIRST — its key is discarded (Opt 3 pattern).
     emit_load_st(buf, Xbase, Wd_top, depth_src, Wd_tmp, Dd_src, Xst_base);
     // Load ST(0) LAST — Wd_tmp retains ST(0) key for emit_store_st_at_offset.
@@ -2753,5 +2777,6 @@ auto translate_fcmov(TranslationResult* a1, IRInstr* a2) -> void {
     x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
     free_gpr(*a1, Wd_tmp);
 }
+
 
 };  // namespace TranslatorX87

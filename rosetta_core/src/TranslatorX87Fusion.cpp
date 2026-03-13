@@ -242,7 +242,9 @@ static auto try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRIns
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_st0 = alloc_free_fpr(*a1);
     const int Dd_fld = alloc_free_fpr(*a1);
@@ -284,7 +286,7 @@ static auto try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRIns
 
     free_fpr(*a1, Dd_fld);
     free_fpr(*a1, Dd_st0);
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 2;
@@ -327,6 +329,13 @@ static auto try_fuse_fxch_arithp(TranslationResult* a1, IRInstr* fxch_instr, IRI
         return std::nullopt;
     if (next_instr->operands[0].reg.reg.index() != 1)
         return std::nullopt;
+
+    // The FXCH is absorbed (no code emitted), but it consumes one tick.
+    // Pre-decrement run_remaining so the delegated translate function's
+    // x87_end(consumed=1) sees the correct budget and flushes deferred
+    // state when the fusion is at the end of a cache run.
+    if (a1->x87_cache.run_remaining > 0)
+        a1->x87_cache.run_remaining--;
 
     switch (next_op) {
         case kOpcodeName_faddp:
@@ -404,7 +413,9 @@ static auto try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_val = alloc_free_fpr(*a1);
 
@@ -428,7 +439,7 @@ static auto try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr
     }
 
     free_fpr(*a1, Dd_val);
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 2;
@@ -464,7 +475,7 @@ static auto try_fuse_fxch_fstp(TranslationResult* a1, IRInstr* fxch_instr, IRIns
     x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
     x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 2;
@@ -609,15 +620,7 @@ static auto try_fuse_fcom_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRIn
         emit_bitfield(buf, 0, 1, 0, /*immr=*/21, /*imms=*/2, Wd_top, W_ax);
     }
 
-    // Double-tick guard: x87_end only flushes at remaining <= 1, but the
-    // fusion consumes 2 ticks. If remaining == 2 and TOP is dirty, the
-    // double-tick would expire the cache without storing.
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining == 2) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 2;
@@ -714,7 +717,9 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
     const int Dd_src = alloc_free_fpr(*a1);
@@ -792,15 +797,7 @@ static auto try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
 
     free_fpr(*a1, Dd_fld);
 
-    // No push, no pop — they cancel.  But we must guard against the triple-tick
-    // expiring a dirty TOP without flushing.
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining >= 2
-        && a1->x87_cache.run_remaining <= 3) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
     free_gpr(*a1, Wd_tmp);
 
     return 3;
@@ -878,7 +875,9 @@ static auto try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
     const int Xst_base = x87_get_st_base(*a1);
     const int Wd_tmp = alloc_gpr(*a1, 2);
 
-    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
 
     const int Dd_fld = alloc_free_fpr(*a1);
     const int Dd_st0 = alloc_free_fpr(*a1);
@@ -947,14 +946,7 @@ static auto try_fuse_fld_arith_arithp(TranslationResult* a1, IRInstr* fld_instr,
     emit_store_st_at_offset(buf, Xbase, Wk_st0, Dd_st0, Xst_base);
     free_fpr(*a1, Dd_st0);
 
-    // No push/pop — they cancel.  Guard against triple-tick expiry.
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining >= 2
-        && a1->x87_cache.run_remaining <= 3) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
     free_gpr(*a1, Wd_tmp);
 
     return 3;
@@ -983,11 +975,18 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     if (fcomp_op != kOpcodeName_fcomp && fcomp_op != kOpcodeName_fucomp)
         return std::nullopt;
 
-    // After FLD push, FCOMP must compare ST(0) vs ST(1) (register form).
-    if (fcomp_instr->operands[0].kind != IROperandKind::Register)
-        return std::nullopt;
-    if (fcomp_instr->operands[1].reg.reg.index() != 1)
-        return std::nullopt;
+    // After FLD push, FCOMP can be:
+    //   Register form: FCOMP ST(0), ST(1)  — compares fld_value vs old_ST(0)
+    //   Memory form:   FCOMP ST(0), m32/m64 — compares fld_value vs memory
+    // Rosetta IR: operands[0] = ST(0) (implicit), operands[1] = comparand.
+    const bool fcomp_is_mem = (fcomp_instr->operands[1].kind != IROperandKind::Register);
+    if (!fcomp_is_mem) {
+        if (fcomp_instr->operands[1].reg.reg.index() != 1)
+            return std::nullopt;
+    } else {
+        if (fcomp_instr->operands[1].mem.size == IROperandSize::S80)
+            return std::nullopt;
+    }
 
     // ── 2. Validate FNSTSW AX ───────────────────────────────────────────────
     if (fstsw_instr->opcode != kOpcodeName_fstsw)
@@ -1010,20 +1009,29 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     const int Wd_tmp = alloc_gpr(*a1, 2);
     const int Wd_tmp2 = alloc_gpr(*a1, 3);
     const int Dd_fld = alloc_free_fpr(*a1);
-    const int Dd_st0 = alloc_free_fpr(*a1);
+    const int Dd_cmp = alloc_free_fpr(*a1);
 
     // ── 4a: Materialise FLD value → Dd_fld ──────────────────────────────────
     emit_fld_value(buf, *a1, cls, fld_instr, Xbase, Wd_top, Wd_tmp, Dd_fld, Xst_base);
 
-    // ── 4b: Load old ST(0) → Dd_st0 ────────────────────────────────────────
-    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+    // ── 4b: Load comparand → Dd_cmp ────────────────────────────────────────
+    if (fcomp_is_mem) {
+        const bool is_f32 = (fcomp_instr->operands[1].mem.size == IROperandSize::S32);
+        const int addr_reg =
+            compute_operand_address(*a1, /*is_64bit=*/true, &fcomp_instr->operands[1], GPR::XZR);
+        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_cmp, addr_reg, /*imm12=*/0);
+        free_gpr(*a1, addr_reg);
+        if (is_f32)
+            emit_fcvt_s_to_d(buf, Dd_cmp, Dd_cmp);
+    } else {
+        emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_cmp, Xst_base);
+    }
 
     // ── 4c: Save NZCV, FCMP, branchless CC mapping, restore NZCV ───────────
-    // (Same sequence as try_fuse_fcom_fstsw)
     buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
-    emit_fcmp_f64(buf, Dd_fld, Dd_st0);
+    emit_fcmp_f64(buf, Dd_fld, Dd_cmp);
 
-    free_fpr(*a1, Dd_st0);
+    free_fpr(*a1, Dd_cmp);
     free_fpr(*a1, Dd_fld);
 
     const int Wd_cc = alloc_free_gpr(*a1);
@@ -1053,8 +1061,9 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word.
-        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
+        // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+            x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -1081,15 +1090,7 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     // the net TOP is the same as before.  The status_word already has the
     // correct TOP (we flushed above), so AX is correct.
 
-    // Triple-tick guard: if TOP is dirty and the cache is about to expire
-    // within 3 ticks, flush it now.
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining >= 2
-        && a1->x87_cache.run_remaining <= 3) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
     free_gpr(*a1, Wd_tmp);
 
     return 3;
@@ -1179,8 +1180,9 @@ static auto try_fuse_fld_fcomp(TranslationResult* a1, IRInstr* fld_instr, IRInst
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word.
-        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
+        // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+            x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -1199,14 +1201,7 @@ static auto try_fuse_fld_fcomp(TranslationResult* a1, IRInstr* fld_instr, IRInst
     }
 
     // ── 3e: No push/pop — they cancel ───────────────────────────────────────
-    // Double-tick guard: flush deferred TOP if cache is about to expire.
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining >= 2
-        && a1->x87_cache.run_remaining <= 2) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
     free_gpr(*a1, Wd_tmp);
 
     return 2;
@@ -1328,14 +1323,7 @@ static auto try_fuse_fld_fcompp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     // BFI W_ax, Wd_top, #11, #3  →  BFM immr=21, imms=2
     emit_bitfield(buf, 0, 1, 0, /*immr=*/21, /*imms=*/2, Wd_top, W_ax);
 
-    // Triple-tick guard: the fusion consumes 3 ticks; flush TOP if needed.
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining >= 2
-        && a1->x87_cache.run_remaining <= 3) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
     free_gpr(*a1, Wd_tmp);
 
     return 3;
@@ -1451,8 +1439,9 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word.
-        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
+        // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+        if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+            x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
         // LDRH Wd_sw, [Xbase, #status_word]
         emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
@@ -1477,17 +1466,10 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     }
 
     // ── 4d: No push or pop (2 pushes + 2 pops = net zero) ───────────────────
-    // TOP is unchanged; status_word already has correct TOP from x87_flush_top.
+    // TOP is unchanged; memory already has correct TOP (OPT-D or flushed above).
 
-    // N-tick guard: flush TOP if the cache would expire before x87_end stores it.
     const int consumed = has_fstsw ? 4 : 3;
-    if (a1->x87_cache.top_dirty && a1->x87_cache.run_remaining >= 2
-        && a1->x87_cache.run_remaining <= consumed) {
-        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
-        a1->x87_cache.top_dirty = 0;
-    }
-
-    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, consumed);
     free_gpr(*a1, Wd_tmp);
 
     return consumed;
