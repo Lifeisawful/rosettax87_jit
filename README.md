@@ -21,15 +21,13 @@ cmake -B build
 cmake --build build
 ```
 
-### Sample Test Program
-
-```clang -v -arch x86_64 -mno-sse -mfpmath=387 ./sample/math.c -o ./build/math```
+Sample programs are built automatically as part of the CMake build.
 
 ## Running
 
-Run the target program from the build folder:
+Run the `wow` benchmark with the loader to test:
 ```
-./runtime_loader ./math
+./build/bin/runtime_loader ./build/bin/wow
 ```
 
 You will see a popup asking you to authorize debugging. Once approved, the process granted debug session.
