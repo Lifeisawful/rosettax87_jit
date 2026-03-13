@@ -3559,6 +3559,368 @@ int try_fuse_fxch_fstp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* fstp
     return 1;
 }
 
+// =============================================================================
+// Peephole: FCOMP/FUCOMP/FCOMPP/FUCOMPP + FNSTSW AX  (2-instruction fusion)
+//
+// The classic x87 compare-and-branch idiom:
+//   FCOMP ...         — compare ST(0) vs operand, set CC bits, pop
+//   FNSTSW AX         — read status_word into AX for SAHF + Jcc
+//
+// Unfused: FCOMP does LDRH + 3×BFI + ORR + STRH (CC write), then x87_pop
+// does LDRH + BFI + STRH (store_top), then FNSTSW does LDRH + BFI (read
+// back into AX).  Fused: do the pop first (updates TOP + tags via existing
+// helpers), then a single status_word LDRH → clear CC → ORR → STRH → BFI
+// into AX.  Saves ~8-10 ARM64 instructions (eliminates FNSTSW's separate
+// x87_begin overhead and one redundant status_word round-trip).
+//
+// Returns 1 if fused (2 instructions consumed), 0 otherwise.
+// =============================================================================
+
+int try_fuse_fcomp_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRInstr* fstsw_instr) {
+    // Guard: first instr must be a popping compare.
+    const auto op = fcom_instr->opcode;
+    if (op != kOpcodeName_fcomp && op != kOpcodeName_fcompp &&
+        op != kOpcodeName_fucomp && op != kOpcodeName_fucompp)
+        return 0;
+
+    // Guard: second instr must be FNSTSW AX (register form).
+    if (fstsw_instr->opcode != kOpcodeName_fstsw)
+        return 0;
+    if (fstsw_instr->operands[0].kind != IROperandKind::Register)
+        return 0;
+
+    const bool is_fcompp = (op == kOpcodeName_fcompp || op == kOpcodeName_fucompp);
+
+    static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;
+
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
+    const int Dd_st0 = alloc_free_fpr(*a1);
+    const int Dd_src = alloc_free_fpr(*a1);
+
+    // Step 1: Load ST(0).
+    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+
+    // Step 2: Load comparand.
+    if (is_fcompp) {
+        emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/1, Wd_tmp, Dd_src, Xst_base);
+    } else if (fcom_instr->operands[1].kind == IROperandKind::Register) {
+        const int depth = fcom_instr->operands[1].reg.reg.index();
+        emit_load_st(buf, Xbase, Wd_top, depth, Wd_tmp, Dd_src, Xst_base);
+    } else {
+        const bool is_f32 = (fcom_instr->operands[1].mem.size == IROperandSize::S32);
+        const int addr_reg =
+            compute_operand_address(*a1, /*is_64bit=*/true, &fcom_instr->operands[1], GPR::XZR);
+        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_src, addr_reg, /*imm12=*/0);
+        free_gpr(*a1, addr_reg);
+        if (is_f32)
+            emit_fcvt_s_to_d(buf, Dd_src, Dd_src);
+    }
+
+    // Step 3: MRS/FCMP/branch-chain/MSR — same as translate_fcom.
+    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_fcmp_f64(buf, Dd_st0, Dd_src);
+    free_fpr(*a1, Dd_src);
+    free_fpr(*a1, Dd_st0);
+
+    // Branch chain: Wd_cc = CC bits (0x0000/0x0100/0x4000/0x4500).
+    // Use a dedicated register so x87_pop doesn't clobber the CC bits.
+    const int Wd_cc = alloc_free_gpr(*a1);
+    emit_movn(buf, 0, 2, 0, 0x0000, Wd_cc);
+    buf.emit(0x54000000u | (6u << 5) | 0xCu);  // B.GT +6
+    emit_movn(buf, 0, 2, 0, 0x0100, Wd_cc);
+    buf.emit(0x54000000u | (4u << 5) | 0x4u);  // B.MI +4
+    emit_movn(buf, 0, 2, 0, 0x4000, Wd_cc);
+    buf.emit(0x54000000u | (2u << 5) | 0x7u);  // B.VC +2
+    emit_movn(buf, 0, 2, 0, 0x4500, Wd_cc);
+
+    // MSR NZCV, Wd_tmp2 — restore saved x86 EFLAGS
+    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));
+    free_gpr(*a1, Wd_tmp2);
+
+    // Step 4: Pop the stack (tag word + TOP updates via existing helpers).
+    // Wd_tmp is free as scratch for the pop; CC bits are safe in Wd_cc.
+    if (is_fcompp)
+        x87_pop_n(buf, *a1, Xbase, Wd_top, Wd_tmp, 2);
+    else
+        x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+    // Step 5: Merged status_word CC write + FNSTSW AX.
+    // The pop already wrote the correct post-pop TOP to status_word.
+    // Now we just need to set the CC bits and copy to AX — one LDRH, clear
+    // CC, ORR, STRH, BFI.  This replaces FCOMP's separate CC STRH +
+    // FNSTSW's separate LDRH + BFI.
+    {
+        const int Wd_sw = alloc_free_gpr(*a1);
+
+        // LDRH Wd_sw, [Xbase, #0x02]
+        emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
+
+        // Clear CC bits: 8 (C0), 10 (C2), 14 (C3)
+        emit_bitfield(buf, 0, 1, 0, 24, 0, GPR::XZR, Wd_sw);  // bit 8
+        emit_bitfield(buf, 0, 1, 0, 22, 0, GPR::XZR, Wd_sw);  // bit 10
+        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);  // bit 14
+
+        // ORR in new CC bits
+        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_cc, 0, Wd_sw, Wd_sw);
+
+        // STRH Wd_sw, [Xbase, #0x02]
+        emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
+
+        // BFI W_ax, Wd_sw, #0, #16 — FNSTSW AX
+        const int W_ax = fstsw_instr->operands[0].reg.reg.index();
+        emit_bitfield(buf, 0, 1, 0, 0, 15, Wd_sw, W_ax);
+
+        free_gpr(*a1, Wd_sw);
+    }
+    free_gpr(*a1, Wd_cc);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
+    free_gpr(*a1, Wd_tmp);
+
+    return 1;
+}
+
+// =============================================================================
+// Peephole: FLD variant + FCOMP/FUCOMP + FNSTSW AX  (3-instruction fusion)
+//
+// The classic compare idiom with a preceding load:
+//   FLD  [src]         — push value onto x87 stack
+//   FCOMP operand      — compare ST(0) vs operand, set CC, pop
+//   FNSTSW AX          — read status_word into AX
+//
+// FLD pushes, FCOMP pops → net zero TOP change.  We skip all push/pop/tag
+// overhead (~21 insns from OPT-D cancellation) + merge status_word RMW.
+//
+// NOT for FCOMPP (pops twice — net -1 with FLD).
+//
+// Returns 1 if fused (3 instructions consumed), 0 otherwise.
+// =============================================================================
+
+int try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
+                              IRInstr* fcom_instr, IRInstr* fstsw_instr) {
+    // Guard: second instr must be FCOMP or FUCOMP (single pop, not FCOMPP).
+    const auto fcom_op = fcom_instr->opcode;
+    if (fcom_op != kOpcodeName_fcomp && fcom_op != kOpcodeName_fucomp)
+        return 0;
+
+    // Guard: third instr must be FNSTSW AX.
+    if (fstsw_instr->opcode != kOpcodeName_fstsw)
+        return 0;
+    if (fstsw_instr->operands[0].kind != IROperandKind::Register)
+        return 0;
+
+    // ── Classify FLD source ──────────────────────────────────────────────────
+
+    enum FldSource {
+        kFldReg, kFldM32, kFldM64, kFldZero, kFldOne, kFldConst64,
+        kFildM16, kFildM32, kFildM64
+    };
+
+    const auto fld_op = fld_instr->opcode;
+    FldSource fld_src;
+    int fld_reg_depth = 0;
+    uint64_t fld_const_bits = 0;
+
+    switch (fld_op) {
+        case kOpcodeName_fld:
+            if (fld_instr->operands[0].kind == IROperandKind::Register) {
+                fld_src = kFldReg;
+                fld_reg_depth = fld_instr->operands[1].reg.reg.index();
+            } else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
+                fld_src = kFldM32;
+            else if (fld_instr->operands[0].mem.size == IROperandSize::S64)
+                fld_src = kFldM64;
+            else
+                return 0;  // m80
+            break;
+        case kOpcodeName_fild:
+            if (fld_instr->operands[0].mem.size == IROperandSize::S16)
+                fld_src = kFildM16;
+            else if (fld_instr->operands[0].mem.size == IROperandSize::S32)
+                fld_src = kFildM32;
+            else
+                fld_src = kFildM64;
+            break;
+        case kOpcodeName_fldz:  fld_src = kFldZero; break;
+        case kOpcodeName_fld1:  fld_src = kFldOne; break;
+        case kOpcodeName_fldl2e:
+            fld_src = kFldConst64; fld_const_bits = 0x3FF71547652B82FEULL; break;
+        case kOpcodeName_fldl2t:
+            fld_src = kFldConst64; fld_const_bits = 0x400A934F0979A371ULL; break;
+        case kOpcodeName_fldlg2:
+            fld_src = kFldConst64; fld_const_bits = 0x3FD34413509F79FFULL; break;
+        case kOpcodeName_fldln2:
+            fld_src = kFldConst64; fld_const_bits = 0x3FE62E42FEFA39EFULL; break;
+        case kOpcodeName_fldpi:
+            fld_src = kFldConst64; fld_const_bits = 0x400921FB54442D18ULL; break;
+        default:
+            return 0;
+    }
+
+    // ── Emit fused code ──────────────────────────────────────────────────────
+    // Net effect: compare FLD_value vs FCOMP_operand, set CC in status_word
+    // and AX, no TOP change (push + pop cancel).
+
+    static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;
+
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    // Flush deferred TOP — we read status_word for merged RMW.
+    x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+    const int Dd_fld = alloc_free_fpr(*a1);
+    const int Dd_src = alloc_free_fpr(*a1);
+
+    // ── Materialise FLD value → Dd_fld ───────────────────────────────────────
+
+    switch (fld_src) {
+        case kFldReg:
+            emit_load_st(buf, Xbase, Wd_top, fld_reg_depth, Wd_tmp, Dd_fld, Xst_base);
+            break;
+        case kFldM32: {
+            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
+            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
+            emit_fldr_imm(buf, 2, Dd_fld, addr, 0);
+            free_gpr(*a1, addr);
+            emit_fcvt_s_to_d(buf, Dd_fld, Dd_fld);
+            break;
+        }
+        case kFldM64: {
+            const bool a64 = (fld_instr->operands[0].mem.addr_size == IROperandSize::S64);
+            const int addr = compute_operand_address(*a1, a64, &fld_instr->operands[0], GPR::XZR);
+            emit_fldr_imm(buf, 3, Dd_fld, addr, 0);
+            free_gpr(*a1, addr);
+            break;
+        }
+        case kFildM16:
+        case kFildM32:
+        case kFildM64: {
+            const int Wd_int = alloc_free_gpr(*a1);
+            const int addr =
+                compute_operand_address(*a1, true, &fld_instr->operands[0], GPR::XZR);
+            if (fld_src == kFildM16) {
+                emit_ldr_str_imm(buf, 1, 0, 1, 0, addr, Wd_int);
+                emit_bitfield(buf, 0, 0, 0, 0, 15, Wd_int, Wd_int);
+            } else if (fld_src == kFildM32) {
+                emit_ldr_str_imm(buf, 2, 0, 1, 0, addr, Wd_int);
+            } else {
+                emit_ldr_str_imm(buf, 3, 0, 1, 0, addr, Wd_int);
+            }
+            free_gpr(*a1, addr);
+            emit_scvtf(buf, (fld_src == kFildM64) ? 1 : 0, 1, Dd_fld, Wd_int);
+            free_gpr(*a1, Wd_int);
+            break;
+        }
+        case kFldZero:
+            emit_movi_d_zero(buf, Dd_fld);
+            break;
+        case kFldOne:
+            emit_fmov_d_one(buf, Dd_fld);
+            break;
+        case kFldConst64: {
+            const uint16_t h3 = (uint16_t)(fld_const_bits >> 48);
+            const uint16_t h2 = (uint16_t)(fld_const_bits >> 32);
+            const uint16_t h1 = (uint16_t)(fld_const_bits >> 16);
+            const uint16_t h0 = (uint16_t)(fld_const_bits);
+            emit_movn(buf, 1, 2, 3, h3, Wd_tmp);
+            if (h2) emit_movn(buf, 1, 3, 2, h2, Wd_tmp);
+            if (h1) emit_movn(buf, 1, 3, 1, h1, Wd_tmp);
+            if (h0) emit_movn(buf, 1, 3, 0, h0, Wd_tmp);
+            emit_fmov_x_to_d(buf, Dd_fld, Wd_tmp);
+            break;
+        }
+    }
+
+    // ── Load FCOMP comparand → Dd_src ────────────────────────────────────────
+    // After the (cancelled) FLD push, FCOMP's ST(0) is the FLD value and
+    // FCOMP's ST(i) maps to old ST(i-1).  For register form, remap depth.
+
+    if (fcom_instr->operands[1].kind == IROperandKind::Register) {
+        // FCOMP ST(i): after cancelled push, ST(i) → old ST(i-1).
+        int depth = fcom_instr->operands[1].reg.reg.index();
+        if (depth == 0) {
+            // FCOMP ST(0) after FLD push means comparing with ST(0) which is
+            // the FLD value itself.  Just copy.
+            // FMOV Dd_src, Dd_fld
+            emit_fmov_f64(buf, Dd_src, Dd_fld);
+        } else {
+            // ST(i) in pushed frame → old ST(i-1) in original frame.
+            emit_load_st(buf, Xbase, Wd_top, depth - 1, Wd_tmp, Dd_src, Xst_base);
+        }
+    } else {
+        // Memory operand — no depth remapping needed.
+        const bool is_f32 = (fcom_instr->operands[1].mem.size == IROperandSize::S32);
+        const int addr_reg =
+            compute_operand_address(*a1, /*is_64bit=*/true, &fcom_instr->operands[1], GPR::XZR);
+        emit_fldr_imm(buf, is_f32 ? 2 : 3, Dd_src, addr_reg, 0);
+        free_gpr(*a1, addr_reg);
+        if (is_f32)
+            emit_fcvt_s_to_d(buf, Dd_src, Dd_src);
+    }
+
+    // ── FCMP + flag mapping ──────────────────────────────────────────────────
+
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
+
+    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_fcmp_f64(buf, Dd_fld, Dd_src);
+    free_fpr(*a1, Dd_src);
+    free_fpr(*a1, Dd_fld);
+
+    emit_movn(buf, 0, 2, 0, 0x0000, Wd_tmp);
+    buf.emit(0x54000000u | (6u << 5) | 0xCu);  // B.GT +6
+    emit_movn(buf, 0, 2, 0, 0x0100, Wd_tmp);
+    buf.emit(0x54000000u | (4u << 5) | 0x4u);  // B.MI +4
+    emit_movn(buf, 0, 2, 0, 0x4000, Wd_tmp);
+    buf.emit(0x54000000u | (2u << 5) | 0x7u);  // B.VC +2
+    emit_movn(buf, 0, 2, 0, 0x4500, Wd_tmp);
+
+    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));  // MSR NZCV, Wd_tmp2
+    free_gpr(*a1, Wd_tmp2);
+
+    // ── Merged status_word RMW: set CC, TOP unchanged, BFI into AX ──────────
+    // Push+pop cancel → TOP doesn't change → no BFI for TOP needed.
+    {
+        const int Wd_sw = alloc_free_gpr(*a1);
+
+        emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
+
+        // Clear CC bits
+        emit_bitfield(buf, 0, 1, 0, 24, 0, GPR::XZR, Wd_sw);  // bit 8
+        emit_bitfield(buf, 0, 1, 0, 22, 0, GPR::XZR, Wd_sw);  // bit 10
+        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);  // bit 14
+
+        // ORR in new CC bits
+        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);
+
+        // STRH — TOP is unchanged, already correct in status_word
+        emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
+
+        // BFI W_ax, Wd_sw, #0, #16
+        const int W_ax = fstsw_instr->operands[0].reg.reg.index();
+        emit_bitfield(buf, 0, 1, 0, 0, 15, Wd_sw, W_ax);
+
+        free_gpr(*a1, Wd_sw);
+    }
+
+    // No push, no pop, no tag word changes — push/pop cancel completely.
+    // OPT-D: If there was a pending push tag, it's still pending (we didn't
+    // push or pop).  Don't touch x87_tag_push_pending.
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/3);
+    free_gpr(*a1, Wd_tmp);
+
+    return 1;
+}
+
 int x87_cache_lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx) {
     int count = 0;
     for (int64_t i = insn_idx; i < num_instrs; i++) {

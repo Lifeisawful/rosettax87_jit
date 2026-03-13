@@ -38,6 +38,16 @@ int try_fuse_fld_fstp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* fstp_i
 // Eliminates FXCH when followed by FSTP (pop destroys the swap's trace).
 int try_fuse_fxch_fstp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* fstp_instr);
 
+// ── Peephole fusion: FCOMP/FUCOMP/FCOMPP/FUCOMPP + FNSTSW AX ────────────
+// Merges the compare's status_word write with FNSTSW's read, embedding
+// post-pop TOP in a single RMW.  Saves ~8-10 ARM64 instructions.
+int try_fuse_fcomp_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRInstr* fstsw_instr);
+
+// ── Peephole fusion: FLD variant + FCOMP/FUCOMP + FNSTSW AX ─────────────
+// Push-pop cancellation + status_word bypass.  Saves ~22-28 ARM64 instructions.
+int try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
+                              IRInstr* fcom_instr, IRInstr* fstsw_instr);
+
 auto translate_fldz(TranslationResult* a1, IRInstr* a2) -> void;
 
 auto translate_fld1(TranslationResult* a1, IRInstr* a2) -> void;

@@ -53,6 +53,9 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
             case Opcode::kOpcodeName_fldpi:
                 fused = TranslatorX87::try_fuse_fld_arith_fstp(
                              translation_result, cur_instr, next1, next2) != 0;
+                if (!fused)
+                    fused = TranslatorX87::try_fuse_fld_fcomp_fstsw(
+                                 translation_result, cur_instr, next1, next2) != 0;
                 if (fused)
                     consumed = 3;
                 break;
@@ -84,8 +87,17 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                         TranslatorX87::try_fuse_fld_fstp(translation_result, cur_instr, next) != 0;
                 break;
 
-            // Pattern 3: FXCH ST(1) + popping arithmetic
-            // Pattern 4: FXCH ST(1) + FSTP
+            // Pattern 3: FCOMP/FUCOMP/FCOMPP/FUCOMPP + FNSTSW AX
+            case Opcode::kOpcodeName_fcomp:
+            case Opcode::kOpcodeName_fcompp:
+            case Opcode::kOpcodeName_fucomp:
+            case Opcode::kOpcodeName_fucompp:
+                fused = TranslatorX87::try_fuse_fcomp_fstsw(
+                             translation_result, cur_instr, next) != 0;
+                break;
+
+            // Pattern 4: FXCH ST(1) + popping arithmetic
+            // Pattern 5: FXCH ST(1) + FSTP
             case Opcode::kOpcodeName_fxch:
                 fused =
                     TranslatorX87::try_fuse_fxch_arithp(translation_result, cur_instr, next) != 0;
