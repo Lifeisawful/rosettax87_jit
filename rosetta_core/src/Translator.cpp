@@ -34,10 +34,36 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     // CORE_LOG("Translating instruction at %llx opcode=0x%04x (%s)", absolute_addr, opcode,
     // kOpcodeNames[opcode]);
 
+    // ── Peephole: try 3-instruction fusion patterns ─────────────────────────
+    // Each pattern consumes 3 IR instructions when successful.
+    bool fused = false;
+    int consumed = 1;
+    if (insn_idx + 2 < num_instrs) {
+        IRInstr* next1 = &instr_array[insn_idx + 1];
+        IRInstr* next2 = &instr_array[insn_idx + 2];
+        switch (opcode) {
+            case Opcode::kOpcodeName_fld:
+            case Opcode::kOpcodeName_fild:
+            case Opcode::kOpcodeName_fldz:
+            case Opcode::kOpcodeName_fld1:
+            case Opcode::kOpcodeName_fldl2e:
+            case Opcode::kOpcodeName_fldl2t:
+            case Opcode::kOpcodeName_fldlg2:
+            case Opcode::kOpcodeName_fldln2:
+            case Opcode::kOpcodeName_fldpi:
+                fused = TranslatorX87::try_fuse_fld_arith_fstp(
+                             translation_result, cur_instr, next1, next2) != 0;
+                if (fused)
+                    consumed = 3;
+                break;
+            default:
+                break;
+        }
+    }
+
     // ── Peephole: try 2-instruction fusion patterns ─────────────────────────
     // Each pattern consumes 2 IR instructions when successful.
-    bool fused = false;
-    if (insn_idx + 1 < num_instrs) {
+    if (!fused && insn_idx + 1 < num_instrs) {
         IRInstr* next = &instr_array[insn_idx + 1];
         switch (opcode) {
             // Pattern 1: FLD variant + popping arithmetic (FADDP, FSUBP, etc.)
@@ -227,8 +253,11 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
 
     // OPT-1: Tick the cache (decrements run counter; releases on expiry).
     // Then reset the mask, excluding any GPRs still pinned by the cache.
-    // Fused pairs consumed 2 instructions — tick twice.
-    const int consumed = fused ? 2 : 1;
+    // Fused patterns consumed 2 or 3 instructions — tick accordingly.
+    if (!fused)
+        consumed = 1;
+    else if (consumed == 1)
+        consumed = 2;  // 2-instruction fusion
     for (int i = 0; i < consumed; i++)
         TranslatorX87::x87_cache_tick(translation_result);
 

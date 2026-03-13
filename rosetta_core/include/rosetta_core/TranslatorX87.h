@@ -18,6 +18,13 @@ int x87_cache_lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
 // Returns 1 if the pair was fused (2 instructions consumed), 0 otherwise.
 int try_fuse_fld_arithp(TranslationResult* a1, IRInstr* fld_instr, IRInstr* arithp_instr);
 
+// ── Peephole fusion: FLD + non-popping arithmetic (mem) + FSTP ────────────
+// Recognizes FLD + FMUL/FADD/FSUB/FDIV (mem) + FSTP (mem) and emits a single
+// fused sequence that skips all push/pop/tag overhead.
+// Returns 1 if the triple was fused (3 instructions consumed), 0 otherwise.
+int try_fuse_fld_arith_fstp(TranslationResult* a1, IRInstr* fld_instr,
+                             IRInstr* arith_instr, IRInstr* fstp_instr);
+
 // ── Peephole fusion: FXCH ST(1) + popping arithmetic ─────────────────────
 // Eliminates the FXCH; for non-commutative ops, swaps the operation.
 int try_fuse_fxch_arithp(TranslationResult* a1, IRInstr* fxch_instr, IRInstr* next_instr);
