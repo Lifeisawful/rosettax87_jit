@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_opcode_sweep.sh -- Systematically enable opcode translations and find failures.
 #

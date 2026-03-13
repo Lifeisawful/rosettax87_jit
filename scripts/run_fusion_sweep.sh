@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_fusion_sweep.sh -- Systematically test fusion translations and their interaction with opcodes.
 #

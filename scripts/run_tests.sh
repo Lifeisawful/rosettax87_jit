@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_tests.sh -- run all x87 test binaries under native Rosetta and the
 # custom runtime_loader, checking self-reported PASS/FAIL output.
