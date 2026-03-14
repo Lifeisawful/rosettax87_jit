@@ -56,7 +56,6 @@ set_property(TARGET libRuntimeRosettax87 PROPERTY INTERPROCEDURAL_OPTIMIZATION T
 
 target_compile_options(libRuntimeRosettax87 PRIVATE
     ${OPTIMIZATION_FLAGS}
-    "-flto"
 )
 
 target_compile_definitions(libRuntimeRosettax87 PRIVATE
