@@ -1350,50 +1350,36 @@ X87Float80StatusWordResult x87_fst_fp80(X87State const* state) {
     // Get value from ST(0)
     auto [value, statusWord] = state->getStConst(0);
 
-    float tmp = value;
-    uint32_t float32 = std::bit_cast<uint32_t>(tmp);
+    uint64_t bits = std::bit_cast<uint64_t>(value);
 
-    // Extract components from float32
-    uint32_t mantissa = float32 & 0x7FFFFF;  // 23 bits
-    uint8_t exp = (float32 >> 23) & 0xFF;    // 8 bits
-    uint16_t sign = (float32 >> 31) << 15;   // Move sign to bit 15
+    // Extract components from double (64-bit IEEE 754)
+    uint64_t mantissa = bits & 0xFFFFFFFFFFFFFULL;  // 52 bits
+    uint32_t exp = (bits >> 52) & 0x7FF;             // 11 bits
+    uint16_t sign = (uint16_t)((bits >> 63) << 15);  // Move sign to bit 15
 
     X87Float80StatusWordResult result;
     result.statusWord = statusWord;
 
-    // Handle zero
-    if (exp == 0 && mantissa == 0) {
+    // Handle zero / denormal (treated as ±0.0)
+    if (exp == 0) {
         result.mantissa = 0;
         result.exponent = sign;
         return result;
     }
 
-    // Handle subnormal numbers
-    if (exp == 0) {
-        // Set denormal flag
-
-        // Count leading zeros to normalize
-        int leading_zeros = __builtin_clz(mantissa) - 8;  // -8 because mantissa is in upper 23 bits
-        mantissa <<= leading_zeros;
-
-        // Adjust exponent for normalization
-        exp = 1 - leading_zeros;
-    }
     // Handle infinity or NaN
-    else if (exp == 255) {
-        // Set invalid operation flag if NaN
-
-        result.mantissa = (uint64_t)mantissa << 40 | 0x8000000000000000ULL;
-        result.exponent = sign | 0x7FFF;  // Maximum exponent
+    if (exp == 0x7FF) {
+        result.mantissa = (mantissa << 11) | 0x8000000000000000ULL;
+        result.exponent = sign | 0x7FFF;
         return result;
     }
 
     // Normal numbers: Convert to x87 format
-    // Shift 23-bit mantissa to 64 bits and set explicit integer bit
-    result.mantissa = ((uint64_t)mantissa << 40) | 0x8000000000000000ULL;
+    // Shift 52-bit mantissa to 63-bit position and set explicit integer bit
+    result.mantissa = (mantissa << 11) | 0x8000000000000000ULL;
 
-    // Bias adjustment: IEEE 754 bias(127) to x87 bias(16383)
-    result.exponent = sign | (exp + 16383 - 127);
+    // Bias adjustment: IEEE 754 double bias(1023) to x87 bias(16383)
+    result.exponent = sign | (uint16_t)(exp + 16383 - 1023);
 
     return result;
 }
