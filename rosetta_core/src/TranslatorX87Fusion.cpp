@@ -549,7 +549,7 @@ static auto try_fuse_fcom_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRIn
     }
 
     // ── MRS save NZCV, FCMP, branchless CC mapping, MSR restore ─────────────
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_mrs_nzcv(buf, Wd_tmp2);
     emit_fcmp_f64(buf, Dd_st0, Dd_src);
 
     free_fpr(*a1, Dd_src);
@@ -562,7 +562,7 @@ static auto try_fuse_fcom_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRIn
     emit_cset(buf, 0, /*VS=*/6, Wd_vs);
     emit_cset(buf, 0, /*EQ=*/0, Wd_tmp);
 
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));  // MSR NZCV, Wd_tmp2
+    emit_msr_nzcv(buf, Wd_tmp2);
     free_gpr(*a1, Wd_tmp2);
 
     // C0 = CC | VS, C3 = EQ | VS
@@ -1028,7 +1028,7 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     }
 
     // ── 4c: Save NZCV, FCMP, branchless CC mapping, restore NZCV ───────────
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_mrs_nzcv(buf, Wd_tmp2);
     emit_fcmp_f64(buf, Dd_fld, Dd_cmp);
 
     free_fpr(*a1, Dd_cmp);
@@ -1041,7 +1041,7 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     emit_cset(buf, 0, /*VS=*/6, Wd_vs);
     emit_cset(buf, 0, /*EQ=*/0, Wd_tmp);
 
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));  // MSR NZCV, Wd_tmp2
+    emit_msr_nzcv(buf, Wd_tmp2);
     free_gpr(*a1, Wd_tmp2);
 
     // C0 = CC | VS, C3 = EQ | VS
@@ -1148,7 +1148,7 @@ static auto try_fuse_fld_fcomp(TranslationResult* a1, IRInstr* fld_instr, IRInst
     emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
 
     // ── 3c: Save NZCV, FCMP, branchless CC mapping, restore NZCV ───────────
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_mrs_nzcv(buf, Wd_tmp2);
     emit_fcmp_f64(buf, Dd_fld, Dd_st0);
 
     free_fpr(*a1, Dd_st0);
@@ -1161,7 +1161,7 @@ static auto try_fuse_fld_fcomp(TranslationResult* a1, IRInstr* fld_instr, IRInst
     emit_cset(buf, 0, /*VS=*/6, Wd_vs);
     emit_cset(buf, 0, /*EQ=*/0, Wd_tmp);
 
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));  // MSR NZCV, Wd_tmp2
+    emit_msr_nzcv(buf, Wd_tmp2);
     free_gpr(*a1, Wd_tmp2);
 
     // C0 = CC | VS, C3 = EQ | VS
@@ -1262,7 +1262,7 @@ static auto try_fuse_fld_fcompp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
 
     // ── 4c: Save NZCV, FCMP(fld_value vs old_ST(0)), map CC, restore NZCV ──
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_mrs_nzcv(buf, Wd_tmp2);
     emit_fcmp_f64(buf, Dd_fld, Dd_st0);
 
     free_fpr(*a1, Dd_st0);
@@ -1275,7 +1275,7 @@ static auto try_fuse_fld_fcompp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     emit_cset(buf, 0, /*VS=*/6, Wd_vs);
     emit_cset(buf, 0, /*EQ=*/0, Wd_tmp);
 
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));  // MSR NZCV, Wd_tmp2
+    emit_msr_nzcv(buf, Wd_tmp2);
     free_gpr(*a1, Wd_tmp2);
 
     // C0 = CC | VS, C3 = EQ | VS
@@ -1395,7 +1395,7 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     if (cls2.source == kFldReg) {
         if (cls2.reg_depth == 0) {
             // fld ST(0) as second FLD → same value as val1; copy it.
-            buf.emit(0x1E604000u | (uint32_t(Dd_val1) << 5) | uint32_t(Dd_val2));  // FMOV Dd_val2, Dd_val1
+            emit_fmov_f64_reg(buf, Dd_val2, Dd_val1);
         } else {
             FldClassification cls2_adj = cls2;
             cls2_adj.reg_depth -= 1;
@@ -1407,7 +1407,7 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
 
     // ── 4b: Save NZCV, FCMP(val2 vs val1), map CC, restore NZCV ────────────
     // FUCOMPP semantics: compare ST(0) vs ST(1) = val2 vs val1.
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));  // MRS Wd_tmp2, NZCV
+    emit_mrs_nzcv(buf, Wd_tmp2);
     emit_fcmp_f64(buf, Dd_val2, Dd_val1);
 
     free_fpr(*a1, Dd_val1);
@@ -1420,7 +1420,7 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     emit_cset(buf, 0, /*VS=*/6, Wd_vs);
     emit_cset(buf, 0, /*EQ=*/0, Wd_tmp);
 
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));  // MSR NZCV, Wd_tmp2
+    emit_msr_nzcv(buf, Wd_tmp2);
     free_gpr(*a1, Wd_tmp2);
 
     // C0 = CC | VS, C3 = EQ | VS

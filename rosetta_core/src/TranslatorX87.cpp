@@ -1213,14 +1213,14 @@ auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
         emit_bitfield(buf, 1, 2, 1, 53, 52, Xbits, Xbits);
 
         // [5] CBZ Wexp, .zero_denorm (+10 insns = +40 bytes)
-        buf.emit(0x34000000u | (10u << 5) | uint32_t(Wexp));
+        emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wexp, 10);
 
         // [6] CMP Wexp, #0x7FF  (SUBS WZR, Wexp, #2047)
         emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/1, /*is_set_flags=*/1,
                      /*shift=*/0, /*imm12=*/0x7FF, Wexp, /*Rd=*/31);
 
         // [7] B.EQ .inf_nan (+11 insns = +44 bytes)
-        buf.emit(0x54000000u | (11u << 5) | 0x0u);
+        emit_b_cond(buf, /*EQ=*/0, 11);
 
         // ── Normal number ──
         // [8] ORR Xbits, Xbits, #0x8000000000000000 — set explicit integer bit
@@ -1243,7 +1243,7 @@ auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
         emit_str_imm(buf, /*size=*/1, Wexp, Xaddr, /*imm12=*/4);
 
         // [14] B .done (+8 insns = +32 bytes)
-        buf.emit(0x14000000u | 8u);
+        emit_b(buf, 8);
 
         // ── Zero / denormal (treated as ±0.0) ──
         // [15] STR XZR, [Xaddr] — mantissa = 0
@@ -1251,7 +1251,7 @@ auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
         // [16] STRH Wd_tmp, [Xaddr, #8] — exponent = sign only
         emit_str_imm(buf, 1, Wd_tmp, Xaddr, 4);
         // [17] B .done (+5 insns = +20 bytes)
-        buf.emit(0x14000000u | 5u);
+        emit_b(buf, 5);
 
         // ── Infinity / NaN ──
         // [18] ORR Xbits, Xbits, #0x8000000000000000 — set explicit integer bit
@@ -1541,15 +1541,8 @@ auto translate_fcom(TranslationResult* a1, IRInstr* a2) -> void {
     // Fix: MRS to save NZCV into a GPR before FCMP, then MSR to restore after
     // we've finished reading the FP condition codes.
     //
-    // MRS NZCV encoding: 0xD53B4200 | Rt   (op0=3, op1=3, CRn=4, CRm=2, op2=0, L=1)
-    // MSR NZCV encoding: 0xD51B4200 | Rt   (same sysreg, L=0)
-    //
-    // NOTE: emit_mrs_nzcv in AssemblerHelpers uses 0xD5334200 which has o0=0
-    // (op0=2, debug registers) — WRONG and crashes at El0.  We inline the
-    // correct encoding here.
-
     // MRS Wd_tmp2, NZCV — save current NZCV (from prior x86 ALU ops)
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));
+    emit_mrs_nzcv(buf, Wd_tmp2);
 
     // FCMP Dd_st0, Dd_src — clobbers NZCV with FP comparison result
     emit_fcmp_f64(buf, Dd_st0, Dd_src);
@@ -1586,7 +1579,7 @@ auto translate_fcom(TranslationResult* a1, IRInstr* a2) -> void {
     emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_tmp);  // 1 if equal
 
     // MSR NZCV, Wd_tmp2 — restore saved x86 EFLAGS (all CSETs done)
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));
+    emit_msr_nzcv(buf, Wd_tmp2);
 
     free_gpr(*a1, Wd_tmp2);
 
@@ -1927,44 +1920,37 @@ auto translate_fistp(TranslationResult* a1, IRInstr* a2) -> void {
     emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11, Wd_rc, Wd_rc);
 
     // [2] CBZ Wd_rc, +28  (+7 instructions → idx 9)
-    // CBZ encoding: 0x34000000 | (imm19<<5) | Rt;  imm19 = byte_offset/4
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
 
     // [3] SUB Wd_rc, Wd_rc, #1
     emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
 
     // [4] CBZ Wd_rc, +28  (+7 instructions → idx 11)
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
 
     // [5] SUB Wd_rc, Wd_rc, #1
     emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
 
     // [6] CBZ Wd_rc, +28  (+7 instructions → idx 13)
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
 
-    // Helper lambda (expressed as inline macro-style) to emit FCVT*S:
-    // base = 0x1E200000 | (sf<<31) | (ftype=1<<22) | (rmode<<19) | (Rn<<5) | Rd
-    const uint32_t fcvt_base = 0x1E200000u | (uint32_t(is_64bit_int) << 31) |
-                               (1u << 22)  // ftype=01 (f64)
-                               | (uint32_t(Dd_val & 0x1F) << 5) | uint32_t(Wd_int & 0x1F);
-
-    // [7] FCVTZS (rmode=3 → aarch64_rmode=3)  RC=3 truncate
-    buf.emit(fcvt_base | (3u << 19));
+    // [7] FCVTZS (rmode=3)  RC=3 truncate
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/3, Wd_int, Dd_val);
     // [8] B +24  (+6 instructions → idx 14)
-    buf.emit(0x14000000u | 6u);
+    emit_b(buf, 6);
 
-    // [9] FCVTNS (rmode=0 → aarch64_rmode=0)  RC=0 nearest
-    buf.emit(fcvt_base | (0u << 19));
+    // [9] FCVTNS (rmode=0)  RC=0 nearest
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/0, Wd_int, Dd_val);
     // [10] B +16  (+4 instructions → idx 14)
-    buf.emit(0x14000000u | 4u);
+    emit_b(buf, 4);
 
-    // [11] FCVTMS (rmode=2 → aarch64_rmode=2)  RC=1 floor  ← fixes the crash
-    buf.emit(fcvt_base | (2u << 19));
+    // [11] FCVTMS (rmode=2)  RC=1 floor
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/2, Wd_int, Dd_val);
     // [12] B +8  (+2 instructions → idx 14)
-    buf.emit(0x14000000u | 2u);
+    emit_b(buf, 2);
 
-    // [13] FCVTPS (rmode=1 → aarch64_rmode=1)  RC=2 ceil
-    buf.emit(fcvt_base | (1u << 19));
+    // [13] FCVTPS (rmode=1)  RC=2 ceil
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/1, Wd_int, Dd_val);
     // [14] done — Wd_int now holds the correctly rounded integer.
 
     // Step 3: compute destination address
@@ -2317,30 +2303,30 @@ auto translate_frndint(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     // ── Runtime dispatch: CBZ/SUB chain (identical structure to translate_fistp)
     //
     // [D+0] CBZ Wd_rc, +28  (imm19=7 → branch offset 28 bytes → [D+28] FRINTN)
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
     // [D+4] SUB Wd_rc, Wd_rc, #1
     emit_add_imm(buf, /*is_64=*/0, /*sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
     // [D+8] CBZ Wd_rc, +28  (target = D+8+28 = D+36 → [D+36] FRINTM)
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
     // [D+12] SUB Wd_rc, Wd_rc, #1
     emit_add_imm(buf, /*is_64=*/0, /*sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
     // [D+16] CBZ Wd_rc, +28  (target = D+16+28 = D+44 → [D+44] FRINTP)
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
 
     // [D+20] FRINTZ Dd, Dd   RC=3 (truncate) — fall-through path
     emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTZ=*/11, Dd, Dd);
     // [D+24] B +24           skip to done  (imm26=6 → offset 24 → D+24+24 = D+48)
-    buf.emit(0x14000000u | 6u);
+    emit_b(buf, 6);
 
     // [D+28] FRINTN Dd, Dd   RC=0 (round nearest, ties to even)
     emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTN=*/8, Dd, Dd);
     // [D+32] B +16           (imm26=4 → offset 16 → D+32+16 = D+48)
-    buf.emit(0x14000000u | 4u);
+    emit_b(buf, 4);
 
     // [D+36] FRINTM Dd, Dd   RC=1 (floor, toward −∞)
     emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTM=*/10, Dd, Dd);
     // [D+40] B +8            (imm26=2 → offset 8 → D+40+8 = D+48)
-    buf.emit(0x14000000u | 2u);
+    emit_b(buf, 2);
 
     // [D+44] FRINTP Dd, Dd   RC=2 (ceil, toward +∞)
     emit_fp_dp1(buf, /*type=*/1 /*f64*/, /*FRINTP=*/9, Dd, Dd);
@@ -2451,7 +2437,7 @@ auto translate_fcomi(TranslationResult* a1, IRInstr* a2) -> void {
     emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 26, Wd_z, Wd_z);
 
     // MSR NZCV, Wd_z — set the corrected flags
-    buf.emit(0xD51B4200u | uint32_t(Wd_z));
+    emit_msr_nzcv(buf, Wd_z);
 
     free_gpr(*a1, Wd_c);
     free_gpr(*a1, Wd_v);
@@ -2504,7 +2490,7 @@ auto translate_ftst(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_st0, Xst_base);
 
     // MRS Wd_tmp2, NZCV — save current NZCV
-    buf.emit(0xD53B4200u | uint32_t(Wd_tmp2));
+    emit_mrs_nzcv(buf, Wd_tmp2);
 
     // FCMP Dd_st0, #0.0 — single instruction, no need to load a zero FPR
     emit_fcmp_zero_f64(buf, Dd_st0);
@@ -2520,7 +2506,7 @@ auto translate_ftst(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_tmp);  // 1 if equal
 
     // MSR NZCV, Wd_tmp2 — restore saved flags
-    buf.emit(0xD51B4200u | uint32_t(Wd_tmp2));
+    emit_msr_nzcv(buf, Wd_tmp2);
 
     free_gpr(*a1, Wd_tmp2);
 
@@ -2594,27 +2580,23 @@ auto translate_fist(TranslationResult* a1, IRInstr* a2) -> void {
     emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 10, /*imms*/ 11, Wd_rc, Wd_rc);
 
     // [2] CBZ Wd_rc, +28 → [9] FCVTNS
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
     // [3] SUB Wd_rc, Wd_rc, #1
     emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
     // [4] CBZ Wd_rc, +28 → [11] FCVTMS
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
     // [5] SUB Wd_rc, Wd_rc, #1
     emit_add_imm(buf, /*is_64=*/0, /*is_sub*/ 1, /*S*/ 0, /*shift*/ 0, 1, Wd_rc, Wd_rc);
     // [6] CBZ Wd_rc, +28 → [13] FCVTPS
-    buf.emit(0x34000000u | (7u << 5) | uint32_t(Wd_rc));
+    emit_cbz(buf, /*is_64bit=*/0, /*is_nz=*/0, Wd_rc, 7);
 
-    const uint32_t fcvt_base = 0x1E200000u | (uint32_t(is_64bit_int) << 31) |
-                               (1u << 22) | (uint32_t(Dd_val & 0x1F) << 5) |
-                               uint32_t(Wd_int & 0x1F);
-
-    buf.emit(fcvt_base | (3u << 19));   // [7] FCVTZS (RC=3)
-    buf.emit(0x14000000u | 6u);         // [8] B +24 → done
-    buf.emit(fcvt_base | (0u << 19));   // [9] FCVTNS (RC=0)
-    buf.emit(0x14000000u | 4u);         // [10] B +16 → done
-    buf.emit(fcvt_base | (2u << 19));   // [11] FCVTMS (RC=1)
-    buf.emit(0x14000000u | 2u);         // [12] B +8 → done
-    buf.emit(fcvt_base | (1u << 19));   // [13] FCVTPS (RC=2)
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/3, Wd_int, Dd_val); // [7] FCVTZS (RC=3)
+    emit_b(buf, 6);                                                                           // [8] B +24 → done
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/0, Wd_int, Dd_val); // [9] FCVTNS (RC=0)
+    emit_b(buf, 4);                                                                           // [10] B +16 → done
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/2, Wd_int, Dd_val); // [11] FCVTMS (RC=1)
+    emit_b(buf, 2);                                                                           // [12] B +8 → done
+    emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=*/1, Wd_int, Dd_val); // [13] FCVTPS (RC=2)
     // [14] done
 
     // Store integer to memory

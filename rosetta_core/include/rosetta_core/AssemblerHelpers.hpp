@@ -196,8 +196,42 @@ auto emit_fcvtzs(AssemblerBuffer& buf, int ftype, int is_64bit_int, int Rd, int 
 // -----------------------------------------------------------------------------
 
 // MRS Xd, NZCV — read condition flags into a GPR
+// Encoding: 0xD53B4200 | Rt  (op0=3, op1=3, CRn=4, CRm=2, op2=0, L=1)
 // (exists as empty stub in binary @ 0x3a1c — implemented here)
 auto emit_mrs_nzcv(AssemblerBuffer& buf, int Xd) -> void;
+
+// MSR NZCV, Xd — write condition flags from a GPR
+// Encoding: 0xD51B4200 | Rt  (same sysreg, L=0)
+auto emit_msr_nzcv(AssemblerBuffer& buf, int Xd) -> void;
+
+// CBZ/CBNZ Rt, #imm19 — compare and branch if (non-)zero
+// is_64bit: 0=W-register, 1=X-register
+// is_nz:    0=CBZ, 1=CBNZ
+// imm19:    signed instruction-count offset (each insn = 4 bytes)
+// Encoding: sf | 011010 | b5=0 | op=is_nz | imm19 | Rt
+auto emit_cbz(AssemblerBuffer& buf, int is_64bit, int is_nz, int Rt, int imm19) -> void;
+
+// B #imm26 — unconditional branch
+// imm26: signed instruction-count offset
+// Encoding: 0 | 00101 | imm26
+auto emit_b(AssemblerBuffer& buf, int imm26) -> void;
+
+// B.cond #imm19 — conditional branch
+// cond:  AArch64 condition code (0=EQ,1=NE,2=CS,3=CC,4=MI,5=PL,6=VS,7=VC,8=HI,9=LS,10=GE,11=LT,12=GT,13=LE,14=AL)
+// imm19: signed instruction-count offset
+// Encoding: 0101010 0 | imm19 | 0 | cond
+auto emit_b_cond(AssemblerBuffer& buf, int cond, int imm19) -> void;
+
+// FMOV Dd, Dn — FPR-to-FPR double-precision register copy
+// Encoding: 0x1E604000 | (Rn<<5) | Rd
+auto emit_fmov_f64_reg(AssemblerBuffer& buf, int Dd, int Dn) -> void;
+
+// FCVT{N,P,M,Z}S — FP-to-signed-integer conversion with explicit rounding mode
+// sf:    0=32-bit result (W), 1=64-bit result (X)
+// ftype: 0=single, 1=double, 3=half
+// rmode: 0=FCVTNS(nearest), 1=FCVTPS(+inf), 2=FCVTMS(-inf), 3=FCVTZS(zero)
+// Encoding: sf | 0 0 11110 | ftype | 1 | rmode | 000 | Rn | Rd
+auto emit_fcvt_fp_to_int(AssemblerBuffer& buf, int sf, int ftype, int rmode, int Rd, int Rn) -> void;
 
 // ---------------------------------------------------------------------------
 // emit_add_reg — mirrors binary at 0x7a8

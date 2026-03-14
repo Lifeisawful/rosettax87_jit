@@ -516,11 +516,62 @@ auto emit_fcvtzs(AssemblerBuffer& buf, int ftype, int is_64bit_int, int Rd, int 
 
 auto emit_mrs_nzcv(AssemblerBuffer& buf, int Xd) -> void {
     // MRS Xd, NZCV
-    // [31:20]=1101010100 11 | [19:5]=system register encoding for NZCV | [4:0]=Rt
-    // NZCV sysreg: op0=11, op1=011, CRn=0100, CRm=0010, op2=000 → 0xDA42 0000
-    // Full encoding: 1101 0101 0011 0011 0100 0010 0000 | Rd
-    uint32_t insn = 0xD5334200;
-    insn |= (uint32_t)(Xd & 0x1F);
+    // NZCV sysreg: op0=3, op1=3, CRn=4, CRm=2, op2=0 → encoding 0xD53B4200 | Rt
+    // Bit layout: 1101 0101 0011 1011 0100 0010 0000 | Rt
+    buf.emit(0xD53B4200u | (uint32_t)(Xd & 0x1F));
+}
+
+auto emit_msr_nzcv(AssemblerBuffer& buf, int Xd) -> void {
+    // MSR NZCV, Xd
+    // Same sysreg as MRS but with L=0 (write): 0xD51B4200 | Rt
+    buf.emit(0xD51B4200u | (uint32_t)(Xd & 0x1F));
+}
+
+auto emit_cbz(AssemblerBuffer& buf, int is_64bit, int is_nz, int Rt, int imm19) -> void {
+    // CBZ/CBNZ Rt, #imm19
+    // Encoding: sf | 011010 | b5=0 | op | imm19 | Rt
+    // 32-bit: 0 011 0100 / 0 011 0101   (0x34 / 0x35)
+    // 64-bit: 1 011 0100 / 1 011 0101   (0xB4 / 0xB5)
+    uint32_t insn = 0x34000000u;
+    insn |= (uint32_t)(is_64bit != 0) << 31;
+    insn |= (uint32_t)(is_nz != 0) << 24;
+    insn |= ((uint32_t)(imm19) & 0x7FFFFu) << 5;
+    insn |= (uint32_t)(Rt & 0x1F);
+    buf.emit(insn);
+}
+
+auto emit_b(AssemblerBuffer& buf, int imm26) -> void {
+    // B #imm26
+    // Encoding: 0 00101 | imm26
+    buf.emit(0x14000000u | ((uint32_t)(imm26) & 0x3FFFFFFu));
+}
+
+auto emit_b_cond(AssemblerBuffer& buf, int cond, int imm19) -> void {
+    // B.cond #imm19
+    // Encoding: 0101 0100 | imm19 | 0 | cond[3:0]
+    uint32_t insn = 0x54000000u;
+    insn |= ((uint32_t)(imm19) & 0x7FFFFu) << 5;
+    insn |= (uint32_t)(cond & 0xF);
+    buf.emit(insn);
+}
+
+auto emit_fmov_f64_reg(AssemblerBuffer& buf, int Dd, int Dn) -> void {
+    // FMOV Dd, Dn — double-precision FPR-to-FPR copy
+    // Encoding: 0x1E604000 | (Rn<<5) | Rd
+    buf.emit(0x1E604000u | ((uint32_t)(Dn & 0x1F) << 5) | (uint32_t)(Dd & 0x1F));
+}
+
+auto emit_fcvt_fp_to_int(AssemblerBuffer& buf, int sf, int ftype, int rmode, int Rd, int Rn) -> void {
+    // FCVT{N,P,M,Z}S — FP to signed integer with explicit rounding mode
+    // Encoding: sf | 0 0 11110 | ftype | 1 | rmode | 000 | Rn | Rd
+    uint32_t insn = 0x1E200000u;
+    insn |= (uint32_t)(sf != 0) << 31;
+    insn |= (uint32_t)(ftype & 0x3) << 22;
+    insn |= 1u << 21;  // fixed
+    insn |= (uint32_t)(rmode & 0x3) << 19;
+    // opcode bits [18:16] = 000 (FCVT*S signed)
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Rd & 0x1F);
     buf.emit(insn);
 }
 
