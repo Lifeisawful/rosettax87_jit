@@ -112,6 +112,9 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_CACHE"))
         cfg.disable_x87_cache = (*v == '1') ? 1 : 0;
 
+    if (const char* v = std::getenv("ROSETTA_X87_FAST_ROUND"))
+        cfg.fast_round = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

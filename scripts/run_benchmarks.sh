@@ -37,6 +37,7 @@ ALL_BENCHMARKS=(
     bench_fusion_fxch_arithp
     bench_fusion_fxch_fstp
     bench_fusion_fcom_fstsw
+    bench_round
 )
 
 RED='\033[0;31m'
@@ -209,4 +210,62 @@ if [[ $total_count -gt 0 ]]; then
     echo -e "${BOLD}Summary (${total_count} benchmarks)${NC}"
     echo -e "  Avg rt_gain  (JIT vs runtime):   ${GREEN}${avg_vs_off_int}.$(printf '%02d' $avg_vs_off_frac)x${NC}"
     echo -e "  Avg nat_gain (JIT vs native):    ${GREEN}${avg_vs_nat_int}.$(printf '%02d' $avg_vs_nat_frac)x${NC}"
+fi
+
+# ── ROSETTA_X87_FAST_ROUND comparison ─────────────────────────────────────────
+# bench_round exercises FISTP/FIST/FRNDINT with all four rounding modes.
+# Compare JIT with the full RC dispatch chain (default) vs. single-instruction
+# fast path (ROSETTA_X87_FAST_ROUND=1, nearest-only, ~27% faster).
+#
+# WARNING: FAST_ROUND=1 is incorrect for code that uses FLDCW to set non-default
+# rounding modes (e.g. Lua, floor-based coordinate math). Only use it when you
+# have verified the target binary never changes the x87 rounding mode.
+ROUND_BIN="$BIN/bench_round"
+if [[ -x "$ROUND_BIN" ]]; then
+    echo ""
+    echo -e "${BOLD}ROSETTA_X87_FAST_ROUND comparison${NC}  (bench_round)"
+    echo -e "  ${YELLOW}NOTE: ROSETTA_X87_FAST_ROUND=1 is unsafe for code using FLDCW (e.g. Lua).${NC}"
+    echo ""
+
+    declare -A ROUND_DEFAULT
+    declare -A ROUND_FAST
+
+    while IFS=' ' read -r keyword name ticks; do
+        [[ "$keyword" == "BENCH" ]] || continue
+        ROUND_DEFAULT["$name"]="$ticks"
+    done < <(run_bench "$ROUND_BIN" 1)
+
+    while IFS=' ' read -r keyword name ticks; do
+        [[ "$keyword" == "BENCH" ]] || continue
+        ROUND_FAST["$name"]="$ticks"
+    done < <(run_bench "$ROUND_BIN" 1 ROSETTA_X87_FAST_ROUND=1)
+
+    DIVIDER2=$(printf '─%.0s' $(seq 1 $((COL_NAME + COL_NUM*2 + COL_SPD + 8))))
+    printf "${BOLD}%-${COL_NAME}s %${COL_NUM}s %${COL_NUM}s %${COL_SPD}s${NC}\n" \
+        "bench_round/func" "JIT" "fast_round" "speedup"
+    echo "$DIVIDER2"
+
+    for name in "${!ROUND_DEFAULT[@]}"; do
+        def_ticks="${ROUND_DEFAULT[$name]:-0}"
+        fast_ticks="${ROUND_FAST[$name]:-0}"
+
+        if [[ $fast_ticks -gt 0 && $def_ticks -gt 0 ]]; then
+            spd_pct=$(( def_ticks * 100 / fast_ticks ))
+            spd_int=$(( spd_pct / 100 ))
+            spd_frac=$(( spd_pct % 100 ))
+        else
+            spd_int=0; spd_frac=0; spd_pct=0
+        fi
+
+        if   [[ $spd_pct -ge 110 ]]; then spd_color="$GREEN"
+        elif [[ $spd_pct -ge 90  ]]; then spd_color="$YELLOW"
+        else                               spd_color="$RED"
+        fi
+
+        printf "%-${COL_NAME}s %${COL_NUM}s %${COL_NUM}s ${spd_color}%${COL_SPD}s${NC}\n" \
+            "round/$name" "$def_ticks" "$fast_ticks" \
+            "${spd_int}.$(printf '%02d' $spd_frac)x"
+    done
+
+    echo "$DIVIDER2"
 fi
