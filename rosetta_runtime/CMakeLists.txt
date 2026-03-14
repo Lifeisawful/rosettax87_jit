@@ -39,6 +39,7 @@ target_include_directories(libRuntimeRosettax87 PRIVATE
 )
 
 target_link_options(libRuntimeRosettax87 PRIVATE
+    "-O3"
     "-Wl,-no_compact_unwind"
 #    "-Wl,-no_pie"
     "-static"

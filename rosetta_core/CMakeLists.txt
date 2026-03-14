@@ -40,7 +40,7 @@ target_include_directories(rosetta_core_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 target_compile_features(rosetta_core_runtime PUBLIC cxx_std_23)
 target_compile_options(rosetta_core_runtime PRIVATE
     -fvisibility=hidden
-    # -O0 # causes undefined behaivor - we can neglect performance for translation anyway
+    -O3
     -funroll-loops
     -march=native
     -mtune=native
@@ -65,4 +65,3 @@ target_sources(rosetta_core_runtime PRIVATE
     src/RuntimeSymbols.cpp
 )
 set_property(TARGET rosetta_core_runtime PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
- 

@@ -39,6 +39,7 @@ ALL_TESTS=(
     test_fxam
     test_peephole7
     test_fcom_nzcv
+    test_store_forward
 )
 
 RED='\033[0;31m'
