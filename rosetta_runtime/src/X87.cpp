@@ -945,33 +945,28 @@ void x87_fld_constant(X87State* state, X87Constant val) {
         } break;
 
         case X87Constant::kPi: {  // fldpi
-            // store_x87_extended_value(state, {.ieee754 = 3.141592741f});
             state->push();
-            state->setSt(0, 3.141592741f);
+            state->setSt(0, std::bit_cast<double>(0x400921FB54442D18ULL));
         } break;
 
         case X87Constant::kLog2e: {  // fldl2e
-            // store_x87_extended_value(state, {.ieee754 = 1.44269502f});
             state->push();
-            state->setSt(0, 1.44269502f);
+            state->setSt(0, std::bit_cast<double>(0x3FF71547652B82FEULL));
         } break;
 
         case X87Constant::kLoge2: {  // fldln2
-            // store_x87_extended_value(state, {.ieee754 = 0.693147182f});
             state->push();
-            state->setSt(0, 0.693147182f);
+            state->setSt(0, std::bit_cast<double>(0x3FE62E42FEFA39EFULL));
         } break;
 
         case X87Constant::kLog2t: {  // fldl2t
-            // store_x87_extended_value(state, {.ieee754 = 3.321928f});
             state->push();
-            state->setSt(0, 3.321928f);
+            state->setSt(0, std::bit_cast<double>(0x400A934F0979A371ULL));
         } break;
 
-        case X87Constant::kLog102: {  // fldl2e
-            // store_x87_extended_value(state, {.ieee754 = 0.301029987f});
+        case X87Constant::kLog102: {  // fldlg2
             state->push();
-            state->setSt(0, 0.301029987f);
+            state->setSt(0, std::bit_cast<double>(0x3FD34413509F79FFULL));
         } break;
 
         default: {
