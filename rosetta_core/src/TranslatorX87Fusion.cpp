@@ -93,6 +93,64 @@ static FldClassification classify_fld_source(IRInstr* fld_instr) {
     return cls;
 }
 
+static bool fld_source_is_x86_memory(FldSource src) {
+    switch (src) {
+        case kFldM32:
+        case kFldM64:
+        case kFildM16:
+        case kFildM32:
+        case kFildM64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Returns true if a preceding non-x87 instruction in the same block stores to
+// the same memory address that the FLD at instrs[fld_idx] reads from.
+//
+// When Rosetta's IR-level optimiser sees a store (e.g. MOVSD [rbp-8], XMM0)
+// followed by an FLD from the same address, it forwards the value via a
+// register — never emitting an ARM STR.  Our fused code emits an ARM LDR and
+// reads stale/uninitialised data.  By scanning backwards we detect this case
+// and reject the fusion, letting standalone translate_fld handle it correctly.
+//
+// X87 stores (FST/FSTP/FIST/etc.) are safe — our translator always emits the
+// ARM STR for those.
+static bool is_memory_fld_with_store_conflict(IRInstr* instrs, int64_t fld_idx) {
+    auto cls = classify_fld_source(&instrs[fld_idx]);
+    if (!fld_source_is_x86_memory(cls.source))
+        return false;
+
+    const auto& fld_mem = instrs[fld_idx].operands[0].mem;
+
+    for (int64_t i = fld_idx - 1; i >= 0; --i) {
+        const auto& instr = instrs[i];
+
+        // Skip x87 instructions — our translator emits their stores correctly.
+        const uint16_t op = instr.opcode;
+        if ((op >= 0x25 && op <= 0x30) || (op >= 0xBD && op <= 0x10C))
+            continue;
+
+        // Only check instructions whose first operand is a memory destination
+        // (potential store).
+        if (instr.operands[0].kind != IROperandKind::MemRef)
+            continue;
+
+        // Structural address match: same base, index, scale, displacement.
+        const auto& st = instr.operands[0].mem;
+        if (st.mem_flags == fld_mem.mem_flags &&
+            st.base_reg == fld_mem.base_reg &&
+            st.index_reg == fld_mem.index_reg &&
+            st.shift_amount == fld_mem.shift_amount &&
+            st.disp == fld_mem.disp) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // =============================================================================
 // Shared FLD value materialisation
 //
@@ -1463,12 +1521,24 @@ static auto try_fuse_fld_group(TranslationResult* tr, IRInstr* instrs, int64_t n
     IRInstr* cur = &instrs[idx];
     IRInstr* next = &instrs[idx + 1];  // caller guarantees idx+1 < num
 
-    // 4-instruction fusions (longest first)
-    if (idx + 3 < num) {
+    // Reject fusions when the FLD reads from a memory address that a preceding
+    // non-x87 store in the same block also writes to.  Rosetta may forward the
+    // store value in a register and elide the ARM STR, so our fused LDR would
+    // read stale data.  Only memory-sourced FLDs with an actual conflict are
+    // rejected; register/constant FLDs and loads with no conflicting store are
+    // allowed through.
+    const bool fld0_conflict = is_memory_fld_with_store_conflict(instrs, idx);
+
+    // 4-instruction fusions (longest first) — both FLDs must be conflict-free
+    if (idx + 3 < num && !fld0_conflict) {
         if (!fusion_disabled(disabled_mask, FusionId::fld_fld_fucompp))
-            if (auto r = try_fuse_fld_fld_fucompp(tr, cur, next, &instrs[idx + 2], &instrs[idx + 3]))
-                return r;
+            if (!is_memory_fld_with_store_conflict(instrs, idx + 1))
+                if (auto r = try_fuse_fld_fld_fucompp(tr, cur, next, &instrs[idx + 2], &instrs[idx + 3]))
+                    return r;
     }
+
+    if (fld0_conflict)
+        return std::nullopt;
 
     // 3-instruction fusions
     if (idx + 2 < num) {
@@ -1485,8 +1555,9 @@ static auto try_fuse_fld_group(TranslationResult* tr, IRInstr* instrs, int64_t n
             if (auto r = try_fuse_fld_fcompp_fstsw(tr, cur, next, &instrs[idx + 2]))
                 return r;
         if (!fusion_disabled(disabled_mask, FusionId::fld_fld_fucompp))
-            if (auto r = try_fuse_fld_fld_fucompp(tr, cur, next, &instrs[idx + 2], nullptr))
-                return r;
+            if (!is_memory_fld_with_store_conflict(instrs, idx + 1))
+                if (auto r = try_fuse_fld_fld_fucompp(tr, cur, next, &instrs[idx + 2], nullptr))
+                    return r;
     }
 
     // 2-instruction fusions
