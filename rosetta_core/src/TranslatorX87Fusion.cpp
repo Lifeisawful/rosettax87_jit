@@ -1,6 +1,5 @@
 #include "rosetta_core/TranslatorX87Fusion.h"
 
-#include "rosetta_core/CoreLog.h"
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/Register.h"
@@ -577,29 +576,19 @@ static auto try_fuse_fcom_fstsw(TranslationResult* a1, IRInstr* fcom_instr, IRIn
     free_gpr(*a1, Wd_vs);
     free_gpr(*a1, Wd_cc);
 
-    // ── RMW status_word + BFI into AX (FUSED — no separate LDRH for FSTSW) ──
+    // ── Build status_word from scratch + BFI into AX ──────────────────────
     const int W_ax = fstsw_instr->operands[0].reg.reg.index();
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
-        // OPT-C: flush deferred TOP before reading status_word — FSTSW
-        // needs correct TOP in AX.
-        // NOTE: Wd_tmp holds the packed CC bits here — use Wd_sw as scratch
-        // for the flush so the CC bits survive.
+        // OPT-C: flush deferred TOP before building status_word.
         x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
-        // LDRH Wd_sw, [Xbase, #0x02]
-        emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
+        // Build SW from registers: Wd_sw = (Wd_top << 11) | packed_CC
+        emit_bitfield(buf, 0, 2, 0, /*immr=*/21, /*imms=*/20, Wd_top, Wd_sw);  // LSL #11
+        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);    // ORR CC bits
 
-        // OPT-F1: clear bits [10:8] and bit 14
-        emit_bitfield(buf, 0, 1, 0, 24, 2, GPR::XZR, Wd_sw);
-        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);
-
-        // ORR in new CC bits
-        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);
-
-        // OPT-F6: BFI directly into W_AX — saves the LDRH that
-        // translate_fstsw would have needed.
+        // OPT-F6: BFI directly into W_AX
         emit_bitfield(buf, 0, 1, 0, /*immr=*/0, /*imms=*/15, Wd_sw, W_ax);
 
         // STRH Wd_sw → status_word (still needed for other readers)
@@ -1056,7 +1045,7 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
     free_gpr(*a1, Wd_vs);
     free_gpr(*a1, Wd_cc);
 
-    // ── 4d: RMW status_word + BFI into AX (OPT-F6 trick) ──────────────────
+    // ── 4d: Build status_word from scratch + BFI into AX ──────────────────
     const int W_ax = fstsw_instr->operands[0].reg.reg.index();
     {
         const int Wd_sw = alloc_free_gpr(*a1);
@@ -1065,15 +1054,9 @@ static auto try_fuse_fld_fcomp_fstsw(TranslationResult* a1, IRInstr* fld_instr,
         if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
             x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
-        // LDRH Wd_sw, [Xbase, #status_word]
-        emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
-
-        // Clear CC bits [10:8] and bit 14
-        emit_bitfield(buf, 0, 1, 0, 24, 2, GPR::XZR, Wd_sw);
-        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);
-
-        // ORR in new CC bits
-        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);
+        // Build SW from registers: Wd_sw = (Wd_top << 11) | packed_CC
+        emit_bitfield(buf, 0, 2, 0, /*immr=*/21, /*imms=*/20, Wd_top, Wd_sw);  // LSL #11
+        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);    // ORR CC bits
 
         // OPT-F6: BFI directly into W_AX
         emit_bitfield(buf, 0, 1, 0, /*immr=*/0, /*imms=*/15, Wd_sw, W_ax);
@@ -1435,7 +1418,9 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
     free_gpr(*a1, Wd_vs);
     free_gpr(*a1, Wd_cc);
 
-    // ── 4c: RMW status_word (+ optional BFI into AX for 4-instr form) ───────
+    // ── 4c: Build status_word from scratch (+ optional copy into AX) ────────
+    // Construct SW = (TOP << 11) | CC_bits.  Avoids reading stale status word
+    // from memory, which caused first-call CC corruption.
     {
         const int Wd_sw = alloc_free_gpr(*a1);
 
@@ -1443,20 +1428,14 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
         if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
             x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_sw);
 
-        // LDRH Wd_sw, [Xbase, #status_word]
-        emit_ldr_str_imm(buf, 1, 0, 1, kX87StatusWordImm12, Xbase, Wd_sw);
-
-        // Clear CC bits [10:8] and bit 14
-        emit_bitfield(buf, 0, 1, 0, 24, 2, GPR::XZR, Wd_sw);
-        emit_bitfield(buf, 0, 1, 0, 18, 0, GPR::XZR, Wd_sw);
-
-        // ORR in new CC bits
-        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);
+        // Build SW from registers: Wd_sw = (Wd_top << 11) | packed_CC
+        emit_bitfield(buf, 0, 2, 0, /*immr=*/21, /*imms=*/20, Wd_top, Wd_sw);  // LSL #11
+        emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_tmp, 0, Wd_sw, Wd_sw);    // ORR CC bits
 
         if (has_fstsw) {
-            // OPT-F6: BFI directly into W_AX
             const int W_ax = fstsw_instr->operands[0].reg.reg.index();
-            emit_bitfield(buf, 0, 1, 0, /*immr=*/0, /*imms=*/15, Wd_sw, W_ax);
+            // MOV W_ax, Wd_sw
+            buf.emit(0x2A0003E0u | (uint32_t(Wd_sw) << 16) | uint32_t(W_ax));
         }
 
         // STRH Wd_sw → status_word
