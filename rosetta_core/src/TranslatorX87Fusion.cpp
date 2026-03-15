@@ -1585,6 +1585,131 @@ static auto try_fuse_arithp_fstp(TranslationResult* a1, IRInstr* arithp_instr, I
 }
 
 // =============================================================================
+// Peephole: FSTP + FLD fusion (pop + push cancel)
+//
+// When FSTP pops ST(0) to a destination and the immediately following FLD
+// pushes a new value, the pop and push cancel (net stack effect = 0).
+//
+// Without fusion, the pop does a full tag-invalidate + TOP increment, and the
+// push does a full tag-validate + TOP decrement — OPT-D cannot help because
+// the pop precedes the push (wrong order for cancellation).
+//
+// Fused: we skip both the pop and push entirely, performing just:
+//   1. Load ST(0) and store to FSTP destination (memory or register)
+//   2. Materialise FLD value and store to ST(0)
+//
+// For FLD from register: the register index references the post-pop/pre-push
+// stack.  Since we keep TOP unchanged, we compensate by reading from
+// depth (reg_depth + 1) instead of reg_depth.
+//
+// Net stack effect: 0 (pop + push cancel).
+//
+// Returns 2 (instructions consumed) if fused, std::nullopt otherwise.
+// =============================================================================
+
+static auto try_fuse_fstp_fld(TranslationResult* a1, IRInstr* fstp_instr, IRInstr* fld_instr)
+    -> std::optional<int> {
+    // ── 1. Validate FSTP ────────────────────────────────────────────────────
+
+    const bool fstp_is_reg = (fstp_instr->operands[0].kind == IROperandKind::Register);
+    int fstp_reg_depth = 0;
+
+    if (fstp_is_reg) {
+        fstp_reg_depth = fstp_instr->operands[0].reg.reg.index();
+    } else {
+        // Memory: reject m80 (too complex for fusion)
+        if (fstp_instr->operands[0].mem.size == IROperandSize::S80)
+            return std::nullopt;
+    }
+
+    // ── 2. Classify the FLD source ──────────────────────────────────────────
+
+    auto cls = classify_fld_source(fld_instr);
+    if (cls.source == kFldInvalid)
+        return std::nullopt;
+
+    // ── 3. Emit fused code ──────────────────────────────────────────────────
+
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    // OPT-D: net-zero-stack fusion — skip flush to preserve full cancellation.
+    if (!(a1->x87_cache.tag_push_pending && a1->x87_cache.top_dirty))
+        x87_flush_top(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+    // FSTP ST(0) is "discard top" — the old ST(0) value is not stored anywhere,
+    // so we can skip loading it entirely.
+    const bool fstp_is_discard = (fstp_is_reg && fstp_reg_depth == 0);
+
+    const int Dd_fld = alloc_free_fpr(*a1);
+
+    // ── 3a: Load old ST(0) (skip if FSTP ST(0) discard) ────────────────────
+
+    int Dd_st0 = -1;
+    int Wk_st0 = -1;
+    if (!fstp_is_discard) {
+        Dd_st0 = alloc_free_fpr(*a1);
+        Wk_st0 = emit_load_st(buf, Xbase, Wd_top, /*depth=*/0, Wd_tmp, Dd_st0, Xst_base);
+    }
+
+    // ── 3b/3c: Store FSTP dest and load FLD value ─────────────────────────
+    //
+    // Ordering matters for correctness:
+    //   Register FSTP: load FLD source FIRST, then store FSTP dest.
+    //     (FSTP ST(n) may overwrite the slot FLD ST(m) reads from.)
+    //   Memory FSTP:   store FSTP dest FIRST, then load FLD source.
+    //     (FLD may read from the same address FSTP writes to — e.g. the
+    //      f32 truncation idiom: FSTP dword [x]; FLD dword [x].)
+
+    if (fstp_is_reg) {
+        // ── Register path: load FLD first, then store FSTP ──────────────
+
+        if (cls.source == kFldReg) {
+            emit_load_st(buf, Xbase, Wd_top, cls.reg_depth + 1, Wd_tmp, Dd_fld, Xst_base);
+        } else {
+            emit_fld_value(buf, *a1, cls, fld_instr, Xbase, Wd_top, Wd_tmp, Dd_fld, Xst_base);
+        }
+
+        if (!fstp_is_discard) {
+            emit_store_st(buf, Xbase, Wd_top, fstp_reg_depth, Wd_tmp, Dd_st0, Xst_base);
+        }
+    } else {
+        // ── Memory path: store FSTP first, then load FLD ────────────────
+
+        const bool is_f32 = (fstp_instr->operands[0].mem.size == IROperandSize::S32);
+        if (is_f32)
+            emit_fcvt_d_to_s(buf, Dd_st0, Dd_st0);
+
+        const int addr =
+            compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
+        emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_st0, addr, 0);
+        free_gpr(*a1, addr);
+
+        if (cls.source == kFldReg) {
+            emit_load_st(buf, Xbase, Wd_top, cls.reg_depth + 1, Wd_tmp, Dd_fld, Xst_base);
+        } else {
+            emit_fld_value(buf, *a1, cls, fld_instr, Xbase, Wd_top, Wd_tmp, Dd_fld, Xst_base);
+        }
+    }
+
+    // ── 3d: Store FLD value to ST(0) ────────────────────────────────────────
+
+    emit_store_st(buf, Xbase, Wd_top, /*depth=*/0, Wd_tmp, Dd_fld, Xst_base);
+
+    // ── Cleanup ─────────────────────────────────────────────────────────────
+
+    if (Dd_st0 >= 0)
+        free_fpr(*a1, Dd_st0);
+    free_fpr(*a1, Dd_fld);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
+    free_gpr(*a1, Wd_tmp);
+
+    return 2;
+}
+
+// =============================================================================
 // Per-opcode-group fusion dispatchers (longest patterns first)
 // =============================================================================
 
@@ -1672,6 +1797,18 @@ static auto try_fuse_arithp_group(TranslationResult* tr, IRInstr* instrs, int64_
     return std::nullopt;
 }
 
+static auto try_fuse_fstp_group(TranslationResult* tr, IRInstr* instrs, int64_t num, int64_t idx,
+                                uint64_t disabled_mask) -> std::optional<int> {
+    IRInstr* cur = &instrs[idx];
+    IRInstr* next = &instrs[idx + 1];
+
+    if (!fusion_disabled(disabled_mask, FusionId::fstp_fld))
+        if (auto r = try_fuse_fstp_fld(tr, cur, next))
+            return r;
+
+    return std::nullopt;
+}
+
 // =============================================================================
 // try_peephole — single entry point for all peephole fusion patterns
 // =============================================================================
@@ -1711,6 +1848,10 @@ auto try_peephole(TranslationResult* tr, IRInstr* instrs, int64_t num, int64_t i
         case kOpcodeName_fdivp:
         case kOpcodeName_fdivrp:
             return try_fuse_arithp_group(tr, instrs, num, idx, disabled_mask);
+
+        case kOpcodeName_fstp:
+        case kOpcodeName_fstp_stack:
+            return try_fuse_fstp_group(tr, instrs, num, idx, disabled_mask);
 
         default:
             return std::nullopt;
