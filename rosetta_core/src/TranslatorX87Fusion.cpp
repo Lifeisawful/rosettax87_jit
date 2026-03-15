@@ -1476,6 +1476,115 @@ static auto try_fuse_fld_fld_fucompp(TranslationResult* a1,
 }
 
 // =============================================================================
+// Peephole: ARITHp ST(1) + FSTP mem  → compute + store + double-pop
+//
+// Fuses a popping arithmetic targeting ST(1) followed by FSTP to memory.
+// Without fusion, the arithp stores its result back to the x87 stack slot
+// and the immediately following FSTP reloads it — a redundant round-trip.
+//
+// With fusion the result stays in a register and goes directly to memory.
+// Both popped slots are discarded, so no stack writeback is needed at all.
+//
+// Constraint: arithp must target ST(1).  After one pop, ST(1) becomes the
+//             new ST(0), which FSTP then stores and pops.  Since both the
+//             old ST(0) and old ST(1) are popped, the result never needs
+//             to hit the stack.
+//
+// Net stack effect: −2  (one arithp pop + one fstp pop).
+//
+// Returns 2 (instructions consumed) if fused, std::nullopt otherwise.
+// =============================================================================
+
+static auto try_fuse_arithp_fstp(TranslationResult* a1, IRInstr* arithp_instr, IRInstr* fstp_instr)
+    -> std::optional<int> {
+    // ── 1. Classify the popping arithmetic op ────────────────────────────────
+
+    enum ArithOp { kAdd, kSub, kSubR, kMul, kDiv, kDivR };
+
+    ArithOp arith;
+    switch (arithp_instr->opcode) {
+        case kOpcodeName_faddp:  arith = kAdd;  break;
+        case kOpcodeName_fsubp:  arith = kSub;  break;
+        case kOpcodeName_fsubrp: arith = kSubR; break;
+        case kOpcodeName_fmulp:  arith = kMul;  break;
+        case kOpcodeName_fdivp:  arith = kDiv;  break;
+        case kOpcodeName_fdivrp: arith = kDivR; break;
+        default: return std::nullopt;
+    }
+
+    // Must target ST(1) — after the pop, the result would land in new ST(0)
+    // which FSTP then stores and pops.  For deeper targets the result survives
+    // the pops and would need a stack writeback, which we skip here.
+    if (arithp_instr->operands[0].reg.reg.index() != 1)
+        return std::nullopt;
+
+    // ── 2. Validate FSTP to memory (m32 or m64, not m80, not register) ──────
+
+    if (fstp_instr->opcode != kOpcodeName_fstp)
+        return std::nullopt;
+    if (fstp_instr->operands[0].kind == IROperandKind::Register)
+        return std::nullopt;
+    const auto fstp_size = fstp_instr->operands[0].mem.size;
+    if (fstp_size == IROperandSize::S80)
+        return std::nullopt;
+
+    const bool is_f32 = (fstp_size == IROperandSize::S32);
+
+    // ── 3. Emit fused code ──────────────────────────────────────────────────
+
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    // No x87_flush_top needed — emit_load_st uses register Wd_top, not memory.
+    // x87_pop_n at the end handles TOP writeback.
+
+    const int Dd_src = alloc_free_fpr(*a1);  // ST(0)
+    const int Dd_dst = alloc_free_fpr(*a1);  // ST(1)
+
+    // Load ST(0) and ST(1).
+    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/0, Wd_tmp, Dd_src, Xst_base);
+    emit_load_st(buf, Xbase, Wd_top, /*stack_depth=*/1, Wd_tmp, Dd_dst, Xst_base);
+
+    // Compute: Dd_dst = op(Dd_dst, Dd_src)
+    //   faddp:  ST(1) = ST(1) + ST(0)
+    //   fsubp:  ST(1) = ST(1) - ST(0)
+    //   fsubrp: ST(1) = ST(0) - ST(1)
+    //   fmulp:  ST(1) = ST(1) * ST(0)
+    //   fdivp:  ST(1) = ST(1) / ST(0)
+    //   fdivrp: ST(1) = ST(0) / ST(1)
+    switch (arith) {
+        case kAdd:  emit_fadd_f64(buf, Dd_dst, Dd_dst, Dd_src); break;
+        case kSub:  emit_fsub_f64(buf, Dd_dst, Dd_dst, Dd_src); break;
+        case kSubR: emit_fsub_f64(buf, Dd_dst, Dd_src, Dd_dst); break;
+        case kMul:  emit_fmul_f64(buf, Dd_dst, Dd_dst, Dd_src); break;
+        case kDiv:  emit_fdiv_f64(buf, Dd_dst, Dd_dst, Dd_src); break;
+        case kDivR: emit_fdiv_f64(buf, Dd_dst, Dd_src, Dd_dst); break;
+    }
+
+    // Convert and store to memory — result goes directly from register.
+    if (is_f32)
+        emit_fcvt_d_to_s(buf, Dd_dst, Dd_dst);
+
+    const int addr_reg =
+        compute_operand_address(*a1, /*is_64bit=*/true, &fstp_instr->operands[0], GPR::XZR);
+    emit_fstr_imm(buf, is_f32 ? 2 : 3, Dd_dst, addr_reg, /*imm12=*/0);
+    free_gpr(*a1, addr_reg);
+
+    // Double pop — both old ST(0) and old ST(1) are consumed.
+    // No stack slot writeback needed since both slots are popped away.
+    x87_pop_n(buf, *a1, Xbase, Wd_top, Wd_tmp, 2);
+
+    free_fpr(*a1, Dd_src);
+    free_fpr(*a1, Dd_dst);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp, /*consumed=*/2);
+    free_gpr(*a1, Wd_tmp);
+
+    return 2;
+}
+
+// =============================================================================
 // Per-opcode-group fusion dispatchers (longest patterns first)
 // =============================================================================
 
@@ -1551,6 +1660,18 @@ static auto try_fuse_fcom_group(TranslationResult* tr, IRInstr* instrs, int64_t 
     return std::nullopt;
 }
 
+static auto try_fuse_arithp_group(TranslationResult* tr, IRInstr* instrs, int64_t num, int64_t idx,
+                                  uint64_t disabled_mask) -> std::optional<int> {
+    IRInstr* cur = &instrs[idx];
+    IRInstr* next = &instrs[idx + 1];
+
+    if (!fusion_disabled(disabled_mask, FusionId::arithp_fstp))
+        if (auto r = try_fuse_arithp_fstp(tr, cur, next))
+            return r;
+
+    return std::nullopt;
+}
+
 // =============================================================================
 // try_peephole — single entry point for all peephole fusion patterns
 // =============================================================================
@@ -1582,6 +1703,14 @@ auto try_peephole(TranslationResult* tr, IRInstr* instrs, int64_t num, int64_t i
         case kOpcodeName_fcompp:
         case kOpcodeName_fucompp:
             return try_fuse_fcom_group(tr, instrs, num, idx, disabled_mask);
+
+        case kOpcodeName_faddp:
+        case kOpcodeName_fsubp:
+        case kOpcodeName_fsubrp:
+        case kOpcodeName_fmulp:
+        case kOpcodeName_fdivp:
+        case kOpcodeName_fdivrp:
+            return try_fuse_arithp_group(tr, instrs, num, idx, disabled_mask);
 
         default:
             return std::nullopt;

@@ -39,6 +39,7 @@ ALL_TESTS=(
     test_fxam
     test_peephole7
     test_fcom_nzcv
+    test_arithp_fstp
 )
 
 RED='\033[0;31m'
