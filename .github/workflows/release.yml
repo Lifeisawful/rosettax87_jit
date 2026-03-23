@@ -1,0 +1,68 @@
+name: Build and Release
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target runtime_loader libRuntimeRosettax87 --parallel
+
+      - name: Verify binaries
+        run: |
+          echo "=== runtime_loader ==="
+          file build/bin/runtime_loader
+          echo ""
+          echo "=== libRuntimeRosettax87 ==="
+          file build/bin/libRuntimeRosettax87
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release
+          cp build/bin/runtime_loader release/
+          cp build/bin/libRuntimeRosettax87 release/
+          cd release
+          tar czf ../rosettax87-jit-macos-arm64.tar.gz .
+
+      - name: Update latest release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build (${{ github.sha }})
+          prerelease: true
+          make_latest: false
+          files: |
+            rosettax87-jit-macos-arm64.tar.gz
+            release/runtime_loader
+            release/libRuntimeRosettax87
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: rosettax87_jit ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            rosettax87-jit-macos-arm64.tar.gz
+            release/runtime_loader
+            release/libRuntimeRosettax87
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
