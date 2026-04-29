@@ -7,6 +7,7 @@
 #include <sys/event.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sched.h>
 
 #include <cstdio>
 #include <cstring>
@@ -662,6 +663,7 @@ int main(int argc, char* argv[]) {
     // This prevents a PID cycle (child->parent->child via ptrace) in the
     // process table that crashes Terminal.app's recursive process-tree walker.
     close(syncPipe[0]);
+    pid_t intermediatePid = getpid();   // valid in C; G inherits via fork copy
     pid_t grandchild = fork();
     if (grandchild == -1) {
         perror("fork (double-fork)");
@@ -671,7 +673,31 @@ int main(int argc, char* argv[]) {
         _exit(0);  // intermediate child exits; grandchild reparented to PID 1
     }
 
-    // GRANDCHILD: becomes the debugger (ppid = 1, no cycle with parent)
+    // GRANDCHILD: wait for the intermediate child to exit before PT_ATTACH.
+    // PT_ATTACH would otherwise reparent R under G while C is still alive
+    // with G as its child, briefly creating a children-list cycle (R↔G via
+    // PT_ATTACH plus G's original ppid=C still in C.children) that crashes
+    // Terminal.app's proc_listchildpids walker. NOTE_EXIT fires from xnu's
+    // proc_exit after G has already been reparented to launchd and C has
+    // been removed from R.children — kernel state is then guaranteed
+    // cycle-free.
+    {
+        int kq = kqueue();
+        if (kq >= 0) {
+            struct kevent ev;
+            EV_SET(&ev, intermediatePid, EVFILT_PROC, EV_ADD | EV_ONESHOT,
+                   NOTE_EXIT, 0, nullptr);
+            struct kevent out;
+            struct timespec ts = {2, 0};   // generous; C's path is ~2 insns
+            (void)kevent(kq, &ev, 1, &out, 1, &ts);
+            close(kq);
+        }
+        // Cover the case where C exited before kevent could register.
+        while (getppid() != 1) {
+            sched_yield();
+        }
+    }
+
     MuhDebugger dbg;
     if (!dbg.attach(parentPid)) {
         fprintf(stderr, "Failed to attach to parent process\n");
