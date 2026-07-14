@@ -88,6 +88,12 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     const auto opcode = cur_instr->opcode();
     auto& cache = translation_result->x87_cache;
 
+    // Bisection knob: hook installed but zero engagement — decline every
+    // instruction before any cache/state/mask access.
+    if (g_rosetta_config && g_rosetta_config->decline_all) {
+        return std::nullopt;
+    }
+
     // Only engage for opcodes we actually handle (x87 ops, plus ARPL). For every
     // other instruction (the vast majority — the whole non-x87 program), decline
     // IMMEDIATELY without touching Rosetta's register masks or our cache. Engaging

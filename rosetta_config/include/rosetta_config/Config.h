@@ -103,10 +103,15 @@ struct RosettaConfig {
     uint8_t  fast_recip_div;         // ROSETTA_X87_FAST_RECIP_DIV=1 — FDiv by ANY normal constant → FMul by reciprocal (up to 1 ulp off; opt-in)
     uint8_t  log_ir_declines;        // ROSETTA_X87_LOG_IR_DECLINES=1 — print address + CompileError for every run the IR pipeline declines
     uint8_t  disable_addr_fold;      // ROSETTA_X87_DISABLE_ADDR_FOLD=1 — don't fold base+disp into LDR/STR addressing modes (singular + fusion paths)
+    uint8_t  decline_all;            // ROSETTA_X87_DECLINE_ALL=1 — translate_instruction declines EVERY instruction before any cache/state access (bisection: hook installed, zero engagement)
+    uint8_t  disable_size_patch;     // ROSETTA_X87_DISABLE_SIZE_PATCH=1 — skip the TranslationResult alloc-size patch (0x268→0x400) (bisection)
+    uint8_t  disable_decode_hook;    // ROSETTA_X87_DISABLE_DECODE_HOOK=1 — don't install hook_decode_opcode (no ARPL/DC-D8 substitution) (bisection)
+    uint8_t  disable_classify_hook;  // ROSETTA_X87_DISABLE_CLASSIFY_HOOK=1 — don't install classify_arm_pc hook (bisection)
+    uint8_t  disable_translate_hook; // ROSETTA_X87_DISABLE_TRANSLATE_HOOK=1 — don't install hook_translate_insn at all (bisection; implies no size patch side effects from that init)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
-static_assert(sizeof(RosettaConfig) == 0x20);
+static_assert(sizeof(RosettaConfig) == 0x28);
 
 inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
     return (cfg.disabled_ops_mask >> static_cast<int>(id)) & 1u;

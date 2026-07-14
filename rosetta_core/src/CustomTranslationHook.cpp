@@ -1,5 +1,7 @@
 #include "rosetta_core/CustomTranslationHook.h"
 
+#include "rosetta_config/Config.h"
+#include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/CoreLog.h"
 #include "rosetta_core/Translator.h"
 #include "rosetta_core/hook.h"
@@ -23,7 +25,9 @@ void init_custom_translation_hook(uintptr_t translate_insn_addr,
                  reinterpret_cast<void*>(hook_translate_insn),
                  reinterpret_cast<void**>(&original_translate_insn));
 
-    patch_movz_imm((void*)transaction_result_size_addr, 0x400);
+    if (!(g_rosetta_config && g_rosetta_config->disable_size_patch)) {
+        patch_movz_imm((void*)transaction_result_size_addr, 0x400);
+    }
 }
 
 int64_t hook_translate_insn(TranslationResult* result, IRBlock* block, IRInstr* instr_array,

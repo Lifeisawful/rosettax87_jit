@@ -153,6 +153,21 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ADDR_FOLD"))
         cfg.disable_addr_fold = (*v == '1') ? 1 : 0;
 
+    if (const char* v = std::getenv("ROSETTA_X87_DECLINE_ALL"))
+        cfg.decline_all = (*v == '1') ? 1 : 0;
+
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_SIZE_PATCH"))
+        cfg.disable_size_patch = (*v == '1') ? 1 : 0;
+
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_DECODE_HOOK"))
+        cfg.disable_decode_hook = (*v == '1') ? 1 : 0;
+
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_CLASSIFY_HOOK"))
+        cfg.disable_classify_hook = (*v == '1') ? 1 : 0;
+
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_TRANSLATE_HOOK"))
+        cfg.disable_translate_hook = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;
