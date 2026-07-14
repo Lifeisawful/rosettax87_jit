@@ -65,6 +65,11 @@ void* memset(void* dst, int c, size_t n) {
     return rt_memset(dst, c, n);
 }
 
+/* clang lowers struct zero-init to a bzero call; -nostdlib means we must supply it. */
+void bzero(void* dst, size_t n) {
+    rt_memset(dst, 0, n);
+}
+
 int memcmp(const void* a, const void* b, size_t n) {
     return rt_memcmp(a, b, n);
 }
