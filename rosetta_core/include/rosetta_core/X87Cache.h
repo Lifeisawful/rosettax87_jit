@@ -48,4 +48,7 @@ struct X87Cache {
     // breaking the run from our perspective).
     static int lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                          uint64_t disabled_ops_mask = 0);
+
+    // True if `op` is an x87 opcode we have a translate_* handler for.
+    static bool is_handled(uint16_t op);
 };

@@ -88,6 +88,17 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     const auto opcode = cur_instr->opcode();
     auto& cache = translation_result->x87_cache;
 
+    // Only engage for opcodes we actually handle (x87 ops, plus ARPL). For every
+    // other instruction (the vast majority — the whole non-x87 program), decline
+    // IMMEDIATELY without touching Rosetta's register masks or our cache. Engaging
+    // cache-management on non-x87 blocks perturbs Rosetta's cold (first) translation
+    // of that block, causing it to leave guest memory uninitialized (crash on
+    // 26.5.2). Block changes are still detected at the first handled op of a block.
+    if (!cache.active() && !X87Cache::is_handled(opcode) &&
+        opcode != Opcode::kOpcodeName_arpl) {
+        return std::nullopt;
+    }
+
     // If extended FPR scratch is enabled, upgrade the mask from 8-reg to 16-reg form on first use.
     if (g_rosetta_config && g_rosetta_config->extended_fpr_scratch &&
         translation_result->free_fpr_mask == kFprScratchMask) {
