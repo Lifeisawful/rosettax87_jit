@@ -83,13 +83,10 @@ These flags are primarily useful for narrowing down bugs by selectively disablin
 | `ROSETTA_X87_LOG_RUN_BREAKS=1` | Log length + breaking opcode + gap-to-next-x87 for every x87 run — useful for finding what terminates runs in real workloads |
 | `ROSETTA_X87_LOGS=1` | Enable verbose logging output from the loader |
 | `ROSETTA_FORCE_CPU_MODE32=1` | Force the decoder into 32-bit mode (test-only; lets `aotinvoke` reach legacy opcodes like ARPL) |
-| `ROSETTA_X87_DISABLE_SIP=1` | Patch the runtime's SIP check (`sys_csrctl`) so the unlocked `ROSETTA_*` runtime flags below are accepted; scrubs kernel-mirrored `ROSETTA_X87_*` apple[] entries. Off by default (leaves the SIP check intact) — required to use any flag in the [Unlocked Rosetta Runtime Flags](#unlocked-rosetta-runtime-flags) table |
 
 ### Unlocked Rosetta Runtime Flags
 
-The loader can patch the runtime's SIP check (`sys_csrctl`) to accept `ROSETTA_*` environment variables that are normally blocked. These are Apple's own debugging/diagnostic flags built into `/usr/libexec/rosetta/runtime` — the loader simply makes them accessible.
-
-**This requires `ROSETTA_X87_DISABLE_SIP=1`** (see [Debugging & Troubleshooting](#debugging--troubleshooting)). The SIP patch is off by default, so none of the flags below take effect unless it is set.
+The loader patches the runtime's SIP check (`sys_csrctl`) to accept `ROSETTA_*` environment variables that are normally blocked. These are Apple's own debugging/diagnostic flags built into `/usr/libexec/rosetta/runtime` — the loader simply makes them accessible.
 
 | Variable | Description |
 |----------|-------------|
@@ -105,6 +102,22 @@ The loader can patch the runtime's SIP check (`sys_csrctl`) to accept `ROSETTA_*
 | `ROSETTA_ADVERTISE_AVX=1` | Report AVX support in CPUID (translation of AVX instructions is not implied) |
 | `ROSETTA_DEBUGSERVER_PORT=<port>` | Attach Rosetta's internal debug server to the given Mach port |
 | `ROSETTA_MEMORY_ACCESS_INSTRUMENTATION=1` | Enable memory access instrumentation in generated code |
+
+## IDA Pro Tooling
+
+Scripts for loading and analyzing Rosetta JIT traces in IDA Pro 9.x.
+
+### Trace Loader (`scripts/ida_rosetta_trace_loader.py`)
+
+IDA loader plugin that imports hardware trace files (produced by `ROSETTA_HARDWARE_TRACING_PATH`) as IDA databases. Symlink to `<IDA>/loaders/`.
+
+### Trace Parser (`scripts/parse_rosetta_trace.py`)
+
+Standalone Python script that parses and pretty-prints Rosetta hardware trace files. Useful for inspecting traces without IDA.
+
+```bash
+python3 scripts/parse_rosetta_trace.py tracee.bin.<pid>
+```
 
 ## Usage with Wine
 
