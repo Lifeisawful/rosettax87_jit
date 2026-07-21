@@ -540,7 +540,5 @@ std::array<const char*, 0x64> g_runtime_routine_names = {
 // 0x174, 0xA0>
 
 ThreadContextOffsets g_thread_context_offsets = {
-    // runtime_pointers merges the former field_0/field_4 pair (0x118, 0x220)
-    // — same bytes little-endian, so Rosetta sees an identical struct.
-    0x118 | (0x220ULL << 32), 0x180, 0, 0x174, 0xA0,
+    0x118, 0x220, 0x180, 0, 0x174, 0xA0, 0,
 };

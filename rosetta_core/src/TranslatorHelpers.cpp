@@ -512,9 +512,9 @@ auto compute_operand_address(TranslationResult& result, int is_64bit, IROperand*
 
         if (seg_override == 1) {
             // FS segment: load 32-bit selector base from thread context at X18
-            // field_8 is a byte offset; divide by 4 for the imm12 of a 32-bit LDR.
+            // fs_base_offset is a byte offset; divide by 4 for the imm12 of a 32-bit LDR.
             emit_ldr_imm(result.insn_buf, /*size=*/2 /*32-bit*/, seg_reg, GPR::X18,
-                         (int16_t)(result.thread_context_offsets->field_8 >> 2));
+                         (int16_t)(result.thread_context_offsets->fs_base_offset >> 2));
             emit_add_reg(result.insn_buf, addr_size_is_64, seg_reg, seg_reg, inner_reg);
         } else if (seg_override == 2) {
             // GS / TLS segment: call get_tls_base runtime routine.
