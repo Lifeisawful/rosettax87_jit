@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 enum RuntimeRoutine {
     kRuntimeRoutine_branch_slot = 0x0,
     kRuntimeRoutine_indirect_jmp = 0x1,
@@ -99,4 +101,10 @@ enum RuntimeRoutine {
     kRuntimeRoutine_ffree = 0x5F,
     kRuntimeRoutine_load_segment_limit = 0x60,
     kRuntimeRoutine_rdrand = 0x61,
+    kRuntimeRoutine_xrstor = 0x62,
+    kRuntimeRoutine_xsave = 0x63,
+    kRuntimeRoutine_MAX = 0x64,
 };
+
+const char* runtime_routine_to_string(RuntimeRoutine r);
+std::optional<RuntimeRoutine> runtime_routine_from_string(const char* name);

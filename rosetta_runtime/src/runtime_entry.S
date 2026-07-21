@@ -1,0 +1,3619 @@
+// =============================================================================
+// runtime_entry.S — Rosetta runtime_entry segment stubs
+//
+// Reconstructed AArch64 assembly for the runtime_entry segment of the Rosetta
+// runtime binary. Each stub saves guest GPR state into the thread-local context
+// block (pointed to by x18) via a shared prologue, then branches to an external
+// dispatch tail. Special stubs (indirect_jmp/call, MXCSR helpers, timer, cpuid,
+// TLS, cpu number) are inlined without the standard prologue.
+//
+// Stubs are packed contiguously with NO padding between them. Order matters —
+// the runtime locates stubs by fixed offsets from the segment base.
+// =============================================================================
+
+.section runtime_entry,runtime_entry,regular,pure_instructions
+.p2align 14
+
+// -----------------------------------------------------------------------------
+// STUB_PROLOGUE — shared 12-instruction (48-byte) prologue
+//
+// Saves x0-x15 pairs, NZCV flags, x17 (scratch), and x30 (return address)
+// into the context block at x18. Sets the high bit of x18 to signal "in stub".
+// -----------------------------------------------------------------------------
+.macro STUB_PROLOGUE
+    stp  x0,  x1,  [x18, #0x10]
+    stp  x2,  x3,  [x18, #0x20]
+    stp  x4,  x5,  [x18, #0x30]
+    stp  x6,  x7,  [x18, #0x40]
+    stp  x8,  x9,  [x18, #0x50]
+    stp  x10, x11, [x18, #0x60]
+    stp  x12, x13, [x18, #0x70]
+    stp  x14, x15, [x18, #0x80]
+    mrs  x29, nzcv
+    stp  x29, x17, [x18, #0x90]
+    str  x30, [x18, #0x8]
+    orr  x18, x18, #0x8000000000000000
+.endm
+
+// =============================================================================
+// Standard prologue stubs — batch 1
+// =============================================================================
+
+.globl _stub_far_jmp
+_stub_far_jmp:
+    STUB_PROLOGUE
+    b    tail_far_jmp
+
+.globl _stub_far_ret
+_stub_far_ret:
+    STUB_PROLOGUE
+    b    tail_far_ret
+
+.globl _stub_far_call
+_stub_far_call:
+    STUB_PROLOGUE
+    b    tail_far_call
+
+.globl _stub_far_ret_single_step
+_stub_far_ret_single_step:
+    STUB_PROLOGUE
+    b    tail_far_ret_single_step
+
+.globl _stub_mov_segment
+_stub_mov_segment:
+    STUB_PROLOGUE
+    b    tail_mov_segment
+
+.globl _stub_mov_segment_and_reg
+_stub_mov_segment_and_reg:
+    STUB_PROLOGUE
+    b    tail_mov_segment_and_reg
+
+// =============================================================================
+// Special stub: stub_indirect_jmp (100 bytes)
+//
+// Fast-path hash-table lookup for indirect jumps. Falls back to the slow path
+// (full prologue + tail) on a cache miss or empty slot.
+// =============================================================================
+
+.globl _stub_indirect_jmp
+_stub_indirect_jmp:
+    crc32cx w23, wzr, x22
+    and     w23, w23, w20
+Lindirect_jmp_loop:
+    add     x24, x19, x23, lsl #4
+    ldp     x25, x26, [x24]
+    sub     x27, x25, x22
+    cbnz    x27, Lindirect_jmp_miss
+    mov     x22, x26
+    ret
+Lindirect_jmp_miss:
+    cbz     x25, Lindirect_jmp_slow
+    add     w23, w23, #1
+    and     w23, w23, w20
+    b       Lindirect_jmp_loop
+Lindirect_jmp_slow:
+    STUB_PROLOGUE
+    b       tail_indirect_jmp
+
+// =============================================================================
+// Special stub: stub_indirect_call (100 bytes)
+//
+// Same hash-lookup pattern as indirect_jmp, different dispatch tail.
+// =============================================================================
+
+.globl _stub_indirect_call
+_stub_indirect_call:
+    crc32cx w23, wzr, x22
+    and     w23, w23, w20
+Lindirect_call_loop:
+    add     x24, x19, x23, lsl #4
+    ldp     x25, x26, [x24]
+    sub     x27, x25, x22
+    cbnz    x27, Lindirect_call_miss
+    mov     x22, x26
+    ret
+Lindirect_call_miss:
+    cbz     x25, Lindirect_call_slow
+    add     w23, w23, #1
+    and     w23, w23, w20
+    b       Lindirect_call_loop
+Lindirect_call_slow:
+    STUB_PROLOGUE
+    b       tail_indirect_call
+
+// =============================================================================
+// Standard prologue stubs — batch 2
+// =============================================================================
+
+.globl _stub_syscall_handler
+_stub_syscall_handler:
+    STUB_PROLOGUE
+    b    tail_syscall_handler
+
+.globl _stub_toggle_single_step
+_stub_toggle_single_step:
+    STUB_PROLOGUE
+    b    tail_toggle_single_step
+
+.globl _stub_load_segment_limit
+_stub_load_segment_limit:
+    STUB_PROLOGUE
+    b    tail_load_segment_limit
+
+.globl _stub_rdrand
+_stub_rdrand:
+    STUB_PROLOGUE
+    b    tail_rdrand
+
+.globl _stub_xrstor
+_stub_xrstor:
+    STUB_PROLOGUE
+    b    tail_xrstor
+
+.globl _stub_xsave
+_stub_xsave:
+    STUB_PROLOGUE
+    b    tail_xsave
+
+// =============================================================================
+// Special stub: stub_mxcsr_to_fpcr_fpsr (100 bytes, 25 instructions)
+//
+// Converts x86 MXCSR (in w26) to AArch64 FPCR/FPSR fields (w23-w25).
+// Three code paths selected by the mode byte at [x18 + 0x170].
+// =============================================================================
+
+.globl _stub_mxcsr_to_fpcr_fpsr
+_stub_mxcsr_to_fpcr_fpsr:
+    lsl     w28, w26, #0x11
+    rbit    w28, w28
+    ubfiz   w23, w28, #0x16, #2
+    ubfx    w25, w26, #0, #1
+    lsr     w28, w26, #2
+    bfi     w25, w28, #1, #4
+    lsr     w28, w26, #1
+    bfi     w25, w28, #7, #1
+    ldrb    w27, [x18, #0x170]
+    tbnz    w27, #1, Lmxcsr_fpcr_alt2
+    cbz     w27, Lmxcsr_fpcr_alt1
+    lsr     w28, w26, #0xf
+    bfi     w23, w28, #0x18, #1
+    ret
+Lmxcsr_fpcr_alt1:
+    ubfx    w24, w26, #6, #1
+    ubfx    w28, w26, #0xf, #1
+    bfi     w24, w28, #1, #1
+    ret
+Lmxcsr_fpcr_alt2:
+    orr     w23, w23, #2
+    orr     w23, w23, #4
+    ubfx    w28, w26, #6, #1
+    bfxil   w23, w28, #0, #1
+    ubfx    w28, w26, #0xf, #1
+    bfi     w23, w28, #0x18, #1
+    ret
+
+// =============================================================================
+// Special stub: stub_read_mxcsr (104 bytes, 26 instructions)
+//
+// Reads AArch64 FPCR/FPSR and converts back to x86 MXCSR format (in w23).
+// Three code paths selected by the mode byte at [x18 + 0x170].
+// Uses AFPCR_EL0 (Apple-private) in alt1 path.
+// =============================================================================
+
+.globl _stub_read_mxcsr
+_stub_read_mxcsr:
+    mrs     x24, fpcr
+    mrs     x26, fpsr
+    mov     w23, #0x1f80
+    lsl     w28, w24, #8
+    rbit    w28, w28
+    bfi     w23, w28, #0xd, #2
+    bfxil   w23, w26, #0, #1
+    lsr     w28, w26, #1
+    bfi     w23, w28, #2, #4
+    lsr     w28, w26, #7
+    bfi     w23, w28, #1, #1
+    ldrb    w27, [x18, #0x170]
+    tbnz    w27, #1, Lread_mxcsr_alt2
+    cbz     w27, Lread_mxcsr_alt1
+    lsr     w28, w24, #0x18
+    bfi     w23, w28, #0xf, #1
+    ret
+Lread_mxcsr_alt1:
+    .long   0xd53ef2b9              // mrs x25, AFPCR_EL0 (Apple-private)
+    bfi     w23, w25, #6, #1
+    lsr     w28, w25, #1
+    bfi     w23, w28, #0xf, #1
+    ret
+Lread_mxcsr_alt2:
+    bfi     w23, w24, #6, #1
+    ubfx    w28, w24, #0x18, #1
+    bfi     w23, w28, #0xf, #1
+    ret
+
+// =============================================================================
+// Standard prologue stubs — batch 3 (PCMPxSTRx + x87 operations)
+// =============================================================================
+
+.globl _stub_pcmpestri
+_stub_pcmpestri:
+    STUB_PROLOGUE
+    b    tail_pcmpestri
+
+.globl _stub_pcmpestrm
+_stub_pcmpestrm:
+    STUB_PROLOGUE
+    b    tail_pcmpestrm
+
+.globl _stub_pcmpistri
+_stub_pcmpistri:
+    STUB_PROLOGUE
+    b    tail_pcmpistri
+
+.globl _stub_pcmpistrm
+_stub_pcmpistrm:
+    STUB_PROLOGUE
+    b    tail_pcmpistrm
+
+.globl _stub_f2xm1
+_stub_f2xm1:
+    STUB_PROLOGUE
+    b    tail_f2xm1
+
+.globl _stub_fabs
+_stub_fabs:
+    STUB_PROLOGUE
+    b    tail_fabs
+
+.globl _stub_fchs
+_stub_fchs:
+    STUB_PROLOGUE
+    b    tail_fchs
+
+.globl _stub_fcos
+_stub_fcos:
+    STUB_PROLOGUE
+    b    tail_fcos
+
+.globl _stub_fdecstp
+_stub_fdecstp:
+    STUB_PROLOGUE
+    b    tail_fdecstp
+
+.globl _stub_fincstp
+_stub_fincstp:
+    STUB_PROLOGUE
+    b    tail_fincstp
+
+.globl _stub_fpatan
+_stub_fpatan:
+    STUB_PROLOGUE
+    b    tail_fpatan
+
+.globl _stub_fprem
+_stub_fprem:
+    STUB_PROLOGUE
+    b    tail_fprem
+
+.globl _stub_fprem1
+_stub_fprem1:
+    STUB_PROLOGUE
+    b    tail_fprem1
+
+.globl _stub_fptan
+_stub_fptan:
+    STUB_PROLOGUE
+    b    tail_fptan
+
+.globl _stub_frndint
+_stub_frndint:
+    STUB_PROLOGUE
+    b    tail_frndint
+
+.globl _stub_fscale
+_stub_fscale:
+    STUB_PROLOGUE
+    b    tail_fscale
+
+.globl _stub_fsin
+_stub_fsin:
+    STUB_PROLOGUE
+    b    tail_fsin
+
+.globl _stub_fsincos
+_stub_fsincos:
+    STUB_PROLOGUE
+    b    tail_fsincos
+
+.globl _stub_fsqrt
+_stub_fsqrt:
+    STUB_PROLOGUE
+    b    tail_fsqrt
+
+.globl _stub_fxam
+_stub_fxam:
+    STUB_PROLOGUE
+    b    tail_fxam
+
+.globl _stub_fxtract
+_stub_fxtract:
+    STUB_PROLOGUE
+    b    tail_fxtract
+
+.globl _stub_fyl2x
+_stub_fyl2x:
+    STUB_PROLOGUE
+    b    tail_fyl2x
+
+.globl _stub_fyl2xp1
+_stub_fyl2xp1:
+    STUB_PROLOGUE
+    b    tail_fyl2xp1
+
+.globl _stub_fbstp
+_stub_fbstp:
+    STUB_PROLOGUE
+    b    tail_fbstp
+
+.globl _stub_ffree
+_stub_ffree:
+    STUB_PROLOGUE
+    b    tail_ffree
+
+.globl _stub_fild
+_stub_fild:
+    STUB_PROLOGUE
+    b    tail_fild
+
+.globl _stub_fld_STi
+_stub_fld_STi:
+    STUB_PROLOGUE
+    b    tail_fld_STi
+
+.globl _stub_fld_constant
+_stub_fld_constant:
+    STUB_PROLOGUE
+    b    tail_fld_constant
+
+.globl _stub_fld_fp32
+_stub_fld_fp32:
+    STUB_PROLOGUE
+    b    tail_fld_fp32
+
+.globl _stub_fld_fp64
+_stub_fld_fp64:
+    STUB_PROLOGUE
+    b    tail_fld_fp64
+
+.globl _stub_fxch
+_stub_fxch:
+    STUB_PROLOGUE
+    b    tail_fxch
+
+.globl _stub_fadd_f32
+_stub_fadd_f32:
+    STUB_PROLOGUE
+    b    tail_fadd_f32
+
+.globl _stub_fadd_f64
+_stub_fadd_f64:
+    STUB_PROLOGUE
+    b    tail_fadd_f64
+
+.globl _stub_fdiv_f32
+_stub_fdiv_f32:
+    STUB_PROLOGUE
+    b    tail_fdiv_f32
+
+.globl _stub_fdiv_f64
+_stub_fdiv_f64:
+    STUB_PROLOGUE
+    b    tail_fdiv_f64
+
+.globl _stub_fdivr_f32
+_stub_fdivr_f32:
+    STUB_PROLOGUE
+    b    tail_fdivr_f32
+
+.globl _stub_fdivr_f64
+_stub_fdivr_f64:
+    STUB_PROLOGUE
+    b    tail_fdivr_f64
+
+.globl _stub_fiadd
+_stub_fiadd:
+    STUB_PROLOGUE
+    b    tail_fiadd
+
+.globl _stub_fidiv
+_stub_fidiv:
+    STUB_PROLOGUE
+    b    tail_fidiv
+
+.globl _stub_fidivr
+_stub_fidivr:
+    STUB_PROLOGUE
+    b    tail_fidivr
+
+.globl _stub_fimul
+_stub_fimul:
+    STUB_PROLOGUE
+    b    tail_fimul
+
+.globl _stub_fisub
+_stub_fisub:
+    STUB_PROLOGUE
+    b    tail_fisub
+
+.globl _stub_fisubr
+_stub_fisubr:
+    STUB_PROLOGUE
+    b    tail_fisubr
+
+.globl _stub_fmul_f32
+_stub_fmul_f32:
+    STUB_PROLOGUE
+    b    tail_fmul_f32
+
+.globl _stub_fmul_f64
+_stub_fmul_f64:
+    STUB_PROLOGUE
+    b    tail_fmul_f64
+
+.globl _stub_fsub_f32
+_stub_fsub_f32:
+    STUB_PROLOGUE
+    b    tail_fsub_f32
+
+.globl _stub_fsub_f64
+_stub_fsub_f64:
+    STUB_PROLOGUE
+    b    tail_fsub_f64
+
+.globl _stub_fsubr_f32
+_stub_fsubr_f32:
+    STUB_PROLOGUE
+    b    tail_fsubr_f32
+
+.globl _stub_fsubr_f64
+_stub_fsubr_f64:
+    STUB_PROLOGUE
+    b    tail_fsubr_f64
+
+.globl _stub_fist_i16
+_stub_fist_i16:
+    STUB_PROLOGUE
+    b    tail_fist_i16
+
+.globl _stub_fist_i32
+_stub_fist_i32:
+    STUB_PROLOGUE
+    b    tail_fist_i32
+
+.globl _stub_fist_i64
+_stub_fist_i64:
+    STUB_PROLOGUE
+    b    tail_fist_i64
+
+.globl _stub_fistt_i16
+_stub_fistt_i16:
+    STUB_PROLOGUE
+    b    tail_fistt_i16
+
+.globl _stub_fistt_i32
+_stub_fistt_i32:
+    STUB_PROLOGUE
+    b    tail_fistt_i32
+
+.globl _stub_fistt_i64
+_stub_fistt_i64:
+    STUB_PROLOGUE
+    b    tail_fistt_i64
+
+.globl _stub_fst_fp32
+_stub_fst_fp32:
+    STUB_PROLOGUE
+    b    tail_fst_fp32
+
+.globl _stub_fst_fp64
+_stub_fst_fp64:
+    STUB_PROLOGUE
+    b    tail_fst_fp64
+
+.globl _stub_fst_fp80
+_stub_fst_fp80:
+    STUB_PROLOGUE
+    b    tail_fst_fp80
+
+.globl _stub_fbld
+_stub_fbld:
+    STUB_PROLOGUE
+    b    tail_fbld
+
+.globl _stub_fld_fp80
+_stub_fld_fp80:
+    STUB_PROLOGUE
+    b    tail_fld_fp80
+
+.globl _stub_fcmov
+_stub_fcmov:
+    STUB_PROLOGUE
+    b    tail_fcmov
+
+.globl _stub_fcom_f32
+_stub_fcom_f32:
+    STUB_PROLOGUE
+    b    tail_fcom_f32
+
+.globl _stub_fcom_f64
+_stub_fcom_f64:
+    STUB_PROLOGUE
+    b    tail_fcom_f64
+
+.globl _stub_fcom_ST
+_stub_fcom_ST:
+    STUB_PROLOGUE
+    b    tail_fcom_ST
+
+.globl _stub_fcomi
+_stub_fcomi:
+    STUB_PROLOGUE
+    b    tail_fcomi
+
+.globl _stub_ficom
+_stub_ficom:
+    STUB_PROLOGUE
+    b    tail_ficom
+
+.globl _stub_fst_STi
+_stub_fst_STi:
+    STUB_PROLOGUE
+    b    tail_fst_STi
+
+.globl _stub_fucom
+_stub_fucom:
+    STUB_PROLOGUE
+    b    tail_fucom
+
+.globl _stub_fucomi
+_stub_fucomi:
+    STUB_PROLOGUE
+    b    tail_fucomi
+
+.globl _stub_fadd_ST
+_stub_fadd_ST:
+    STUB_PROLOGUE
+    b    tail_fadd_ST
+
+.globl _stub_fdiv_ST
+_stub_fdiv_ST:
+    STUB_PROLOGUE
+    b    tail_fdiv_ST
+
+.globl _stub_fdivr_ST
+_stub_fdivr_ST:
+    STUB_PROLOGUE
+    b    tail_fdivr_ST
+
+.globl _stub_fmul_ST
+_stub_fmul_ST:
+    STUB_PROLOGUE
+    b    tail_fmul_ST
+
+.globl _stub_fsub_ST
+_stub_fsub_ST:
+    STUB_PROLOGUE
+    b    tail_fsub_ST
+
+.globl _stub_fsubr_ST
+_stub_fsubr_ST:
+    STUB_PROLOGUE
+    b    tail_fsubr_ST
+
+// =============================================================================
+// Special stub: stub_read_timer_nanoseconds (64 bytes, 16 instructions)
+//
+// Reads the hardware timer counter and converts ticks to nanoseconds.
+// Three paths: ACNTVCT_EL0 (Apple-private), CNTVCTSS_EL0, or ISB+CNTVCT_EL0.
+// Conversion: ns = ticks * 125 / 3  (via multiply-by-reciprocal).
+// =============================================================================
+
+.globl _stub_read_timer_nanoseconds
+_stub_read_timer_nanoseconds:
+    ldrb    w22, [x18, #0x171]
+    tbnz    w22, #3, Ltimer_acntvct
+    tbnz    w22, #2, Ltimer_cntvctss
+    isb
+    mrs     x22, cntvct_el0
+    b       Ltimer_compute
+Ltimer_acntvct:
+    .long   0xd53cfad6              // mrs x22, ACNTVCT_EL0 (Apple-private)
+    b       Ltimer_compute
+Ltimer_cntvctss:
+    .long   0xd53be0d6              // mrs x22, CNTVCTSS_EL0 (ARMv8.6)
+Ltimer_compute:
+    mov     x23, #0x7d
+    mul     x22, x22, x23
+    mov     x23, #0xAAAAAAAAAAAAAAAA
+    movk    x23, #0xAAAB
+    umulh   x22, x22, x23
+    lsr     x22, x22, #1
+    ret
+
+// =============================================================================
+// Standard prologue stub — final
+// =============================================================================
+
+.globl _stub_indirect_jmp_dyld_stub
+_stub_indirect_jmp_dyld_stub:
+    STUB_PROLOGUE
+    b    tail_indirect_jmp_dyld_stub
+
+// =============================================================================
+// Special stub: stub_get_cpu_number (12 bytes, 3 instructions)
+//
+// Returns the current CPU number from TPIDR_EL0 (low 12 bits).
+// =============================================================================
+
+.globl _stub_get_cpu_number
+_stub_get_cpu_number:
+    mrs     x22, tpidr_el0
+    and     x22, x22, #0xFFF
+    ret
+
+// =============================================================================
+// Special stub: stub_get_tls_base (12 bytes, 3 instructions)
+//
+// Returns the TLS base pointer from TPIDRRO_EL0, masked to strip low bits.
+// =============================================================================
+
+.globl _stub_get_tls_base
+_stub_get_tls_base:
+    mrs     x29, tpidrro_el0
+    and     x29, x29, #0xFFFFFFFFFFF8
+    ret
+
+// =============================================================================
+// Special stub: stub_cpuid (12 bytes, 3 instructions)
+//
+// Dispatches to a CPUID handler via function pointer at [x18 + 0x158].
+// The leaf selector is read from [x18 + 0x222].
+// =============================================================================
+
+.globl _stub_cpuid
+_stub_cpuid:
+    ldr     x29, [x18, #0x158]
+    ldrb    w22, [x18, #0x222]
+    br      x29
+
+
+// =============================================================================
+// Dispatch tails and runtime exit segments
+//
+// Reconstructed from Rosetta runtime binary via IDA.
+// =============================================================================
+
+
+// =============================================================================
+// runtime_savedreg segment
+// =============================================================================
+.section runtime_savedreg,runtime_savedreg,regular,pure_instructions
+.p2align 2
+
+// Tail pattern macros
+// TAIL_F:  no args, no result, vtable call
+// TAIL_E:  1 arg (x22), result in x22
+// TAIL_EN: 1 arg (x22), no result
+// TAIL_G:  1 arg (x22), 2 results (x22, x23)
+// TAIL_H:  2 args (x22, x23), no result
+// TAIL_I:  2 args (x22, x23), result in x22
+// TAIL_J:  3 args (x22, x23, x24), result in x22
+
+// --- Dispatch shape A: far_jmp (vtable[0x20], 2 args, setup cache, -> exitljmp)
+tail_far_jmp:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x20]
+    add  x0, x18, #0x10
+    blr  x29
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    mov  x22, x0
+    mov  x23, x1
+    mov  x24, x2
+    mov  x25, x3
+    mov  x26, x4
+    mov  x28, x1
+    b    runtime_exitljmp
+
+// --- Dispatch shape B: far_ret (vtable[0x28], 5 args, setup cache, -> exit_br)
+tail_far_ret:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    mov  x5, x26
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x28]
+    add  x0, x18, #0x10
+    blr  x29
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    mov  x22, x0
+    mov  x23, x1
+    mov  x28, x1
+    b    runtime_exit_br
+
+// --- far_call: same as far_jmp but -> exitcall
+tail_far_call:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x20]
+    add  x0, x18, #0x10
+    blr  x29
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    mov  x22, x0
+    mov  x23, x1
+    mov  x24, x2
+    mov  x25, x3
+    mov  x26, x4
+    mov  x28, x1
+    b    runtime_exitcall
+
+// --- far_ret_single_step: shape B variant -> exit_ret
+tail_far_ret_single_step:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    mov  x5, x26
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x28]
+    add  x0, x18, #0x10
+    blr  x29
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    mov  x22, x1
+    mov  x28, x1
+    b    runtime_exit_ret
+
+// --- mov_segment: vtable[0x160], 2 args, no result
+tail_mov_segment:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x160]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+// --- mov_segment_and_reg: vtable[0x168], 4 args, no result
+tail_mov_segment_and_reg:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x168]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+// --- indirect_jmp resolve: vtable[0x18], -> exit_ret
+tail_indirect_jmp:
+    mov  x28, x22
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x18]
+    mov  x0, x18
+    blr  x29
+    mov  x22, x0
+    b    runtime_exit_ret
+
+// --- indirect_call resolve: vtable[0x18], -> exitcall
+tail_indirect_call:
+    mov  x28, x22
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x18]
+    mov  x0, x18
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitcall
+
+// --- branch slot miss: vtable[0x30], -> exit_br
+tail_branch_miss:
+    mov  x28, x22
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x30]
+    mov  x0, x18
+    blr  x29
+    mov  x22, x0
+    b    runtime_exit_br
+
+// --- return stack miss: vtable[0x18], -> exit_br
+tail_return_miss:
+    mov  x28, x22
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x18]
+    mov  x0, x18
+    blr  x29
+    mov  x22, x0
+    b    runtime_exit_br
+
+tail_toggle_single_step:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x108]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_ret
+
+tail_load_segment_limit:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x158]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    eor  x23, x1, #1
+    b    runtime_exitinst
+
+tail_rdrand:
+    sub  sp, sp, #0x10
+    mov  x0, sp
+    mov  x1, #8
+    mov  x16, #500
+    svc  #0x80
+    ldur x23, [sp]
+    cset x22, cs
+    csel x23, xzr, x23, cs
+    add  sp, sp, #0x10
+    b    runtime_exitinst
+
+// --- xrstor/xsave tails: Shape H (2 args, X0=raw ThreadContext, not X87State)
+tail_xrstor:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3C8]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exitinst
+
+tail_xsave:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3D0]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exitinst
+
+tail_pcmpestri:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    mov  x5, x26
+    mov  x6, x27
+    mov  x7, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x170]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_pcmpestrm:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    mov  x5, x26
+    mov  x6, x27
+    mov  x7, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x178]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_pcmpistri:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    mov  x5, x26
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x180]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_pcmpistrm:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    mov  x4, x25
+    mov  x5, x26
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x188]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+// --- x87 operation tails: pattern F (no args, no result)
+
+tail_f2xm1:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x190]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fabs:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x198]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fchs:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1C8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fcos:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x200]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fdecstp:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x208]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fincstp:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x270]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fpatan:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2F8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fprem:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x300]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fprem1:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x308]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fptan:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x310]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_frndint:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x318]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fscale:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x320]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fsin:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x328]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fsincos:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x330]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fsqrt:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x338]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fxam:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3A0]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fxtract:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3B0]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fyl2x:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3B8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fyl2xp1:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3C0]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+// --- fbstp: no args, 2 results (x22, x23)
+tail_fbstp:
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1C0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+// --- x87 tails: pattern EN (1 arg, no result)
+
+tail_ffree:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x240]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fild:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x260]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fld_STi:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2D8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fld_constant:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2B8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fld_fp32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2C0]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fld_fp64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2C8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fxch:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x3A8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+// --- x87 tails: pattern E (1 arg, result in x22)
+
+tail_fadd_f32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1A0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fadd_f64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1A8]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fdiv_f32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x228]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fdiv_f64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x230]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fdivr_f32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x210]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fdivr_f64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x218]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fiadd:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x248]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fidiv:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x250]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fidivr:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x258]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fimul:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x268]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fisub:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2A8]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fisubr:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2B0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fmul_f32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2E0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fmul_f64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2E8]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fsub_f32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x378]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fsub_f64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x380]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fsubr_f32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x360]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fsubr_f64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x368]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+// --- x87 tails: pattern G (1 arg, 2 results)
+
+tail_fist_i16:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x290]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fist_i32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x298]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fist_i64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2A0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fistt_i16:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x278]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fistt_i32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x280]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fistt_i64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x288]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fst_fp32:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x340]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fst_fp64:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x348]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+tail_fst_fp80:
+    mov  x1, x22
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x350]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    mov  x23, x1
+    b    runtime_exitinst
+
+// --- x87 tails: pattern H (2 args, no result)
+
+tail_fbld:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1B8]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fld_fp80:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2D0]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+// --- x87 tails: pattern I (2 args, result in x22)
+
+tail_fcmov:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1D0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fcom_f32:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1D8]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fcom_f64:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1E0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fcom_ST:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1E8]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fcomi:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1F0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_ficom:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1F8]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fst_STi:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x358]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exitinst
+
+tail_fucom:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x390]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fucomi:
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x398]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+// --- x87 tails: pattern J (3 args, result in x22)
+
+tail_fadd_ST:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x1B0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fdiv_ST:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x238]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fdivr_ST:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x220]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fmul_ST:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x2F0]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fsub_ST:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x388]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_fsubr_ST:
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x370]
+    add  x0, x18, #0x10
+    blr  x29
+    mov  x22, x0
+    b    runtime_exitinst
+
+tail_indirect_jmp_dyld_stub:
+    mov  x28, x22
+    mov  x1, x22
+    mov  x2, x23
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x38]
+    mov  x0, x18
+    blr  x29
+    mov  x22, x0
+    b    runtime_exit_ret
+
+// --- Syscall dispatch targets from jump tables
+
+// sysent case 12: vtable[0x70]
+sysent_case12:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x70]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys_nzcv
+
+// sysent case 14: vtable[0x78] with extra arg from [x22+8]
+sysent_case14:
+    mov  x22, x4
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x7, [x22, #8]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x78]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys_nzcv
+
+// bsd/mach class 7 dispatch targets (jpt_22D38)
+
+bsd7_case1:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    mov  x1, x30
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xD8]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case2:
+    mov  x22, x4
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x7, [x22, #8]
+    mov  x1, x30
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xE0]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case3:
+    mov  x1, x6
+    mov  x2, x2
+    mov  x3, x10
+    mov  x4, x8
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xE8]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case4:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    mov  x1, x30
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xF0]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case5:
+    mov  x1, x6
+    mov  x2, x2
+    mov  x3, x10
+    mov  x4, x8
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xF8]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case6:
+    mov  x1, x6
+    mov  x2, x2
+    mov  x3, x10
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x128]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case7:
+    mov  x1, x6
+    mov  x2, x2
+    mov  x3, x10
+    mov  x4, x8
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x130]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case8:
+    mov  x1, x6
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x138]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case9:
+    mov  x1, x6
+    mov  x2, x2
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x140]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+bsd7_case0:
+    mov  x1, x6
+    mov  x2, x2
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x100]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+// Mach trap dispatch targets (jpt_22CE0 non-default cases)
+
+mach_case46:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xA0]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case53:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xA8]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case59:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    mov  w5, w16
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xB0]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case66:
+    mov  w16, #2
+mach_case2:
+    mov  x23, x0
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x40]
+    mov  x0, x18
+    blr  x29
+    lsr  x2, x0, #32
+    mov  w0, w0
+    b    runtime_exit_sys
+
+mach_case73:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x68]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case74:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x60]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case75:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x48]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case197:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x50]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case244:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x58]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case294:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x110]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case360:
+    mov  x22, x4
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x7, [x22, #8]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x80]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case366:
+    mov  x22, x4
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x7, [x22, #8]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x88]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case438:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x118]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+mach_case536:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x120]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys
+
+// mdep dispatch targets (jpt_22DF0 cases 5,6)
+mdep_case5:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x148]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exit_sys
+
+mdep_case6:
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x150]
+    add  x0, x18, #0x10
+    blr  x29
+    b    runtime_exit_sys
+
+// =============================================================================
+// runtime_br_miss segment
+// =============================================================================
+.section runtime_br_miss,runtime_br_miss,regular,pure_instructions
+.p2align 2
+
+.globl _stub_branch_slot
+_stub_branch_slot:
+    STUB_PROLOGUE
+    b    tail_branch_miss
+
+.globl _stub_return_stack_miss
+_stub_return_stack_miss:
+    ldr  x21, [x18, #0x1A8]
+    crc32cx w23, wzr, x22
+    and  w23, w23, w20
+Lreturn_miss_loop:
+    add  x24, x19, x23, lsl #4
+    ldp  x25, x26, [x24]
+    sub  x27, x25, x22
+    cbnz x27, Lreturn_miss_check
+    br   x26
+Lreturn_miss_check:
+    cbz  x25, Lreturn_miss_slow
+    add  w23, w23, #1
+    and  w23, w23, w20
+    b    Lreturn_miss_loop
+Lreturn_miss_slow:
+    STUB_PROLOGUE
+    b    tail_return_miss
+
+// =============================================================================
+// runtime_exit_ret segment
+// =============================================================================
+.section runtime_exit_ret,runtime_exit_ret,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exit_ret
+_runtime_exit_ret:
+runtime_exit_ret:
+    ldr  w27, [x18, #0x1C8]
+Lexit_ret_check:
+    cbz  w27, Lexit_ret_restore
+    tbz  w27, #9, Lexit_ret_run
+    ldr  x21, [x18, #0x1A8]
+Lexit_ret_run:
+    adr  x29, Lexit_ret_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    mov  x1, x30
+    mov  x2, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29]
+    mov  x0, x18
+    blr  x29
+Lexit_ret_post:
+    strb wzr, [x18, #0x208]
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  w27, [x18, #0x1C8]
+    orr  w27, w27, w1
+    tbz  w27, #1, Lexit_ret_restore
+    mov  x0, #3
+    and  x1, x18, #0x7FFFFFFFFFFFFFFF
+    add  x1, x1, #0x1CC
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lexit_ret_restore
+    brk  #6
+Lexit_ret_restore:
+    ldp  x29, x17, [x18, #0x90]
+    msr  nzcv, x29
+    ldp  x14, x15, [x18, #0x80]
+    ldp  x12, x13, [x18, #0x70]
+    ldp  x10, x11, [x18, #0x60]
+    ldp  x8,  x9,  [x18, #0x50]
+    ldp  x6,  x7,  [x18, #0x40]
+    ldp  x4,  x5,  [x18, #0x30]
+    ldp  x2,  x3,  [x18, #0x20]
+    ldp  x0,  x1,  [x18, #0x10]
+    ldr  x30, [x18, #0x8]
+    and  x18, x18, #0x7FFFFFFFFFFFFFFF
+    ret
+
+// =============================================================================
+// runtime_exitcall segment
+// =============================================================================
+.section runtime_exitcall,runtime_exitcall,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exitcall
+_runtime_exitcall:
+runtime_exitcall:
+    ldr  w27, [x18, #0x1C8]
+Lexitcall_check:
+    cbz  w27, Lexitcall_restore
+    tbz  w27, #9, Lexitcall_run
+    ldr  x21, [x18, #0x1A8]
+Lexitcall_run:
+    adr  x29, Lexitcall_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    mov  x1, x30
+    mov  x2, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x8]
+    mov  x0, x18
+    blr  x29
+Lexitcall_post:
+    strb wzr, [x18, #0x208]
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  w27, [x18, #0x1C8]
+    orr  w27, w27, w1
+    tbz  w27, #1, Lexitcall_restore
+    mov  x0, #3
+    and  x1, x18, #0x7FFFFFFFFFFFFFFF
+    add  x1, x1, #0x1CC
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lexitcall_restore
+    brk  #6
+Lexitcall_restore:
+    ldp  x29, x17, [x18, #0x90]
+    msr  nzcv, x29
+    ldp  x14, x15, [x18, #0x80]
+    ldp  x12, x13, [x18, #0x70]
+    ldp  x10, x11, [x18, #0x60]
+    ldp  x8,  x9,  [x18, #0x50]
+    ldp  x6,  x7,  [x18, #0x40]
+    ldp  x4,  x5,  [x18, #0x30]
+    ldp  x2,  x3,  [x18, #0x20]
+    ldp  x0,  x1,  [x18, #0x10]
+    ldr  x30, [x18, #0x8]
+    and  x18, x18, #0x7FFFFFFFFFFFFFFF
+    ret
+
+// =============================================================================
+// runtime_exitljmp segment
+// =============================================================================
+.section runtime_exitljmp,runtime_exitljmp,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exitljmp
+_runtime_exitljmp:
+runtime_exitljmp:
+    ldr  w27, [x18, #0x1C8]
+Lexitljmp_check:
+    cbz  w27, Lexitljmp_restore
+    tbz  w27, #9, Lexitljmp_run
+    ldr  x21, [x18, #0x1A8]
+Lexitljmp_run:
+    adr  x29, Lexitljmp_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    mov  x1, x30
+    mov  x2, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29]
+    mov  x0, x18
+    blr  x29
+Lexitljmp_post:
+    strb wzr, [x18, #0x208]
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  w27, [x18, #0x1C8]
+    orr  w27, w27, w1
+    tbz  w27, #1, Lexitljmp_restore
+    mov  x0, #3
+    and  x1, x18, #0x7FFFFFFFFFFFFFFF
+    add  x1, x1, #0x1CC
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lexitljmp_restore
+    brk  #6
+Lexitljmp_restore:
+    ldp  x29, x17, [x18, #0x90]
+    msr  nzcv, x29
+    ldp  x14, x15, [x18, #0x80]
+    ldp  x12, x13, [x18, #0x70]
+    ldp  x10, x11, [x18, #0x60]
+    ldp  x8,  x9,  [x18, #0x50]
+    ldp  x6,  x7,  [x18, #0x40]
+    ldp  x4,  x5,  [x18, #0x30]
+    ldp  x2,  x3,  [x18, #0x20]
+    ldp  x0,  x1,  [x18, #0x10]
+    ldr  x30, [x18, #0x8]
+    and  x18, x18, #0x7FFFFFFFFFFFFFFF
+    ret
+
+// =============================================================================
+// runtime_exit_br segment
+// =============================================================================
+.section runtime_exit_br,runtime_exit_br,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exit_br
+_runtime_exit_br:
+runtime_exit_br:
+    ldr  w27, [x18, #0x1C8]
+Lexit_br_check:
+    cbz  w27, Lexit_br_restore
+    tbz  w27, #9, Lexit_br_run
+    ldr  x21, [x18, #0x1A8]
+Lexit_br_run:
+    adr  x29, Lexit_br_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    mov  x1, x22
+    mov  x2, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29]
+    mov  x0, x18
+    blr  x29
+Lexit_br_post:
+    strb wzr, [x18, #0x208]
+    mov  x22, x0
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  w27, [x18, #0x1C8]
+    orr  w27, w27, w1
+    tbz  w27, #1, Lexit_br_restore
+    mov  x0, #3
+    and  x1, x18, #0x7FFFFFFFFFFFFFFF
+    add  x1, x1, #0x1CC
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lexit_br_restore
+    brk  #6
+Lexit_br_restore:
+    ldp  x29, x17, [x18, #0x90]
+    msr  nzcv, x29
+    ldp  x14, x15, [x18, #0x80]
+    ldp  x12, x13, [x18, #0x70]
+    ldp  x10, x11, [x18, #0x60]
+    ldp  x8,  x9,  [x18, #0x50]
+    ldp  x6,  x7,  [x18, #0x40]
+    ldp  x4,  x5,  [x18, #0x30]
+    ldp  x2,  x3,  [x18, #0x20]
+    ldp  x0,  x1,  [x18, #0x10]
+    ldr  x30, [x18, #0x8]
+    and  x18, x18, #0x7FFFFFFFFFFFFFFF
+    br   x22
+
+// =============================================================================
+// runtime_exit_sys segment
+// =============================================================================
+.section runtime_exit_sys,runtime_exit_sys,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exit_sys
+_runtime_exit_sys:
+runtime_exit_sys:
+    ubfiz w22, w1, #29, #1
+    msr  nzcv, x22
+runtime_exit_sys_nzcv:
+    ccmn wzr, #0, #2, cs
+    ldr  x27, [x18, #0x1C0]
+    ldr  x27, [x27]
+    str  x27, [x18, #0x1B8]
+    ldr  w27, [x18, #0x1C8]
+Lexit_sys_check:
+    cbz  w27, Lexit_sys_restore
+    tbz  w27, #9, Lexit_sys_save
+    ldr  x21, [x18, #0x1A8]
+Lexit_sys_save:
+    str  x0, [x18, #0x10]
+    str  x2, [x18, #0x20]
+    mrs  x29, nzcv
+    str  x29, [x18, #0x90]
+Lexit_sys_run:
+    adr  x29, Lexit_sys_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    mov  x1, x30
+    mov  x2, x28
+    ldr  x29, [x18]
+    ldr  x29, [x29]
+    mov  x0, x18
+    blr  x29
+Lexit_sys_post:
+    strb wzr, [x18, #0x208]
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  w27, [x18, #0x1C8]
+    orr  w27, w27, w1
+    tbz  w27, #1, Lexit_sys_nzcv_restore
+    mov  x0, #3
+    and  x1, x18, #0x7FFFFFFFFFFFFFFF
+    add  x1, x1, #0x1CC
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lexit_sys_nzcv_restore
+    brk  #6
+Lexit_sys_nzcv_restore:
+    ldr  x29, [x18, #0x90]
+    msr  nzcv, x29
+    ldr  x2, [x18, #0x20]
+    ldr  x0, [x18, #0x10]
+Lexit_sys_restore:
+    ldp  xzr, x17, [x18, #0x90]
+    ldp  x14, x15, [x18, #0x80]
+    ldp  x12, x13, [x18, #0x70]
+    ldp  x10, x11, [x18, #0x60]
+    ldp  x8,  x9,  [x18, #0x50]
+    ldp  x6,  x7,  [x18, #0x40]
+    ldp  x4,  x5,  [x18, #0x30]
+    ldr  x3, [x18, #0x28]
+    ldr  x1, [x18, #0x18]
+    ldr  x30, [x18, #0x8]
+    and  x18, x18, #0x7FFFFFFFFFFFFFFF
+    ret
+
+// =============================================================================
+// runtime_exitinst segment
+// =============================================================================
+.section runtime_exitinst,runtime_exitinst,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exitinst
+_runtime_exitinst:
+runtime_exitinst:
+    ldrb w27, [x18, #0x1C8]
+Lexitinst_check:
+    cbz  w27, Lexitinst_restore
+Lexitinst_run:
+    adr  x29, Lexitinst_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x10]
+    mov  x0, x18
+    blr  x29
+Lexitinst_post:
+    strb wzr, [x18, #0x208]
+    ldrb w27, [x18, #0x1C8]
+    orr  w27, w27, w0
+    tbz  w27, #1, Lexitinst_restore
+    mov  x0, #3
+    and  x1, x18, #0x7FFFFFFFFFFFFFFF
+    add  x1, x1, #0x1CC
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lexitinst_restore
+    brk  #6
+Lexitinst_restore:
+    ldp  x29, x17, [x18, #0x90]
+    msr  nzcv, x29
+    ldp  x14, x15, [x18, #0x80]
+    ldp  x12, x13, [x18, #0x70]
+    ldp  x10, x11, [x18, #0x60]
+    ldp  x8,  x9,  [x18, #0x50]
+    ldp  x6,  x7,  [x18, #0x40]
+    ldp  x4,  x5,  [x18, #0x30]
+    ldp  x2,  x3,  [x18, #0x20]
+    ldp  x0,  x1,  [x18, #0x10]
+    ldr  x30, [x18, #0x8]
+    and  x18, x18, #0x7FFFFFFFFFFFFFFF
+    ret
+
+// =============================================================================
+// runtime_exitsigr segment
+// =============================================================================
+.section runtime_exitsigr,runtime_exitsigr,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_exitsigr
+_runtime_exitsigr:
+runtime_exitsigr:
+    ldrb w27, [x18, #0x1C8]
+Lexitsigr_check:
+    cbz  w27, Lexitsigr_do_sigreturn
+Lexitsigr_run:
+    adr  x29, Lexitsigr_run
+    str  x29, [x18, #0x1D0]
+    mov  w29, #1
+    strb w29, [x18, #0x208]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x10]
+    mov  x0, x18
+    blr  x29
+Lexitsigr_post:
+    strb wzr, [x18, #0x208]
+Lexitsigr_do_sigreturn:
+    mov  x0, x22
+    mov  x1, x23
+    mov  x2, x24
+    mov  x16, #0xB8
+    svc  #0x80
+    brk  #6
+
+// =============================================================================
+// runtime_savdnzcv segment
+// =============================================================================
+.section runtime_savdnzcv,runtime_savdnzcv,regular,pure_instructions
+.p2align 2
+
+.globl _stub_wide_udiv_64
+_stub_wide_udiv_64:
+    ldr  x29, [x18, #0x160]
+    br   x29
+
+.globl _stub_wide_sdiv_64
+_stub_wide_sdiv_64:
+    ldr  x29, [x18, #0x168]
+    br   x29
+
+// =============================================================================
+// runtime_sigtramp segment
+// =============================================================================
+.section runtime_sigtramp,runtime_sigtramp,regular,pure_instructions
+.p2align 2
+
+.globl _sa_tramp_handler
+_sa_tramp_handler:
+    sub  sp, sp, #0x10
+    mov  x6, sp
+    bl   _sa_tramp
+    ldr  x21, [sp]
+    mov  x22, x0
+    mov  x28, x1
+    and  sp, x18, #0x7FFFFFFFFFFFFFFF
+    b    runtime_exit_br
+
+// =============================================================================
+// runtime_thread segment
+// =============================================================================
+.section runtime_thread,runtime_thread,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_thread
+_runtime_thread:
+runtime_thread:
+    mov  x22, x17
+    sub  sp, sp, #0x80
+    stp  x0,  x1,  [sp]
+    stp  x2,  x3,  [sp, #0x10]
+    stp  x4,  x5,  [sp, #0x20]
+    stp  x6,  x7,  [sp, #0x30]
+    stp  x8,  x9,  [sp, #0x40]
+    stp  x10, x11, [sp, #0x50]
+    stp  x12, x13, [sp, #0x60]
+    stp  x14, x15, [sp, #0x70]
+    mvn  x0, xzr
+    str  x0, [sp, #-0x10]!
+    mov  x0, #3
+    mov  x1, sp
+    mov  x2, sp
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lthread_ok
+    brk  #6
+Lthread_ok:
+    mov  x18, #3
+    mov  x0, x22
+    ldr  x1, [sp]
+    bl   _runtime_thread_init
+    add  x30, x0, #4
+    add  sp, sp, #0x10
+    ldp  x14, x15, [sp, #0x70]
+    ldp  x12, x13, [sp, #0x60]
+    ldp  x10, x11, [sp, #0x50]
+    ldp  x8,  x9,  [sp, #0x40]
+    ldp  x6,  x7,  [sp, #0x30]
+    ldp  x4,  x5,  [sp, #0x20]
+    ldp  x2,  x3,  [sp, #0x10]
+    ldp  x0,  x1,  [sp]
+    mov  sp, x18
+    msr  fpcr, xzr
+    ldrb w17, [x18, #0x170]
+    tbz  w17, #1, Lthread_fpcr_done
+    mov  w17, #6
+    msr  fpcr, x17
+Lthread_fpcr_done:
+    mov  x17, #0
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  x21, [x18, #0x1A8]
+    stp  x0,  x1,  [x18, #0x10]
+    stp  x2,  x3,  [x18, #0x20]
+    stp  x4,  x5,  [x18, #0x30]
+    stp  x6,  x7,  [x18, #0x40]
+    stp  x8,  x9,  [x18, #0x50]
+    stp  x10, x11, [x18, #0x60]
+    stp  x12, x13, [x18, #0x70]
+    stp  x14, x15, [x18, #0x80]
+    str  x30, [x18, #0x8]
+    orr  x18, x18, #0x8000000000000000
+    sub  x22, x30, #4
+    b    runtime_exit_br
+
+// =============================================================================
+// runtime_pthread segment
+// =============================================================================
+.section runtime_pthread,runtime_pthread,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_pthread
+_runtime_pthread:
+runtime_pthread:
+    mov  x22, x0
+    mov  x23, x1
+    mov  x24, x2
+    mov  x25, x3
+    mov  x26, x4
+    mov  x27, x5
+    mvn  x0, xzr
+    str  x0, [sp, #-0x10]!
+    mov  x0, #3
+    mov  x1, sp
+    mov  x2, sp
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lpthread_ok
+    brk  #6
+Lpthread_ok:
+    adrp x28, _pthread_entry_fptr@PAGE
+    ldr  x28, [x28, _pthread_entry_fptr@PAGEOFF]
+    mov  x18, #3
+    mov  x0, x23
+    mov  x1, x28
+    ldr  x2, [sp]
+    mov  x3, #1
+    bl   _runtime_pthread_init
+    add  x30, x0, #4
+    add  sp, sp, #0x10
+    mov  x4, sp
+    mov  sp, x18
+    msr  fpcr, xzr
+    ldrb w17, [x18, #0x170]
+    tbz  w17, #1, Lpthread_fpcr_done
+    mov  w17, #6
+    msr  fpcr, x17
+Lpthread_fpcr_done:
+    mov  x17, #0
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  x21, [x18, #0x1A8]
+    stp  x23, x22, [x18, #0x40]
+    str  x24, [x18, #0x20]
+    str  x25, [x18, #0x18]
+    stp  x26, x27, [x18, #0x50]
+    str  x4, [x18, #0x30]
+    str  x30, [x18, #0x8]
+    orr  x18, x18, #0x8000000000000000
+    sub  x22, x30, #4
+    b    runtime_exit_br
+
+// =============================================================================
+// runtime_wqthread segment
+// =============================================================================
+.section runtime_wqthread,runtime_wqthread,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_wqthread
+_runtime_wqthread:
+runtime_wqthread:
+    mov  x22, x0
+    mov  x23, x1
+    mov  x24, x2
+    mov  x25, x3
+    mov  x26, x4
+    mov  x27, x5
+    mvn  x0, xzr
+    str  x0, [sp, #-0x10]!
+    mov  x0, #3
+    mov  x1, sp
+    mov  x2, sp
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lwqthread_ok
+    brk  #6
+Lwqthread_ok:
+    adrp x28, _wqthread_entry_fptr@PAGE
+    ldr  x28, [x28, _wqthread_entry_fptr@PAGEOFF]
+    mov  x18, #3
+    mov  x0, x23
+    mov  x1, x28
+    ldr  x2, [sp]
+    mov  x3, #2
+    bl   _runtime_pthread_init
+    add  x30, x0, #4
+    add  sp, sp, #0x10
+    mov  x4, sp
+    mov  sp, x18
+    msr  fpcr, xzr
+    ldrb w17, [x18, #0x170]
+    tbz  w17, #1, Lwqthread_fpcr_done
+    mov  w17, #6
+    msr  fpcr, x17
+Lwqthread_fpcr_done:
+    mov  x17, #0
+    ldr  x29, [x18, #0x198]
+    ldp  x19, x29, [x29]
+    mov  w20, #1
+    lsl  w20, w20, w29
+    sub  w20, w20, #1
+    ldr  x21, [x18, #0x1A8]
+    stp  x23, x22, [x18, #0x40]
+    str  x24, [x18, #0x20]
+    str  x25, [x18, #0x18]
+    stp  x26, x27, [x18, #0x50]
+    str  x4, [x18, #0x30]
+    str  x30, [x18, #0x8]
+    orr  x18, x18, #0x8000000000000000
+    sub  x22, x30, #4
+    b    runtime_exit_br
+
+// =============================================================================
+// runtime_syscall segment
+// =============================================================================
+.section runtime_syscall,runtime_syscall,regular,pure_instructions
+.p2align 2
+
+.globl _runtime_syscall
+_runtime_syscall:
+runtime_syscall:
+tail_syscall_handler:
+    and  w23, w0, #0x7000000
+    lsr  w23, w23, #24
+    cmp  w23, #1
+    b.eq Lsyscall_class1
+    cmp  w23, #2
+    b.eq Lsyscall_class2
+    cmp  w23, #3
+    b.eq Lsyscall_class3
+    b    syscall_trap
+
+// BSD syscall class 1 (128-entry jump table)
+Lsyscall_class1:
+    and  w16, w0, #0xFFFF
+    cmp  w16, #0x7F
+    b.hi syscall_trap
+    adr  x22, jpt_sysent
+    ldrsw x23, [x22, x16, lsl #2]
+    add  x23, x23, x22
+    br   x23
+
+// Default BSD syscall: negate syscall number, pass args, SVC
+syscall_default:
+    neg  x16, x16
+mach_default:
+    mov  x22, x4
+    mov  x0, x7
+    mov  x1, x6
+    mov  x3, x10
+    mov  x4, x8
+    mov  x5, x9
+    ldr  x6, [x22, #8]
+    ldp  x7, x8, [x22, #0x10]
+    mov  x22, #-1
+    str  x22, [x18, #0x1B8]
+Lsyscall_svc:
+    svc  #0x80
+Lsyscall_svc_ret:
+    mov  x2, x1
+    b    runtime_exit_sys_nzcv
+
+sysent_case31:
+    and  w22, w6, #3
+    cmp  w22, #3
+    b.ne syscall_default
+    ldr  w22, [x7, #0x14]
+    sub  x23, x22, #0xD48
+    cmp  x23, #0x32
+    b.ls Lsysent31_ioctl_check
+    sub  x23, x22, #0xE10
+    cmp  x23, #0x1B
+    b.ls Lsysent31_kext_path
+    mov  x23, #0x12C0
+    sub  x23, x22, x23
+    cmp  x23, #0x14
+    b.ls Lsysent31_ioctl_check
+    mov  x23, #0x1F40
+    cmp  x22, x23
+    b.eq Lsysent31_ioctl_check
+    b    syscall_default
+
+Lsysent31_ioctl_check:
+    ldr  w24, [x7, #8]
+    ldr  w25, [x18, #0x190]
+    cmp  x24, x25
+    b.ne syscall_default
+    mov  x22, x4
+    mov  x0, x7
+    mov  x1, x6
+    mov  x3, x10
+    mov  x4, x8
+    mov  x5, x9
+    ldr  x6, [x22, #8]
+    ldp  x7, x8, [x22, #0x10]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xB8]
+    blr  x29
+    cbz  x1, Lsysent31_fallback
+    b    runtime_exit_sys_nzcv
+
+Lsysent31_kext_path:
+    mov  x22, x4
+    mov  x0, x7
+    mov  x1, x6
+    mov  x3, x10
+    mov  x4, x8
+    mov  x5, x9
+    ldr  x6, [x22, #8]
+    ldp  x7, x8, [x22, #0x10]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xC0]
+    blr  x29
+    cbz  x1, Lsysent31_fallback
+    b    runtime_exit_sys_nzcv
+
+Lsysent31_fallback:
+    ldp  x1, x0, [x18, #0x40]
+    ldr  x2, [x18, #0x20]
+    ldr  x3, [x18, #0x60]
+    ldp  x4, x5, [x18, #0x50]
+    ldr  x22, [x18, #0x30]
+    ldr  x6, [x22, #8]
+    mov  x22, #-1
+    str  x22, [x18, #0x1B8]
+    mov  x16, #-31
+    b    Lsyscall_svc
+
+sysent_case47:
+    tbz  x6, #33, syscall_default
+    and  x22, x6, #3
+    cmp  x22, #3
+    b.ne syscall_default
+    lsr  x22, x8, #32
+    sub  x23, x22, #0xD48
+    cmp  x23, #0x32
+    b.ls Lsysent47_ioctl_check
+    sub  x23, x22, #0xE10
+    cmp  x23, #0x1B
+    b.ls Lsysent47_kext_path
+    mov  x23, #0x12C0
+    sub  x23, x22, x23
+    cmp  x23, #0x14
+    b.ls Lsysent47_ioctl_check
+    mov  x23, #0x1F40
+    cmp  x22, x23
+    b.eq Lsysent47_ioctl_check
+    b    syscall_default
+
+Lsysent47_ioctl_check:
+    ldr  w25, [x18, #0x190]
+    cmp  w10, w25
+    b.ne syscall_default
+    mov  x22, x4
+    mov  x0, x7
+    mov  x1, x6
+    mov  x3, x10
+    mov  x4, x8
+    mov  x5, x9
+    ldr  x6, [x22, #8]
+    ldp  x7, x8, [x22, #0x10]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xC8]
+    blr  x29
+    cbz  x1, Lsysent47_fallback
+    b    runtime_exit_sys_nzcv
+
+Lsysent47_kext_path:
+    mov  x22, x4
+    mov  x0, x7
+    mov  x1, x6
+    mov  x3, x10
+    mov  x4, x8
+    mov  x5, x9
+    ldr  x6, [x22, #8]
+    ldp  x7, x8, [x22, #0x10]
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0xD0]
+    blr  x29
+    cbz  x1, Lsysent47_fallback
+    b    runtime_exit_sys_nzcv
+
+Lsysent47_fallback:
+    ldp  x1, x0, [x18, #0x40]
+    ldr  x2, [x18, #0x20]
+    ldr  x3, [x18, #0x60]
+    ldp  x4, x5, [x18, #0x50]
+    ldr  x22, [x18, #0x30]
+    ldp  x6, x7, [x22, #8]
+    mov  x22, #-1
+    str  x22, [x18, #0x1B8]
+    mov  x16, #-47
+    b    Lsyscall_svc
+
+sysent_case89:
+    mov  w22, #1
+    stp  w22, w22, [x7]
+    mov  w0, #0
+    b    runtime_exit_sys_nzcv
+
+// Mach trap class 2 (537-entry jump table)
+Lsyscall_class2:
+    and  w16, w0, #0xFFFF
+    cmp  w16, #0x218
+    b.hi mach_default
+    adr  x22, jpt_mach
+    ldrsw x23, [x22, x16, lsl #2]
+    add  x23, x23, x22
+    br   x23
+
+mach_case0:
+    and  w22, w7, #0x7000000
+    lsr  w22, w22, #24
+    cmp  w22, #7
+    b.eq Lmach_case0_class7
+    mov  w0, w7
+    mov  x7, x6
+    mov  x6, x2
+    mov  x2, x10
+    mov  x10, x8
+    mov  x8, x9
+    ldr  x9, [x4, #8]
+    ldp  x23, x24, [x4, #0x10]
+    stp  x23, x24, [x18, #-0x10]
+    sub  x4, x18, #0x18
+    b    Lsyscall_class2
+
+Lmach_case0_class7:
+    and  w0, w7, #0xFFFF
+    cmp  w0, #9
+    b.hi syscall_trap
+    adr  x22, jpt_bsd7
+    ldrsw x23, [x22, x0, lsl #2]
+    add  x23, x23, x22
+    br   x23
+
+mach_case361:
+    mov  x22, #1
+    strb w22, [x18, #0x221]
+    b    mach_default
+
+mach_case184:
+    cmp  x6, #0x1E
+    b.eq Lmach_case184_sigreturn
+    mov  x1, x7
+    mov  x3, x2
+    mov  x2, x6
+    mov  x4, x10
+    mov  x5, x8
+    mov  x6, x9
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x98]
+    mov  x0, x18
+    blr  x29
+    b    runtime_exit_sys_nzcv
+
+Lmach_case184_sigreturn:
+    mov  x22, x7
+    mov  x23, x6
+    mov  x24, x2
+    mov  x0, #3
+    adr  x1, Lsyscall_sentinel
+    mov  x2, xzr
+    mov  x16, #0x149
+    svc  #0x80
+    b.cc Lmach_case184_ok
+    brk  #6
+Lmach_case184_ok:
+    sub  sp, sp, #0x450
+    mov  x1, x22
+    mov  x2, x23
+    mov  x3, x24
+    add  x4, sp, #0x68
+    add  x5, sp, #0xA0
+    mov  x6, x21
+    ldr  x29, [x18]
+    ldr  x29, [x29, #0x90]
+    mov  x0, x18
+    blr  x29
+    add  x22, sp, #0x68
+    b    runtime_exitsigr
+
+// Machine-dependent class 3 (7-entry jump table)
+Lsyscall_class3:
+    and  w23, w0, #0xFFFF
+    cmp  w23, #6
+    b.hi syscall_trap
+    adr  x22, jpt_mdep
+    ldrsw x23, [x22, x23, lsl #2]
+    add  x23, x23, x22
+    br   x23
+
+mdep_default:
+    mov  x0, #4
+    mov  x22, #0x20000000
+    msr  nzcv, x22
+    b    runtime_exit_sys_nzcv
+
+mdep_case3:
+    mov  x0, x7
+    mov  x3, #2
+    mov  x16, #0x80000000
+    svc  #0x80
+    b    runtime_exit_sys_nzcv
+
+syscall_trap:
+    brk  #5
+
+j_runtime_exit_ret:
+    b    runtime_exit_ret
+
+// =============================================================================
+// Jump tables (32-bit PC-relative offsets)
+// =============================================================================
+
+jpt_sysent:
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long sysent_case12 - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long sysent_case14 - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long sysent_case31 - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long sysent_case47 - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long sysent_case89 - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+    .long syscall_default - jpt_sysent
+
+jpt_mdep:
+    .long mdep_default - jpt_mdep
+    .long mdep_default - jpt_mdep
+    .long mdep_default - jpt_mdep
+    .long mdep_case3 - jpt_mdep
+    .long mdep_default - jpt_mdep
+    .long mdep_case5 - jpt_mdep
+    .long mdep_case6 - jpt_mdep
+
+jpt_mach:
+    .long mach_case0 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case2 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case46 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case53 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case59 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case66 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case73 - jpt_mach
+    .long mach_case74 - jpt_mach
+    .long mach_case75 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case184 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case197 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case244 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case294 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case360 - jpt_mach
+    .long mach_case361 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case366 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case361 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case59 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case438 - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_default - jpt_mach
+    .long mach_case536 - jpt_mach
+
+jpt_bsd7:
+    .long bsd7_case0 - jpt_bsd7
+    .long bsd7_case1 - jpt_bsd7
+    .long bsd7_case2 - jpt_bsd7
+    .long bsd7_case3 - jpt_bsd7
+    .long bsd7_case4 - jpt_bsd7
+    .long bsd7_case5 - jpt_bsd7
+    .long bsd7_case6 - jpt_bsd7
+    .long bsd7_case7 - jpt_bsd7
+    .long bsd7_case8 - jpt_bsd7
+    .long bsd7_case9 - jpt_bsd7
+
+Lsyscall_sentinel:
+    .long 0xFFFFFFFF
+

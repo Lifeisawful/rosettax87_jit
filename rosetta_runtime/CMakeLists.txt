@@ -1,5 +1,7 @@
 project(rosetta_runtime)
 
+enable_language(ASM)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -32,6 +34,8 @@ add_executable(libRuntimeRosettax87
     src/SIMDGuard.cpp
     src/Offsets.cpp
     src/RuntimeConfig.cpp
+    src/runtime_entry.S
+    src/runtime_stubs.cpp
 )
 
 target_include_directories(libRuntimeRosettax87 PRIVATE
@@ -48,7 +52,7 @@ target_link_options(libRuntimeRosettax87 PRIVATE
     "-Wl,-pagezero_size,0x0"
     "-Wl,-headerpad,0"
     "-Wl,-e,_start"
-    "-Wl,-segalign,10"
+    "-Wl,-segalign,1"
     "-Wl,-fixup_chains_section"          # emit LC_DYLD_CHAINED_FIXUPS so we can rebase
 )
 

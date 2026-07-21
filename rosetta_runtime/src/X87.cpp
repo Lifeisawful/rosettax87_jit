@@ -83,7 +83,16 @@ void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const
     return orig_init_library(a1, a2, a3);
 }
 
-X87_TRAMPOLINE(register_runtime_routine_offsets, x9)
+void register_runtime_routine_offsets(intptr_t* runtime_routine_offsets, const char** runtime_routine_names, int32_t count) {
+    // original code calculates the offsets to each runtime routine. 
+    //  for ( i = 0; i != 0x62; ++i )
+    //     g_runtime_routine_offsets[i] = (char *)g_rt_branch_slot[i] - (char *)stub_far_jmp;
+ 
+    // TODO: Overwrite runtime_routine_offsets here with the new offsets to OUR entry stubs. 
+
+    orig_register_runtime_routine_offsets(runtime_routine_offsets, runtime_routine_names, count);
+}
+
 X87_TRAMPOLINE(translator_use_t8027_codegen, x9)
 X87_TRAMPOLINE(translator_reset, x9)
 X87_TRAMPOLINE(ir_create_bad_access, x9)
