@@ -211,36 +211,102 @@ public:
     }
 
     bool detach() {
-        // PT_DETACH requires the tracee to be in a BSD signal-stop. Under
-        // PT_ATTACHEXC our stops arrive as Mach exceptions (the BRK is a bare
-        // EXC_BREAKPOINT carrying no signal), which PT_DETACH rejects with
-        // EBUSY. So drive the tracee into a SIGSTOP job-control stop and hold
-        // it — the approach debugserver takes. SIGSTOP can't be caught or
-        // ignored, and PT_DETACH only accepts a held signal-stop like this one
-        // (a bare EXC_BREAKPOINT or a running process both give EBUSY).
-        kill(childPid_, SIGSTOP);
-        if (!exc_.reply(0)) {  // release the held stop; run into the SIGSTOP
-            return false;
-        }
-        if (!waitForStopped(SIGSTOP)) {
-            fprintf(stderr, "detach: failed to reach SIGSTOP stop\n");
-            return false;
-        }
-        // Restore the task's exception ports, PT_DETACH from the held SIGSTOP
-        // stop, then release the exception (unblocking the thread). Order
-        // matters: PT_DETACH must run while the SIGSTOP exception is still held,
-        // and the release must run after (ptrace is no longer valid post-detach).
-        exc_.restoreAndTearDown();
-        bool ok = true;
-        if (ptrace(PT_DETACH, childPid_, (caddr_t)1, 0) < 0) {
-            perror("ptrace(PT_DETACH)");
-            ok = false;
-        }
+        // Exact 1:1 port of lldb debugserver's MachProcess::Detach()
+        // (llvm lldb/tools/debugserver/source/MacOSX/MachProcess.mm). Order:
+        //
+        //   DoSIGSTOP(clear_bps, allow_running=true)   // run, then SIGSTOP-stop
+        //     -> PrivateResume(): ReplyToAllExceptions + task_resume  (RUN)
+        //     -> Signal(SIGSTOP, timeout): kill(SIGSTOP), wait for the stop
+        //        (the exception thread task_suspend()s on catching the SIGSTOP
+        //         exception, in ExceptionMessageReceived)
+        //   ReplyToAllExceptions()                     // reply SIGSTOP, traced
+        //   ShutDownExceptionThread()                  // restore ports
+        //   ::ptrace(PT_DETACH)                        // best-effort
+        //   m_task.Resume()                            // balance the suspend
+        //
+        // The two invariants that make this work, both verified against XNU
+        // (bsd/kern) and the debugserver source:
+        //
+        //  * A planted BRK arrives as a raw EXC_BREAKPOINT on our Mach port with
+        //    p_stat == SRUN (NOT a BSD trace-stop — XNU only sets p_stat == SSTOP
+        //    via issignal_locked for BSD signals). So the SIGSTOP is genuinely
+        //    needed to reach the p_stat == SSTOP that PT_DETACH's gate wants.
+        //  * debugserver task_suspend()s ONLY when it catches the SIGSTOP
+        //    exception (paired with that catch), and SIGSTOPs a RUNNING task —
+        //    not a pre-suspended one. Suspending before the SIGSTOP (as an
+        //    earlier version of this code did) means kill(SIGSTOP) races a task
+        //    that is already frozen at Mach level; the SIGSTOP exception may not
+        //    be delivered until the task runs, so the drain below can stall on a
+        //    fast/differently-scheduled host (the CI-only hang). We therefore do
+        //    NOT suspend up front: we resume the BRK, SIGSTOP the running task,
+        //    and suspend only once the SIGSTOP exception is in hand.
+
+        // 1. PrivateResume: reply to the held BRK so the task runs. (Our "stopped
+        //    at BRK" state is a held Mach exception, not a Mach suspend, so there
+        //    is no task_resume to pair here — just release the exception.)
         exc_.release();
-        if (ok) {
-            LOG("Debugger detached.\n");
+
+        // 2. Signal(SIGSTOP) on the RUNNING task, then wait for the SIGSTOP to
+        //    come back as EXC_SOFT_SIGNAL. Suppress any other soft signal and
+        //    forward genuine faults, mirroring debugserver's bundle handling.
+        kill(childPid_, SIGSTOP);
+
+        bool gotSigstop = false;
+        for (int attempts = 0; attempts < 8 && !gotSigstop; ++attempts) {
+            lastEvent_ = exc_.waitForEvent(3000);
+            if (!lastEvent_.valid) {
+                break;
+            }
+            int sig = lastEvent_.softSignal();
+            if (sig == SIGSTOP) {
+                gotSigstop = true;
+            } else if (sig != 0) {
+                exc_.reply(0);
+            } else {
+                exc_.forward();
+            }
         }
-        return ok;
+
+        if (!gotSigstop) {
+            fprintf(stderr, "detach: SIGSTOP not received\n");
+        }
+
+        // 2b. task_suspend paired with the SIGSTOP catch (debugserver:
+        //     ExceptionMessageReceived -> m_task.Suspend on the first exception
+        //     of the bundle). This is the balanced counterpart to m_task.Resume()
+        //     at the end. It freezes the task at Mach level while we tear down.
+        task_suspend(taskPort_);
+
+        // 3. ReplyToAllExceptions: reply to the SIGSTOP exception WHILE STILL
+        //    TRACED. reply(0) does PT_THUPDATE(0) to suppress the signal and
+        //    sends the Mach reply; because P_LTRACED is still set, XNU's
+        //    resume-on-reply path (pt_setrunnable) runs and lifts the job-control
+        //    SSTOP cleanly, so no dangling stop is left for a future signal to
+        //    wedge on. (The task stays frozen by the Mach suspend from 2b.)
+        exc_.reply(0);
+
+        // 4. ShutDownExceptionThread: restore original exception ports, drop ours.
+        exc_.restoreAndTearDown();
+
+        // 5. PT_DETACH — best-effort, exactly as debugserver treats it (it logs
+        //    the return but never requires success). Because step 3 SRUN'd the
+        //    proc, this returns EBUSY and does not clear P_LTRACED; that is safe —
+        //    the original exception ports are already restored, so any future
+        //    signal takes its default (non-debugger) disposition rather than
+        //    routing to our torn-down port (verified: a post-detach SIGUSR1
+        //    terminates the tracee normally instead of wedging it).
+        errno = 0;
+        if (ptrace(PT_DETACH, childPid_, (caddr_t)1, 0) < 0 && errno != EBUSY) {
+            perror("ptrace(PT_DETACH)");
+        }
+
+        // 6. m_task.Resume(): balance the task_suspend from 2b. This is what
+        //    actually runs the process; no SIGCONT is needed because the SSTOP was
+        //    already lifted by the reply-while-traced in step 3.
+        task_resume(taskPort_);
+
+        LOG("Debugger detached.\n");
+        return true;
     }
 
     bool setBreakpoint(uint64_t address) {
