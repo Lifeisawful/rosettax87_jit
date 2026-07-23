@@ -9,7 +9,9 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-26
+    # Preview image for the newer macOS 26.5.2 (25F84) build; provided "as-is"
+    # and retired when the beta ships — revert to macos-26 once 26.5 is GA.
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
 
