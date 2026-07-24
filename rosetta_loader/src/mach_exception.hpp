@@ -49,14 +49,12 @@ public:
     };
 
     // Allocate a receive right, insert a send right, and atomically install our
-    // port as the task's EXC_MASK_SOFTWARE handler (EXCEPTION_DEFAULT |
-    // MACH_EXCEPTION_CODES), saving the previous ports for restore/forward. We
-    // claim only EXC_SOFTWARE at task level: PT_ATTACHEXC folds the ptrace
-    // signal-stops (attach/exec/SIGSTOP) into EXC_SOFT_SIGNAL, which we must
-    // receive. The one planted BRK (EXC_BREAKPOINT) is caught at THREAD level
-    // instead (see installThreadBreakpoint) so we never share the task-level
-    // EXC_BREAKPOINT port with libRosettaRuntime's JIT.
-    // pid is the tracee pid (needed for PT_THUPDATE on reply).
+    // port as the task's EXC_MASK_ALL handler (EXCEPTION_DEFAULT |
+    // MACH_EXCEPTION_CODES), saving the previous ports for restore/forward.
+    // Mirrors lldb debugserver's MachTask::StartExceptionThread: we claim every
+    // exception type at task level, so both the PT_ATTACHEXC signal-stops (folded
+    // into EXC_SOFT_SIGNAL) and the one planted BRK (EXC_BREAKPOINT) arrive on
+    // this port. pid is the tracee pid (needed for PT_THUPDATE on reply).
     bool install(pid_t pid, task_t task);
 
     // Re-install on a (possibly new) task port. execve resets a task's
@@ -66,21 +64,6 @@ public:
     // True if our port is currently among the task's registered handlers.
     // Used to prove the port is live before continuing into the BRK window.
     [[nodiscard]] bool verifyInstalled() const;
-
-    // Register our exception port for EXC_BREAKPOINT on a SINGLE thread (the one
-    // that will execute the planted BRK) instead of at task level. Thread-level
-    // exception ports out-rank task-level ones in Mach's delivery order, so we
-    // still catch our own BRK — but libRosettaRuntime's task-level
-    // EXC_BREAKPOINT handler (used by its JIT) is never displaced, so there is
-    // nothing to restore and no clobber race at detach (the ~1/12 post-detach
-    // SIGTRAP / exit=133 flake). The BRK arrives on the same receive port as the
-    // soft-signal stops; catch_mach_exception_raise dispatches by type.
-    bool installThreadBreakpoint(thread_act_t thread);
-
-    // Tear down the thread-level EXC_BREAKPOINT registration installed above,
-    // restoring whatever the thread had before (freshly-exec'd threads have no
-    // handler, so this clears ours). Idempotent.
-    void removeThreadBreakpoint();
 
     // Block until an exception message arrives (or timeout). Runs the MIG
     // server, which decodes the message and builds the reply we will later
@@ -126,23 +109,13 @@ private:
     bool haveHeld_ = false;
 
     // Saved previous TASK-level exception ports (for restore / default
-    // forwarding). Covers EXC_MASK_SOFTWARE only.
+    // forwarding). Covers EXC_MASK_ALL.
     exception_mask_t savedMasks_[kMaxExcPorts] = {};
     mach_port_t savedPorts_[kMaxExcPorts] = {};
     exception_behavior_t savedBehaviors_[kMaxExcPorts] = {};
     thread_state_flavor_t savedFlavors_[kMaxExcPorts] = {};
     mach_msg_type_number_t savedCount_ = 0;
     bool haveSaved_ = false;
-
-    // Saved previous THREAD-level EXC_BREAKPOINT ports for the one thread we arm
-    // around the planted BRK (see installThreadBreakpoint/removeThreadBreakpoint).
-    exception_mask_t savedThreadMasks_[kMaxExcPorts] = {};
-    mach_port_t savedThreadPorts_[kMaxExcPorts] = {};
-    exception_behavior_t savedThreadBehaviors_[kMaxExcPorts] = {};
-    thread_state_flavor_t savedThreadFlavors_[kMaxExcPorts] = {};
-    mach_msg_type_number_t savedThreadCount_ = 0;
-    thread_act_t bpThread_ = MACH_PORT_NULL;
-    bool haveThreadBp_ = false;
 
     // Message buffers. 1024 bytes comfortably holds a 64-bit exception message
     // and its reply (mirrors debugserver's MachMessage union).

@@ -7,7 +7,7 @@
 #include <sys/mman.h>
 #include <sys/event.h>
 #include <sys/ptrace.h>
-#include <sys/sysctl.h>
+#include <sys/sysctl.h>  // detach diagnostics: read tracee p_stat
 #include <sys/wait.h>
 #include <sched.h>
 
@@ -33,55 +33,6 @@ const char* logsEnabled = nullptr;
             printf(fmt, ##__VA_ARGS__); \
         }                               \
     } while (0)
-
-// Returns true when the running XNU build is >= the given threshold build
-// number, compared component-wise (numeric), parsed from kern.version's
-// "root:xnu-<A.B.C.D.E>~<F>" token. On any parse/sysctl failure, returns
-// `fallback` (default false => keep the conservative detach() path).
-//
-// A string compare would be wrong here ("9" > "13432" lexically, and the dotted
-// tail needs numeric ordering), so we compare each dotted component as an int.
-// The trailing "~N" revision suffix is ignored. Missing trailing components in
-// the running build are treated as 0, so an exact prefix match counts as "at
-// least" (>=).
-static bool xnuBuildAtLeast(const int* threshold, size_t nThreshold, bool fallback = false) {
-    char buf[512];
-    size_t len = sizeof(buf);
-    if (sysctlbyname("kern.version", buf, &len, nullptr, 0) != 0) {
-        return fallback;
-    }
-    buf[sizeof(buf) - 1] = '\0';
-
-    const char* p = strstr(buf, "root:xnu-");
-    if (!p) {
-        return fallback;
-    }
-    p += strlen("root:xnu-");
-
-    for (size_t i = 0; i < nThreshold; ++i) {
-        // A component must start with a digit; anything else (end of token,
-        // "~", "/") means the running build has no more components -> treat as 0.
-        int running = 0;
-        if (*p >= '0' && *p <= '9') {
-            char* end = nullptr;
-            long v = strtol(p, &end, 10);
-            running = (int)v;
-            p = end;
-            if (*p == '.') {
-                ++p;  // step over the separator to the next component
-            }
-        }
-        if (running != threshold[i]) {
-            return running > threshold[i];
-        }
-    }
-    // All compared components equal -> at least the threshold.
-    return true;
-}
-
-// XNU build 13432.0.94.501.4~1 — first kernel where the debugserver-style
-// detach (detach_golden_gate) is correct; older kernels need detach().
-static const int kGoldenGateXnuBuild[] = {13432, 0, 94, 501, 4};
 
 typedef const struct dyld_process_info_base* DyldProcessInfo;
 
@@ -109,6 +60,18 @@ private:
     // as a fatal SIGTRAP (the flaky exit=133).
     MachExceptionSession exc_;
     MachExceptionSession::Event lastEvent_{};
+
+    // Read the tracee's BSD p_stat via sysctl (drives the post-detach SSTOP
+    // watch). SRUN=2 SSLEEP=3 SSTOP=4 SZOMB=5; -1 = sysctl failed (e.g. proc gone).
+    static int readPstat(pid_t pid) {
+        struct kinfo_proc kp;
+        size_t len = sizeof(kp);
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+        if (sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len == 0) {
+            return -1;
+        }
+        return kp.kp_proc.p_stat;
+    }
 
     // Receive the next event, suppressing soft-signal stops other than
     // expectedSignal (0 = return on any stop), mirroring the old
@@ -183,14 +146,6 @@ public:
     task_t taskPort() const { return taskPort_; }
     mach_port_t stoppedThread() const { return lastEvent_.thread; }
 
-    // Arm/disarm the thread-level EXC_BREAKPOINT catcher on the currently
-    // stopped thread — the one that will execute (and later re-execute) the
-    // planted BRK. Must be armed before continuing into the BRK and disarmed
-    // after the original instruction is restored. Catching the BRK at thread
-    // level keeps us off libRosettaRuntime's task-level EXC_BREAKPOINT port.
-    bool armThreadBreakpoint() { return exc_.installThreadBreakpoint(lastEvent_.thread); }
-    void disarmThreadBreakpoint() { exc_.removeThreadBreakpoint(); }
-
     bool attach(pid_t pid) {
         childPid_ = pid;
         LOG("Attempting to attach to %d\n", childPid_);
@@ -261,85 +216,33 @@ public:
     }
 
     bool detach() {
-        // PT_DETACH requires the tracee to be in a BSD signal-stop. Under
-        // PT_ATTACHEXC our stops arrive as Mach exceptions (the BRK is a bare
-        // EXC_BREAKPOINT carrying no signal), which PT_DETACH rejects with
-        // EBUSY. So drive the tracee into a SIGSTOP job-control stop and hold
-        // it — the approach debugserver takes. SIGSTOP can't be caught or
-        // ignored, and PT_DETACH only accepts a held signal-stop like this one
-        // (a bare EXC_BREAKPOINT or a running process both give EBUSY).
-        kill(childPid_, SIGSTOP);
-        if (!exc_.reply(0)) {  // release the held stop; run into the SIGSTOP
-            return false;
-        }
-        if (!waitForStopped(SIGSTOP)) {
-            fprintf(stderr, "detach: failed to reach SIGSTOP stop\n");
-            return false;
-        }
-        // Restore the task's exception ports, PT_DETACH from the held SIGSTOP
-        // stop, then release the exception (unblocking the thread). Order
-        // matters: PT_DETACH must run while the SIGSTOP exception is still held,
-        // and the release must run after (ptrace is no longer valid post-detach).
-        exc_.restoreAndTearDown();
-        bool ok = true;
-        if (ptrace(PT_DETACH, childPid_, (caddr_t)1, 0) < 0) {
-            perror("ptrace(PT_DETACH)");
-            ok = false;
-        }
-        exc_.release();
-        if (ok) {
-            LOG("Debugger detached.\n");
-        }
-        return ok;
-    }
-
-    bool detach_golden_gate() {
-        // Exact 1:1 port of lldb debugserver's MachProcess::Detach()
-        // (llvm lldb/tools/debugserver/source/MacOSX/MachProcess.mm). Order:
+        // Literal 1:1 port of lldb debugserver's MachProcess::Detach()
+        // (llvm lldb/tools/debugserver/source/MacOSX/MachProcess.mm), in its
+        // exact order:
         //
         //   DoSIGSTOP(clear_bps, allow_running=true)   // run, then SIGSTOP-stop
-        //     -> PrivateResume(): ReplyToAllExceptions + task_resume  (RUN)
-        //     -> Signal(SIGSTOP, timeout): kill(SIGSTOP), wait for the stop
-        //        (the exception thread task_suspend()s on catching the SIGSTOP
-        //         exception, in ExceptionMessageReceived)
-        //   ReplyToAllExceptions()                     // reply SIGSTOP, traced
-        //   ShutDownExceptionThread()                  // restore ports
-        //   ::ptrace(PT_DETACH)                        // best-effort
-        //   m_task.Resume()                            // balance the suspend
-        //
-        // The two invariants that make this work, both verified against XNU
-        // (bsd/kern) and the debugserver source:
-        //
-        //  * A planted BRK arrives as a raw EXC_BREAKPOINT on our Mach port with
-        //    p_stat == SRUN (NOT a BSD trace-stop — XNU only sets p_stat == SSTOP
-        //    via issignal_locked for BSD signals). So the SIGSTOP is genuinely
-        //    needed to reach the p_stat == SSTOP that PT_DETACH's gate wants.
-        //  * debugserver task_suspend()s ONLY when it catches the SIGSTOP
-        //    exception (paired with that catch), and SIGSTOPs a RUNNING task —
-        //    not a pre-suspended one. Suspending before the SIGSTOP (as an
-        //    earlier version of this code did) means kill(SIGSTOP) races a task
-        //    that is already frozen at Mach level; the SIGSTOP exception may not
-        //    be delivered until the task runs, so the drain below can stall on a
-        //    fast/differently-scheduled host (the CI-only hang). We therefore do
-        //    NOT suspend up front: we resume the BRK, SIGSTOP the running task,
-        //    and suspend only once the SIGSTOP exception is in hand.
+        //     -> PrivateResume(): reply held exception + task run
+        //     -> Signal(SIGSTOP, timeout=2s): kill(SIGSTOP), wait once for stop
+        //   ReplyToAllExceptions()   // reply, forwarding signal=-1 per thread
+        //   ShutDownExceptionThread()// restore original exception ports
+        //   ::ptrace(PT_DETACH)      // best-effort: logged, never fatal
+        //   m_task.Resume()          // task_resume only if suspend_count > 0
 
-        // 1. PrivateResume: reply to the held BRK so the task runs. (Our "stopped
-        //    at BRK" state is a held Mach exception, not a Mach suspend, so there
-        //    is no task_resume to pair here — just release the exception.)
+        LOG("[detach] enter: p_stat=%d (SRUN=2 SSTOP=4)\n", readPstat(childPid_));
+
+        // 1. DoSIGSTOP / PrivateResume: reply to the held BRK so the task runs.
         exc_.release();
 
-        // 2. Signal(SIGSTOP) on the RUNNING task, then wait for the SIGSTOP to
-        //    come back as EXC_SOFT_SIGNAL. Suppress any other soft signal and
-        //    forward genuine faults, mirroring debugserver's bundle handling.
+        // 2. Signal(SIGSTOP): kill(SIGSTOP) on the running task, then wait ONCE
+        //    with a 2-second timeout for the SIGSTOP to come back as
+        //    EXC_SOFT_SIGNAL — matching debugserver's Signal(SIGSTOP, 2s). Any
+        //    other soft signal is suppressed and a genuine fault forwarded;
+        //    proceed regardless of whether the stop arrived (best-effort).
         kill(childPid_, SIGSTOP);
 
         bool gotSigstop = false;
-        for (int attempts = 0; attempts < 8 && !gotSigstop; ++attempts) {
-            lastEvent_ = exc_.waitForEvent(3000);
-            if (!lastEvent_.valid) {
-                break;
-            }
+        lastEvent_ = exc_.waitForEvent(2000);
+        if (lastEvent_.valid) {
             int sig = lastEvent_.softSignal();
             if (sig == SIGSTOP) {
                 gotSigstop = true;
@@ -349,48 +252,90 @@ public:
                 exc_.forward();
             }
         }
-
         if (!gotSigstop) {
-            fprintf(stderr, "detach: SIGSTOP not received\n");
+            fprintf(stderr, "detach: SIGSTOP not received within 2s (proceeding)\n");
         }
+        LOG("[detach] after SIGSTOP-wait: gotSigstop=%d p_stat=%d\n", gotSigstop,
+            readPstat(childPid_));
 
-        // 2b. task_suspend paired with the SIGSTOP catch (debugserver:
-        //     ExceptionMessageReceived -> m_task.Suspend on the first exception
-        //     of the bundle). This is the balanced counterpart to m_task.Resume()
-        //     at the end. It freezes the task at Mach level while we tear down.
-        task_suspend(taskPort_);
-
-        // 3. ReplyToAllExceptions: reply to the SIGSTOP exception WHILE STILL
-        //    TRACED. reply(0) does PT_THUPDATE(0) to suppress the signal and
-        //    sends the Mach reply; because P_LTRACED is still set, XNU's
-        //    resume-on-reply path (pt_setrunnable) runs and lifts the job-control
-        //    SSTOP cleanly, so no dangling stop is left for a future signal to
-        //    wedge on. (The task stays frozen by the Mach suspend from 2b.)
-        exc_.reply(0);
+        // 3. ReplyToAllExceptions: reply to the held SIGSTOP exception forwarding
+        //    signal = -1.
+        //
+        //    We must NOT let this SRUN the proc: PT_DETACH (step 5) is gated on
+        //    p_stat == SSTOP and returns EBUSY otherwise, leaving P_LTRACED set
+        //    (the worst failure — a still-traced tracee forces SIG_DFL on every
+        //    signal, freezing signal-driven apps, and no SIGCONT can fix it).
+        //    On this XNU, PT_THUPDATE bounds-checks `(unsigned)data >= NSIG`, so
+        //    -1 EINVALs and its `t->p_stat = SRUN` is skipped — the proc stays
+        //    SSTOP, PT_DETACH passes its gate and clears P_LTRACED. (data = 0
+        //    would instead succeed, SRUN the proc, and make PT_DETACH EBUSY —
+        //    verified.) The cost of keeping SSTOP is that the now-untraced tracee
+        //    can re-enter a job-control stop after detach; step 7 lifts that with
+        //    SIGCONT.
+        exc_.reply(-1);
+        LOG("[detach] after reply(-1): p_stat=%d\n", readPstat(childPid_));
 
         // 4. ShutDownExceptionThread: restore original exception ports, drop ours.
         exc_.restoreAndTearDown();
 
-        // 5. PT_DETACH — best-effort, exactly as debugserver treats it (it logs
-        //    the return but never requires success). Because step 3 SRUN'd the
-        //    proc, this returns EBUSY and does not clear P_LTRACED; that is safe —
-        //    the original exception ports are already restored, so any future
-        //    signal takes its default (non-debugger) disposition rather than
-        //    routing to our torn-down port (verified: a post-detach SIGUSR1
-        //    terminates the tracee normally instead of wedging it).
+        // 5. PT_DETACH — best-effort, exactly as debugserver treats it: it logs
+        //    the return but never requires success, never retries, never branches.
         errno = 0;
-        if (ptrace(PT_DETACH, childPid_, (caddr_t)1, 0) < 0 && errno != EBUSY) {
-            perror("ptrace(PT_DETACH)");
+        int pstatBeforeDetach = logsEnabled ? readPstat(childPid_) : -1;
+        int detachRet = ptrace(PT_DETACH, childPid_, (caddr_t)1, 0);
+        int detachErrno = errno;
+        // Always warn on a real PT_DETACH failure; the full p_stat trace is
+        // gated behind ROSETTA_X87_LOGS.
+        if (detachRet != 0) {
+            fprintf(stderr, "ptrace(PT_DETACH, %d, (caddr_t)1, 0) = %d: %s\n", childPid_, detachRet,
+                    strerror(detachErrno));
         }
+        LOG("[detach] PT_DETACH: p_stat_before=%d ret=%d errno=%d (%s) p_stat_after=%d\n",
+            pstatBeforeDetach, detachRet, detachErrno,
+            detachRet != 0 ? strerror(detachErrno) : "OK", readPstat(childPid_));
 
-        // 6. m_task.Resume(): balance the task_suspend from 2b. This is what
-        //    actually runs the process; no SIGCONT is needed because the SSTOP was
-        //    already lifted by the reply-while-traced in step 3.
-        task_resume(taskPort_);
+        // 6. m_task.Resume(): mirror MachTask::Resume — read the live suspend
+        //    count and task_resume only if suspend_count > 0 (task_resume is not
+        //    ref-counted like task_suspend, so resuming a running task errors).
+        //    No manual task_suspend precedes this: debugserver does not suspend in
+        //    Detach().
+        struct task_basic_info taskInfo;
+        mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
+        bool resumed = false;
+        int suspendCount = -1;
+        if (task_info(taskPort_, TASK_BASIC_INFO, (task_info_t)&taskInfo, &infoCount) ==
+            KERN_SUCCESS) {
+            suspendCount = taskInfo.suspend_count;
+            if (taskInfo.suspend_count > 0) {
+                task_resume(taskPort_);
+                resumed = true;
+            }
+        }
+        LOG("[detach] resume: suspend_count=%d resumed=%d\n", suspendCount, resumed);
+
+        // 7. The tracee may re-enter a BSD job-control stop (p_stat == SSTOP,
+        //    "suspended (signal)") AFTER detach() returns.
+        //
+        //    We are forced to reply(-1) so PT_DETACH runs while the proc is still
+        //    SSTOP (else it EBUSYs and P_LTRACED is never cleared). The price is
+        //    that -1 EINVALs PT_THUPDATE, so its `p_stat = SRUN` is skipped and
+        //    the now-untraced tracee, on Golden Gate, INTERMITTENTLY re-enters a
+        //    job-control stop via SIGSTOP's default SA_STOP disposition. This
+        //    re-stop fires ASYNC and, as observed on a wedged process, AFTER this
+        //    function has already returned (the loader is by then parked in its
+        //    final kevent wait). So it cannot be lifted here — only SIGCONT lifts
+        //    a BSD SSTOP, and it must be sent whenever the stop actually fires.
+        //    That watch lives in main()'s post-detach wait loop (which polls the
+        //    tracee's p_stat and SIGCONTs any SSTOP for the tracee's lifetime),
+        //    since the loader is alive and idle there anyway. On Sequoia the proc
+        //    is SRUN throughout and no SIGCONT is ever sent.
 
         LOG("Debugger detached.\n");
         return true;
     }
+
+    // Public p_stat probe for the post-detach SSTOP watch loop in main().
+    static int tracePstat(pid_t pid) { return readPstat(pid); }
 
     bool setBreakpoint(uint64_t address) {
         // Verify address is in valid range
@@ -941,26 +886,17 @@ int main(int argc, char* argv[]) {
         LOG("Patched sys_csrctl at 0x%llx to return 0\n", csrctlAddr);
     }
 
-    // Catch the one planted BRK at THREAD level on the currently stopped thread
-    // (the single init thread that will execute exports_fetch). Thread-level
-    // exception ports out-rank task-level ones, so we still receive the BRK, but
-    // we never displace libRosettaRuntime's task-level EXC_BREAKPOINT handler —
-    // eliminating the detach-time restore race that leaked a fatal SIGTRAP to
-    // the parent (exit=133). Must be armed before continuing into the BRK.
-    if (!dbg.armThreadBreakpoint()) {
-        fprintf(stderr, "Failed to arm thread-level breakpoint catcher\n");
-        return 1;
-    }
+    // Plant the one BRK at exports_fetch. Our EXC_MASK_ALL task-level port
+    // catches the resulting EXC_BREAKPOINT (mirroring lldb debugserver, which
+    // registers at task level for all exception types).
     dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
     dbg.continueExecution();
     // Read X19 (Exports struct addr) from the thread that hit the BRK, then
-    // restore the original instruction and drop the thread-level catcher. The
-    // process stays stopped (we hold the breakpoint exception reply) through the
-    // stub install below until detach.
+    // restore the original instruction. The process stays stopped (we hold the
+    // breakpoint exception reply) through the stub install below until detach.
     auto rosettaRuntimeExportsAddress =
         dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-    dbg.disarmThreadBreakpoint();
     LOG("Rosetta runtime exports: 0x%llx\n", rosettaRuntimeExportsAddress);
 
     Exports exports;
@@ -1003,21 +939,13 @@ int main(int argc, char* argv[]) {
 
     dbg.restoreThreadState(mmapThreadState);
 
-    // setup a breakpoint after mmap syscall. Re-arm the thread-level
-    // EXC_BREAKPOINT catcher on the init thread (we disarmed it after
-    // exports_fetch, and we never hold the task-level EXC_BREAKPOINT port), so
-    // this second planted BRK is delivered to us rather than to
-    // libRosettaRuntime's task-level handler.
-    if (!dbg.armThreadBreakpoint()) {
-        fprintf(stderr, "Failed to arm thread-level breakpoint catcher for mmap\n");
-        return 1;
-    }
+    // Plant the second BRK after the mmap syscall; our EXC_MASK_ALL task-level
+    // port catches the resulting EXC_BREAKPOINT.
     dbg.setBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
     dbg.continueExecution();
 
     uint64_t machoBase = dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X0);
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
-    dbg.disarmThreadBreakpoint();
 
     LOG("Allocated memory at 0x%llx\n", machoBase);
 
@@ -1124,9 +1052,9 @@ int main(int argc, char* argv[]) {
                             });
 
                             if (destAddr != 0) {
-                                LOG("  Rebase: fileoff=0x%llx target=0x%llx -> 0x%llx "
-                                    "dest=0x%llx\n",
-                                    curFileOffset, fullTarget, rebased, destAddr);
+                                // LOG("  Rebase: fileoff=0x%llx target=0x%llx -> 0x%llx "
+                                //     "dest=0x%llx\n",
+                                //     curFileOffset, fullTarget, rebased, destAddr);
                                 dbg.writeMemory(destAddr, &rebased, sizeof(rebased));
                             } else {
                                 LOG("  WARNING: could not map fileoff=0x%llx to any segment\n",
@@ -1237,31 +1165,47 @@ int main(int argc, char* argv[]) {
 
     // replace the exports in X19 register with the address of the mapped macho
     dbg.setRegister(MuhDebugger::Register::X19, machoExportsAddress);
+    dbg.detach();
 
-    // Pick the detach path by kernel version. detach_golden_gate() (a 1:1 port
-    // of debugserver's MachProcess::Detach) is correct only on new-enough XNU;
-    // on older kernels it leaves the tracee P_LTRACED (forces SIG_DFL on all
-    // signals, freezing signal-driven GUI apps), so those use detach().
-    bool useGoldenGate = xnuBuildAtLeast(
-        kGoldenGateXnuBuild, sizeof(kGoldenGateXnuBuild) / sizeof(kGoldenGateXnuBuild[0]));
-
-    if (useGoldenGate) {
-        LOG("Using detach_golden_gate (xnu >= 13432.0.94.501.4)\n");
-        dbg.detach_golden_gate();
-    } else {
-        LOG("Using detach (xnu < 13432.0.94.501.4)\n");
-        dbg.detach();
-    }
-
-    // Block until the parent (wine) exits. We can't use waitpid since
-    // the parent is not our child, so use kqueue with EVFILT_PROC.
+    // Wait for the parent (wine) to exit, and — for its whole lifetime — lift any
+    // leftover BSD job-control stop on it.
+    //
+    // The tracee we detached from IS parentPid (the loader attached to the parent,
+    // which then exec'd wine). On Golden Gate, detach() is forced to reply(-1) so
+    // PT_DETACH succeeds from SSTOP (see detach() step 3/7); the cost is that the
+    // now-untraced tracee INTERMITTENTLY re-enters a job-control stop
+    // ("suspended (signal)") AFTER detach returns — asynchronously, past any
+    // in-detach window. Only SIGCONT lifts a BSD SSTOP. Rather than block
+    // indefinitely in kevent, we fold that watch into this wait: poll the tracee's
+    // p_stat on a short timeout and SIGCONT any SSTOP, until NOTE_EXIT fires. On
+    // Sequoia the proc is never SSTOP, so no SIGCONT is ever sent (a plain wait).
     int kq = kqueue();
     if (kq != -1) {
         struct kevent ev;
         EV_SET(&ev, parentPid, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, nullptr);
         kevent(kq, &ev, 1, nullptr, 0, nullptr);
-        // Block until parent exits
-        kevent(kq, nullptr, 0, &ev, 1, nullptr);
+
+        // 20ms timeout: wake often enough to lift a re-stop promptly, but idle
+        // (no busy-spin) between wakeups. Loop until the parent exits.
+        struct timespec timeout = {0, 20 * 1000 * 1000};  // 20ms
+        while (true) {
+            struct kevent out;
+            int n = kevent(kq, nullptr, 0, &out, 1, &timeout);
+            if (n > 0) {
+                // NOTE_EXIT delivered — parent gone.
+                break;
+            }
+            // Timeout (n == 0) or EINTR (n < 0): probe the tracee and lift any
+            // job-control stop. p_stat == -1 means the proc is gone.
+            int ps = MuhDebugger::tracePstat(parentPid);
+            if (ps == -1) {
+                break;
+            }
+            if (ps == 4 /* SSTOP */) {
+                kill(parentPid, SIGCONT);
+                LOG("post-detach watch: tracee SSTOP -> SIGCONT\n");
+            }
+        }
         close(kq);
     }
 

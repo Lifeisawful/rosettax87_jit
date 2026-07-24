@@ -75,16 +75,13 @@ void MachExceptionSession::recordFromCatch(mach_port_t thread, mach_port_t task,
 
 bool MachExceptionSession::swapPorts(task_t task) {
     savedCount_ = kMaxExcPorts;
-    // Claim ONLY EXC_SOFTWARE at task level: it carries the ptrace signal-stops
-    // (attach/exec/SIGSTOP as EXC_SOFT_SIGNAL) that PT_ATTACHEXC folds into Mach
-    // exceptions and that we must receive. We deliberately do NOT claim
-    // EXC_BREAKPOINT here — that is libRosettaRuntime's task-level port for its
-    // JIT BRKs, and displacing-then-restoring it races the runtime (the
-    // post-detach SIGTRAP / exit=133 flake). Our own planted BRK is caught at
-    // THREAD level instead (installThreadBreakpoint). Taking EXC_MASK_ALL would
-    // likewise disturb handlers for faults we never plant (e.g. EXC_BAD_ACCESS).
+    // Claim EXC_MASK_ALL at task level, mirroring lldb debugserver's
+    // MachTask::StartExceptionThread (LLDB_EXC_MASK == EXC_MASK_ALL). We become
+    // the task-level handler for every exception type, including EXC_BREAKPOINT,
+    // so the one planted BRK is caught on the task port (not a per-thread port).
+    // The previous ports are saved for a 1:1 restore on detach.
     kern_return_t kr = task_swap_exception_ports(
-        task, EXC_MASK_SOFTWARE, exceptionPort_, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+        task, EXC_MASK_ALL, exceptionPort_, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
         THREAD_STATE_NONE, savedMasks_, &savedCount_, savedPorts_, savedBehaviors_, savedFlavors_);
     if (kr != KERN_SUCCESS) {
         fprintf(stdout, "MachExc: task_swap_exception_ports failed (0x%x: %s)\n", kr,
@@ -152,50 +149,6 @@ bool MachExceptionSession::verifyInstalled() const {
     // Not an error on its own: reinstall() uses this to decide whether exec
     // reset the ports. Callers that require our port log their own failure.
     return false;
-}
-
-bool MachExceptionSession::installThreadBreakpoint(thread_act_t thread) {
-    if (exceptionPort_ == MACH_PORT_NULL) {
-        fprintf(stdout, "MachExc: installThreadBreakpoint before install\n");
-        return false;
-    }
-    savedThreadCount_ = kMaxExcPorts;
-    kern_return_t kr = thread_swap_exception_ports(
-        thread, EXC_MASK_BREAKPOINT, exceptionPort_, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
-        THREAD_STATE_NONE, savedThreadMasks_, &savedThreadCount_, savedThreadPorts_,
-        savedThreadBehaviors_, savedThreadFlavors_);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stdout, "MachExc: thread_swap_exception_ports failed (0x%x: %s)\n", kr,
-                mach_error_string(kr));
-        savedThreadCount_ = 0;
-        return false;
-    }
-    bpThread_ = thread;
-    haveThreadBp_ = true;
-    return true;
-}
-
-void MachExceptionSession::removeThreadBreakpoint() {
-    if (!haveThreadBp_) {
-        return;
-    }
-    // Write back whatever the thread had before. A freshly-exec'd thread has no
-    // EXC_BREAKPOINT handler, so savedThreadCount_ is typically 0 and this loop
-    // restores the (empty) default — clearing our registration. We never
-    // touched the task-level handler, so there is nothing else to undo.
-    for (mach_msg_type_number_t i = 0; i < savedThreadCount_; ++i) {
-        thread_set_exception_ports(bpThread_, savedThreadMasks_[i], savedThreadPorts_[i],
-                                   savedThreadBehaviors_[i], savedThreadFlavors_[i]);
-    }
-    if (savedThreadCount_ == 0) {
-        // Nothing was registered before us: explicitly drop our port so the
-        // thread falls through to the task-level (Rosetta) handler again.
-        thread_set_exception_ports(bpThread_, EXC_MASK_BREAKPOINT, MACH_PORT_NULL,
-                                   EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, THREAD_STATE_NONE);
-    }
-    haveThreadBp_ = false;
-    savedThreadCount_ = 0;
-    bpThread_ = MACH_PORT_NULL;
 }
 
 MachExceptionSession::Event MachExceptionSession::waitForEvent(uint32_t timeoutMs) {
@@ -284,35 +237,18 @@ bool MachExceptionSession::forward() {
 }
 
 void MachExceptionSession::restoreAndTearDown() {
-    // Drop any thread-level EXC_BREAKPOINT registration first (normally already
-    // removed right after the BRK; this is a safety net for error paths).
-    removeThreadBreakpoint();
+    // Literal port of lldb debugserver MachException::PortInfo::Restore: replay
+    // each saved (mask, port, behavior, flavor) tuple back into the task via
+    // task_set_exception_ports, bailing on the first failure. This unconditionally
+    // reinstalls whatever handlers were registered before our EXC_MASK_ALL swap.
     if (haveSaved_ && task_ != TASK_NULL) {
         for (mach_msg_type_number_t i = 0; i < savedCount_; ++i) {
-            // We now only ever hold EXC_MASK_SOFTWARE at task level, but keep
-            // the conditional restore: write the saved handler back ONLY if we
-            // are still the registered handler for this mask. If libRosettaRuntime
-            // has installed its own handler over ours since the swap, blindly
-            // writing back our stale (empty) snapshot would clobber it; leave
-            // the runtime's handler in place instead.
-            exception_mask_t curMasks[kMaxExcPorts];
-            mach_port_t curPorts[kMaxExcPorts];
-            exception_behavior_t curBehaviors[kMaxExcPorts];
-            thread_state_flavor_t curFlavors[kMaxExcPorts];
-            mach_msg_type_number_t curCount = kMaxExcPorts;
-            bool stillOurs = false;
-            if (task_get_exception_ports(task_, savedMasks_[i], curMasks, &curCount, curPorts,
-                                         curBehaviors, curFlavors) == KERN_SUCCESS) {
-                for (mach_msg_type_number_t j = 0; j < curCount; ++j) {
-                    if (curPorts[j] == exceptionPort_) {
-                        stillOurs = true;
-                        break;
-                    }
-                }
-            }
-            if (stillOurs) {
-                task_set_exception_ports(task_, savedMasks_[i], savedPorts_[i], savedBehaviors_[i],
-                                         savedFlavors_[i]);
+            kern_return_t kr = task_set_exception_ports(
+                task_, savedMasks_[i], savedPorts_[i], savedBehaviors_[i], savedFlavors_[i]);
+            if (kr != KERN_SUCCESS) {
+                fprintf(stdout, "MachExc: task_set_exception_ports restore failed (0x%x: %s)\n", kr,
+                        mach_error_string(kr));
+                break;  // bail on first error, matching debugserver
             }
         }
         haveSaved_ = false;
