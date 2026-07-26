@@ -14,18 +14,21 @@
 void* init_library(SymbolList const* a1, uint64_t stack_cookie, ThreadContextOffsets const* a3) {
     printf("RosettaRuntimex87 built %s - Rosetta Version 0x%llx\n", __DATE__ " " __TIME__, (unsigned long long)kImports.version);
 
-    // The FCOS fast path (runtime_entry.S _stub_fcos_fast) addresses the
-    // X87State at a baked-in x18+0xA0.  If a Rosetta update ever moves it,
-    // route FCOS back to the classic stub (rewrite_runtime_routine_offsets
-    // reads this flag when it builds the offset table, which happens after
-    // library init) and say so loudly — a silently wrong offset would corrupt
-    // guest floats.
+    // The trig fast paths (runtime_entry.S _stub_{fcos,fsin,fsincos,fptan}_fast)
+    // address the X87State at a baked-in x18+0xA0.  If a Rosetta update ever
+    // moves it, route them all back to the classic stubs
+    // (rewrite_runtime_routine_offsets reads these flags when it builds the
+    // offset table, which happens after library init) and say so loudly — a
+    // silently wrong offset would corrupt guest floats.
     if (a3 && a3->x87_state_offset != 0xA0) {
         printf(
             "RosettaRuntimex87: WARNING x87_state_offset is 0x%x, expected 0xA0 — "
-            "disabling the FCOS fast path\n",
+            "disabling the trig fast paths\n",
             a3->x87_state_offset);
         kConfig.disable_fcos_fast = 1;
+        kConfig.disable_fsin_fast = 1;
+        kConfig.disable_fsincos_fast = 1;
+        kConfig.disable_fptan_fast = 1;
     }
 
     uintptr_t runtime_library_base =

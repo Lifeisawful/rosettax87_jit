@@ -54,6 +54,7 @@ ALL_BENCHMARKS=(
     bench_addr_fold
     bench_f32
     bench_fcos
+    bench_trig
     bench_interleaved_mov
     bench_const_promote
 )

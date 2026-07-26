@@ -108,6 +108,9 @@ struct RosettaConfig {
     uint8_t  bridge_carry;           // ROSETTA_X87_BRIDGE_CARRY=1 — carry base-address-cache + RC GPRs across bridged gaps (implies RUN_BRIDGE; opt-in)
     uint8_t  runtime_keepalive;      // ROSETTA_X87_RUNTIME_KEEPALIVE=1 — keep the pinned cache alive across runtime-routine transcendentals (fsin/fcos/…; opt-in)
     uint8_t  disable_fcos_fast;      // ROSETTA_X87_DISABLE_FCOS_FAST=1 — route FCOS through the classic prologue/vtable stub instead of the in-blob fast path
+    uint8_t  disable_fsin_fast;      // ROSETTA_X87_DISABLE_FSIN_FAST=1 — same for FSIN
+    uint8_t  disable_fsincos_fast;   // ROSETTA_X87_DISABLE_FSINCOS_FAST=1 — same for FSINCOS
+    uint8_t  disable_fptan_fast;     // ROSETTA_X87_DISABLE_FPTAN_FAST=1 — same for FPTAN
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

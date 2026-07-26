@@ -177,11 +177,17 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_RUNTIME_KEEPALIVE"))
         cfg.runtime_keepalive = (*v == '1') ? 1 : 0;
 
-    // Fall back to the classic prologue/vtable/C++ FCOS stub instead of the
-    // in-blob assembly fast path (runtime_entry.S _stub_fcos_fast). Bisection
-    // lever; the fast path is on by default.
+    // Fall back to the classic prologue/vtable/C++ stub instead of the
+    // in-blob assembly fast path (runtime_entry.S _stub_<op>_fast). Bisection
+    // levers; the fast paths are on by default.
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FCOS_FAST"))
         cfg.disable_fcos_fast = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FSIN_FAST"))
+        cfg.disable_fsin_fast = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FSINCOS_FAST"))
+        cfg.disable_fsincos_fast = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FPTAN_FAST"))
+        cfg.disable_fptan_fast = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')

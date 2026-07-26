@@ -87,6 +87,7 @@ ALL_TESTS=(
     test_addr32
     test_keepalive
     test_fcos
+    test_trig
 )
 
 RED='\033[0;31m'

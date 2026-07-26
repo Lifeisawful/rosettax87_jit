@@ -51,11 +51,14 @@ extern char stub_fcom_f64[];
 extern char stub_fcom_ST[];
 extern char stub_fcomi[];
 extern char stub_fcos[];
-// FCOS is routed by offset, not by patching: the table entry points straight at
-// the in-blob fast path, or at the classic prologue+tail body when
-// ROSETTA_X87_DISABLE_FCOS_FAST=1 (see rewrite_runtime_routine_offsets).
+// Trig ops are routed by offset, not by patching: each table entry points
+// straight at the in-blob fast path, or at the op's classic prologue+tail
+// slot when its ROSETTA_X87_DISABLE_*_FAST flag is set (see
+// rewrite_runtime_routine_offsets).
 extern char stub_fcos_fast[];
-extern char stub_fcos_slow[];
+extern char stub_fsin_fast[];
+extern char stub_fsincos_fast[];
+extern char stub_fptan_fast[];
 extern char stub_fdecstp[];
 extern char stub_fdiv_f32[];
 extern char stub_fdiv_f64[];
@@ -269,18 +272,24 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
         offsets[i] = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(kStubs[i]) - base);
     }
 
-    // FCOS fast/classic selection happens HERE, not by patching the blob: every
-    // BL fixup resolves through this table, so pointing the entry at the wanted
-    // body routes all call sites.  Enabled (default) targets _stub_fcos_fast
-    // directly — one branch fewer than going through the slot trampoline.  The
-    // slot itself keeps a `b _stub_fcos_fast` so its reference offset stays a
-    // valid alias either way.
-    if (kRuntimeRoutine_fcos < n) {
-        char* const fcos_body = kConfig.disable_fcos_fast ? stub_fcos_slow : stub_fcos_fast;
-        offsets[kRuntimeRoutine_fcos] =
-            static_cast<intptr_t>(reinterpret_cast<uintptr_t>(fcos_body) - base);
-    }
+    // Trig fast/classic selection happens HERE, not by patching the blob: every
+    // BL fixup resolves through this table, so pointing an entry at the wanted
+    // body routes all call sites.  Enabled (default) targets the in-blob fast
+    // path directly; disabled targets the op's untouched classic slot, which
+    // is also every fast path's bail-out target.
+    auto route = [&](int idx, char* fast, uint8_t disabled) {
+        if (idx < n && !disabled)
+            offsets[idx] = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(fast) - base);
+    };
+    route(kRuntimeRoutine_fcos, stub_fcos_fast, kConfig.disable_fcos_fast);
+    route(kRuntimeRoutine_fsin, stub_fsin_fast, kConfig.disable_fsin_fast);
+    route(kRuntimeRoutine_fsincos, stub_fsincos_fast, kConfig.disable_fsincos_fast);
+    route(kRuntimeRoutine_fptan, stub_fptan_fast, kConfig.disable_fptan_fast);
 
-    CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs (fcos=%s)",
-             n, count, kConfig.disable_fcos_fast ? "classic" : "fast");
+    CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
+             "(fcos=%s fsin=%s fsincos=%s fptan=%s)",
+             n, count, kConfig.disable_fcos_fast ? "classic" : "fast",
+             kConfig.disable_fsin_fast ? "classic" : "fast",
+             kConfig.disable_fsincos_fast ? "classic" : "fast",
+             kConfig.disable_fptan_fast ? "classic" : "fast");
 }
