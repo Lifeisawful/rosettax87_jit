@@ -36,6 +36,7 @@ add_executable(libRuntimeRosettax87
     src/RuntimeConfig.cpp
     src/RuntimeLibrary.cpp
     src/TranslationCacheAbi.cpp
+    src/Library.cpp
     src/RuntimeRoutineOffsets.cpp
     src/runtime_entry.S
     src/runtime_stubs.cpp

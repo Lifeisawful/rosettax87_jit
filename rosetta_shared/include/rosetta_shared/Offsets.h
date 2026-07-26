@@ -20,6 +20,7 @@ struct Offsets {
     uint64_t allocate_chunk_rva;   // ExecutableHeap::allocate_chunk, offset within the runtime image
     uint64_t trace_write_mapping_record_rva;  // trace_write_mapping_record, offset within the
                                               // runtime image
+    uint64_t bind_library_stubs_rva;  // bind_library_stubs, offset within the runtime image
 };
 
-static_assert(sizeof(Offsets) == 0x58, "Invalid size for Offsets");
+static_assert(sizeof(Offsets) == 0x60, "Invalid size for Offsets");

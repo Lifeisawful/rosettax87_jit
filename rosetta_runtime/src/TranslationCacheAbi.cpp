@@ -115,9 +115,11 @@ struct ExitRegion {
     AbiKind kind;
 };
 
-}  // namespace
-
-void TranslationCacheAbi::abi_info_for_runtime_routines_address(AbiInfo* result, uintptr_t o) {
+// Replacement for abi_info_for_runtime_routines_address (0xB230).  Takes an
+// offset into our blob rather than a rebased file address — the rebasing at
+// 0xB88C is exactly what we are removing.  File-local: only classify_arm_pc
+// (below) calls it.
+void abi_info_for_runtime_routines_address(AbiInfo* result, uintptr_t o) {
     // Mirrors 0xB230's ladder, but keyed on offsets into OUR blob.  Ordered by
     // address, matching the reference's descending if-chain.
 
@@ -219,8 +221,11 @@ void TranslationCacheAbi::abi_info_for_runtime_routines_address(AbiInfo* result,
         (o >= off(syscall_post_svc) && o < off(syscall_sigreturn_case)) ? 1 : 0;
 }
 
-void TranslationCacheAbi::classify_arm_pc(AbiInfo* result, uint32_t thread_port,
-                                          uintptr_t arm_pc) {
+// Replacement for classify_arm_pc (0xB6FC).  Classifies two regions itself — the
+// mapped runtime_entry page (found via arm_tree, kind RuntimeRoutines or
+// InvalidRuntimeRoutines) and our own library image — and forwards everything
+// else to the original.  File-local: installed by hook, never called by name.
+void classify_arm_pc(AbiInfo* result, uint32_t thread_port, uintptr_t arm_pc) {
     // Checked first, before taking any lock: this is a two-compare range test,
     // and our own library image is where the X87 handlers live — the hottest
     // place for a signal to land after a stub has dispatched.  The two regions
@@ -300,8 +305,10 @@ void TranslationCacheAbi::classify_arm_pc(AbiInfo* result, uint32_t thread_port,
     g_original_classify_arm_pc(result, thread_port, arm_pc);
 }
 
-void TranslationCacheAbi::init(uintptr_t classify_arm_pc_addr, uintptr_t rosettax87_base,
-                               size_t rosettax87_size) {
+}  // namespace
+
+void init_translation_cache_abi_hooks(uintptr_t classify_arm_pc_addr, uintptr_t rosettax87_base,
+                                      size_t rosettax87_size) {
     g_rosettax87_base = rosettax87_base;
     g_rosettax87_size = rosettax87_size;
 
@@ -310,6 +317,6 @@ void TranslationCacheAbi::init(uintptr_t classify_arm_pc_addr, uintptr_t rosetta
 
     g_original_classify_arm_pc = reinterpret_cast<classify_arm_pc_t>(classify_arm_pc_addr);
     hook_install(reinterpret_cast<void*>(g_original_classify_arm_pc),
-                 reinterpret_cast<void*>(&TranslationCacheAbi::classify_arm_pc),
+                 reinterpret_cast<void*>(&classify_arm_pc),
                  reinterpret_cast<void**>(&g_original_classify_arm_pc));
 }

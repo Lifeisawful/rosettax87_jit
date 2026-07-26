@@ -708,8 +708,19 @@ public:
         // entryPoint() is a link-time vmaddr; convert to the loaded address.
         uint64_t entryAddr = imageBase + (entryVmaddr - imagePreferredBase);
 
-        LOG("callImageEntry: entry vmaddr=0x%llx -> 0x%llx sp=0x%llx\n", entryVmaddr, entryAddr,
-            scratchStackTop);
+        // Hand _start the image's C++ static initializer list (__DATA,__mod_init_func):
+        //   X0 = loaded address of the section (imageBase + rebased sect->addr),
+        //   X1 = its size in bytes. If the image has no such section, pass 0/0 so
+        //   _start runs no initializers. sect->addr is a link-time vmaddr, rebased
+        //   the same way as entryPoint above.
+        uint64_t modInitAddr = 0, modInitSize = 0;
+        if (auto* modInit = image.getSection("__DATA", "__mod_init_func")) {
+            modInitAddr = imageBase + (modInit->addr - imagePreferredBase);
+            modInitSize = modInit->size;
+        }
+
+        LOG("callImageEntry: entry vmaddr=0x%llx -> 0x%llx sp=0x%llx mod_init=0x%llx size=0x%llx\n",
+            entryVmaddr, entryAddr, scratchStackTop, modInitAddr, modInitSize);
 
         arm_thread_state64_t saved;
         if (!copyThreadState(saved)) {
@@ -734,7 +745,10 @@ public:
         // instead. 16-byte aligned, as the AArch64 ABI requires.
         callState.__sp = scratchStackTop & ~0xFULL;
         callState.__fp = 0;
-        // _start takes no arguments and never returns, so LR is left as-is.
+        // _start's args: X0 = __mod_init_func base, X1 = its size (0/0 if absent).
+        callState.__x[0] = modInitAddr;
+        callState.__x[1] = modInitSize;
+        // _start never returns, so LR is left as-is.
 
         if (!restoreThreadState(callState)) {
             fprintf(stderr, "callImageEntry: failed to set call state\n");
@@ -911,14 +925,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     LOG("Found rosetta runtime offsets successfully!\n");
-    LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
+    LOG("offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
         "offset_classify_arm_pc=%llx offset_sys_csrctl=%llx "
         "offset_runtime_routines_for_address=%llx offset_allocate_chunk=%llx "
-        "offset_trace_write_mapping_record=%llx\n",
-        offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_,
+        "offset_trace_write_mapping_record=%llx offset_bind_library_stubs=%llx\n",
+        offsetFinder.offsetSvcCallEntry_,
         offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_,
         offsetFinder.offsetSysCsrctl_, offsetFinder.offsetRuntimeRoutinesForAddress_,
-        offsetFinder.offsetAllocateChunk_, offsetFinder.offsetTraceWriteMappingRecord_);
+        offsetFinder.offsetAllocateChunk_, offsetFinder.offsetTraceWriteMappingRecord_,
+        offsetFinder.offsetBindLibraryStubs_);
 
     if (!offsetFinder.scanLibRosettaRuntime()) {
         fprintf(stderr, "Fatal: failed to scan libRosettaRuntime for offsets.\n");
@@ -1255,6 +1270,7 @@ int main(int argc, char* argv[]) {
         .runtime_routines_for_address_rva = offsetFinder.offsetRuntimeRoutinesForAddress_,
         .allocate_chunk_rva = offsetFinder.offsetAllocateChunk_,
         .trace_write_mapping_record_rva = offsetFinder.offsetTraceWriteMappingRecord_,
+        .bind_library_stubs_rva = offsetFinder.offsetBindLibraryStubs_,
     };
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));
@@ -1266,97 +1282,26 @@ int main(int argc, char* argv[]) {
         dbg.writeMemory(machoConfigAddress, &runtimeConfig, sizeof(runtimeConfig));
     }
 
+    // Seed kImports.version (Exports field 0) from libRosettaRuntime's on-disk
+    // exports.  The export *tables* in kImports are filled in-process by our
+    // bind_library_stubs hook, but version is never passed to that routine, so the
+    // loader supplies it here.  It gates rosetta_core_runtime_version() opcode
+    // compatibility — leaving it 0 mistranslates on 26.4+.
+    if (auto* importsSection = machoLoader.getSection("__DATA", "imports")) {
+        uint64_t machoImportsAddress = machoBase + importsSection->addr;  // &kImports
+        dbg.writeMemory(machoImportsAddress, &offsetFinder.runtimeVersion_, sizeof(uint64_t));
+    }
+
     // Run our image's entry point (_start) on the stopped thread, before the
     // runtime's main() gets to run.  __DATA,offsets and __DATA,config are both
-    // populated above, which is everything _start's early init depends on —
-    // it must NOT touch kImports, which is still zeroed until the export swap
-    // below.
+    // populated above, which is everything _start's early init depends on.
+    // kImports.version is seeded above; its export tables stay zeroed here and are
+    // filled later, in-process, by the bind_library_stubs hook.
     if (!dbg.callImageEntry(machoLoader, machoBase, machoPreferredBase, scratchStackTop)) {
         fprintf(stderr, "Fatal: failed to run libRuntimeRosettax87 _start\n");
         return 1;
     }
 
-    // ── Late phase ────────────────────────────────────────────────────────────
-    //
-    // Resume and run until exports_fetch.  Only now does libRosettaRuntime exist
-    // (main() maps it at 0x12708), so only now can we read its Exports from X19
-    // and splice ours in.
-    dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-    dbg.continueExecution();
-    // Read X19 (Exports struct addr) from the thread that hit the BRK, then
-    // restore the original instruction. The process stays stopped (we hold the
-    // breakpoint exception reply) through the stub install below until detach.
-    auto rosettaRuntimeExportsAddress =
-        dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
-    dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-    LOG("Rosetta runtime exports: 0x%llx\n", rosettaRuntimeExportsAddress);
-
-    Exports exports;
-    dbg.readMemory(rosettaRuntimeExportsAddress, &exports, sizeof(exports));
-    LOG("Rosetta version: %llx\n", exports.version);
-
-    // fix up Exports segment of mapped macho
-    uint64_t machoExportsAddress = machoBase + machoLoader.getSection("__DATA", "exports")->addr;
-    Exports machoExports;
-
-    dbg.readMemory(machoExportsAddress, &machoExports, sizeof(machoExports));
-    // x87Exports and runtimeExports are already correct absolute addresses
-    // after chain fixup rebasing — do NOT add machoBase again.
-
-    std::vector<Export> x87Exports(machoExports.x87ExportCount);
-    std::vector<Export> runtimeExports(machoExports.runtimeExportCount);
-
-    dbg.readMemory(machoExports.x87Exports, x87Exports.data(), x87Exports.size() * sizeof(Export));
-    dbg.readMemory(machoExports.runtimeExports, runtimeExports.data(),
-                   runtimeExports.size() * sizeof(Export));
-
-    // address and name fields are already correct absolute addresses
-    // after chain fixup rebasing — do NOT add machoBase again.
-
-    dbg.writeMemory(machoExports.x87Exports, x87Exports.data(), x87Exports.size() * sizeof(Export));
-    dbg.writeMemory(machoExports.runtimeExports, runtimeExports.data(),
-                    runtimeExports.size() * sizeof(Export));
-
-    LOG("machoExports_address: 0x%llx\n", machoExportsAddress);
-    LOG("machoExports.x87Exports: 0x%llx\n", machoExports.x87Exports);
-    LOG("machoExports.runtimeExports: 0x%llx\n", machoExports.runtimeExports);
-
-    // match the running system's Rosetta version and export count
-    auto libRosettaRuntimeExportsAddress =
-        dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
-    Exports libRosettaRuntimeExports;
-    dbg.readMemory(libRosettaRuntimeExportsAddress, &libRosettaRuntimeExports,
-                   sizeof(libRosettaRuntimeExports));
-
-    machoExports.version = libRosettaRuntimeExports.version;
-    if (libRosettaRuntimeExports.x87ExportCount < machoExports.x87ExportCount) {
-        LOG("Capping x87ExportCount from %llu to %llu to match system\n",
-            machoExports.x87ExportCount, libRosettaRuntimeExports.x87ExportCount);
-        machoExports.x87ExportCount = libRosettaRuntimeExports.x87ExportCount;
-    }
-
-    dbg.writeMemory(machoExportsAddress, &machoExports, sizeof(machoExports));
-
-    // look up imports section of mapped macho
-    auto machoImportsAddress = machoBase + machoLoader.getSection("__DATA", "imports")->addr;
-    LOG("machoImportsAddress: 0x%llx\n", machoImportsAddress);
-
-    LOG("libRosettaRuntimeExportsAddress: 0x%llx\n", libRosettaRuntimeExportsAddress);
-
-    LOG("libRosettaRuntimeExports.version = 0x%llx\n", libRosettaRuntimeExports.version);
-    LOG("libRosettaRuntimeExports.x87Exports = 0x%llx\n", libRosettaRuntimeExports.x87Exports);
-    LOG("libRosettaRuntimeExports.x87Export_count = 0x%llx\n",
-        libRosettaRuntimeExports.x87ExportCount);
-    LOG("libRosettaRuntimeExports.runtimeExports = 0x%llx\n",
-        libRosettaRuntimeExports.runtimeExports);
-    LOG("libRosettaRuntimeExports.runtimeExportCount = 0x%llx\n",
-        libRosettaRuntimeExports.runtimeExportCount);
-
-    dbg.writeMemory(machoImportsAddress, &libRosettaRuntimeExports,
-                    sizeof(libRosettaRuntimeExports));
-
-    // replace the exports in X19 register with the address of the mapped macho
-    dbg.setRegister(MuhDebugger::Register::X19, machoExportsAddress);
     dbg.detach();
 
     // Wait for the parent (wine) to exit, and — for its whole lifetime — lift any

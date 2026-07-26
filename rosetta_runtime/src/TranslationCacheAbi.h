@@ -44,26 +44,17 @@
 // So we classify pcs inside our own region against our own labels, and delegate
 // everything else — JIT'd guest code, the translator image, library ranges — to
 // the original.
-class TranslationCacheAbi {
-   public:
-    // Installs the hook over the reference classify_arm_pc and records the bounds
-    // of our own loaded library image.  Called from init_library.
-    //
-    // No bounds are needed for the *mapped stub page*: that region is found by
-    // walking ExecutableHeap::arm_tree, so additional heap chunks (each with
-    // their own RuntimeRoutines fragment) are handled automatically.  The
-    // rosettax87_* pair describes the separate, dyld-loaded library image.
-    static void init(uintptr_t classify_arm_pc_addr, uintptr_t rosettax87_base,
-                     size_t rosettax87_size);
+//
+// Only the init entry point is public.  The classify_arm_pc replacement and its
+// abi_info_for_runtime_routines_address helper are file-local (anonymous
+// namespace) in TranslationCacheAbi.cpp — nothing outside the hook calls them.
 
-    // Replacement for classify_arm_pc (0xB6FC).  Classifies two regions itself —
-    // the mapped runtime_entry page (found via arm_tree, kind RuntimeRoutines or
-    // InvalidRuntimeRoutines) and our own library image — and forwards everything
-    // else to the original.
-    static void classify_arm_pc(AbiInfo* result, uint32_t thread_port, uintptr_t arm_pc);
-
-    // Replacement for abi_info_for_runtime_routines_address (0xB230).  Takes an
-    // offset into our blob rather than a rebased file address — the rebasing at
-    // 0xB88C is exactly what we are removing.
-    static void abi_info_for_runtime_routines_address(AbiInfo* result, uintptr_t offset);
-};
+// Installs the hook over the reference classify_arm_pc and records the bounds of
+// our own loaded library image.  Called from runtime_early_init.
+//
+// No bounds are needed for the *mapped stub page*: that region is found by
+// walking ExecutableHeap::arm_tree, so additional heap chunks (each with their
+// own RuntimeRoutines fragment) are handled automatically.  The rosettax87_* pair
+// describes the separate, dyld-loaded library image.
+void init_translation_cache_abi_hooks(uintptr_t classify_arm_pc_addr, uintptr_t rosettax87_base,
+                                      size_t rosettax87_size);

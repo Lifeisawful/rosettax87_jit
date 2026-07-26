@@ -1,6 +1,46 @@
 #include <cstdarg>
+#include <cstdint>
 
 #include "RuntimeLibrary.h"
+
+#include "RuntimeOffsets.h"
+#include "RuntimeConfig.h"
+
+#include "ExecutableHeap.h"
+#include "TranslationCacheAbi.h"
+#include "Library.h"
+
+#include "rosetta_core/CoreConfig.h"
+#include "rosetta_core/RuntimeLibC.h"
+
+static void runtime_early_init() {
+    rosetta_set_config(&kConfig);
+
+    uintptr_t classify_arm_pc_ptr = kOffsets.runtime_base + kOffsets.classify_arm_pc_rva;
+    // Both live in the runtime image (/usr/libexec/rosetta/runtime), not in
+    // libRosettaRuntime — same base as classify_arm_pc above.
+    uintptr_t runtime_routines_for_address_ptr =
+        kOffsets.runtime_base + kOffsets.runtime_routines_for_address_rva;
+    uintptr_t allocate_chunk_ptr = kOffsets.runtime_base + kOffsets.allocate_chunk_rva;
+    // Guard the zero case explicitly: a 0 rva would otherwise yield runtime_base,
+    // i.e. a valid-looking but wrong function pointer.
+    uintptr_t trace_write_mapping_record_ptr =
+        kOffsets.trace_write_mapping_record_rva
+            ? kOffsets.runtime_base + kOffsets.trace_write_mapping_record_rva
+            : 0;
+
+    init_translation_cache_abi_hooks(classify_arm_pc_ptr, kOffsets.rosettax87_base,
+                                     kOffsets.rosettax87_size);
+
+    init_executable_heap_hooks(allocate_chunk_ptr, runtime_routines_for_address_ptr,
+                               trace_write_mapping_record_ptr);
+
+    uintptr_t bind_library_stubs_ptr =
+        kOffsets.bind_library_stubs_rva
+            ? kOffsets.runtime_base + kOffsets.bind_library_stubs_rva
+            : 0;
+    init_bind_library_stubs_hook(bind_library_stubs_ptr);
+}
 
 // Image entry point (-Wl,-e,_start), recorded in LC_UNIXTHREAD.
 //
@@ -27,9 +67,19 @@
 // process ever enters _start, so the trap is unreachable in every other path. If
 // that ever changes, this must go back to a normal `ret` with a loader-planted
 // breakpoint — an uncaught BRK here would kill the tracee with SIGTRAP.
+using mod_init_func_t = void (*)();
+
 extern "C"
     __attribute__((used, visibility("default"), section("__TEXT,__text"), noinline, retain)) void
-    start() {
+    start(mod_init_func_t* mod_inits, uint64_t mod_inits_size) {
+    if (mod_inits && mod_inits_size) {
+        for (auto i = 0; i < mod_inits_size / sizeof(mod_init_func_t); i++) {
+            if (const auto mod_init = mod_inits[i]) {
+                mod_init();
+            }
+        }
+    }
+
     runtime_early_init();
 
     // Hand control back to the loader. `brk #0` matches the loader's
@@ -44,9 +94,9 @@ inline namespace __1 {
 // std::optional / std::function from rosetta_core_runtime. Newer libc++
 // (macos-26 CI) routes these through __libcpp_verbose_abort; -nostdlib does
 // not provide it. Match its signature and mangling exactly.
-[[noreturn]] __attribute__((used, visibility("default")))
-void __libcpp_verbose_abort(const char* /*fmt*/, ...) {
+[[noreturn]] __attribute__((used, visibility("default"))) void __libcpp_verbose_abort(
+    const char* /*fmt*/, ...) {
     __builtin_trap();
 }
-} // namespace __1
-} // namespace std
+}  // namespace __1
+}  // namespace std

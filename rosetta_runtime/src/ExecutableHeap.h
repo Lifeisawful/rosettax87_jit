@@ -166,16 +166,16 @@ extern ExecutableHeap* g_executable_heap;
 // Installs our replacements over the reference ExecutableHeap::allocate_chunk and
 // ExecutableHeap::runtime_routines_for_address.  Both addresses are absolute
 // (kOffsets.runtime_base + the respective rva); a zero address skips that hook.
-// Called from init_library, before the original runs — allocate_chunk is invoked
+// Called from runtime_early_init, before the original runs — allocate_chunk is invoked
 // from the reference `main`, which has not reached the heap setup yet at that
 // point, so the hook is in place for the very first chunk.
 // trace_write_mapping_record_addr is not hooked — it is the reference function,
 // called directly from our map_runtime_routines to emit the type-5
 // (RuntimeRoutinesMapped) trace record that our replacement would otherwise skip.
 // Pass 0 to disable that record.
-void executable_heap_init(uintptr_t allocate_chunk_addr,
-                          uintptr_t runtime_routines_for_address_addr,
-                          uintptr_t trace_write_mapping_record_addr);
+void init_executable_heap_hooks(uintptr_t allocate_chunk_addr,
+                                uintptr_t runtime_routines_for_address_addr,
+                                uintptr_t trace_write_mapping_record_addr);
 
 void map_runtime_routines(uintptr_t dest, uint32_t task_port);
 CodeFragmentMetadata* register_code_fragment(uint32_t lock_owner, uint64_t arm_base,

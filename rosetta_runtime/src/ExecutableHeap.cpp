@@ -190,7 +190,7 @@ FreeBlock* ExecutableHeap::allocate_chunk(uint32_t lock_owner) {
     uintptr_t jit_base = heap_base + runtime_routines_size();
 
     // Registering the fragment is also what makes this region visible to
-    // TranslationCacheAbi::classify_arm_pc — it finds the region by walking
+    // classify_arm_pc (TranslationCacheAbi.cpp) — it finds the region by walking
     // arm_tree for kind == RuntimeRoutines, so no bounds need publishing here.
     register_code_fragment(lock_owner, heap_base, runtime_routines_size(), CodeFragmentKind::RuntimeRoutines);
 
@@ -285,9 +285,9 @@ void* hook_runtime_routines_for_address(ExecutableHeap* heap, uint32_t lock_owne
 
 }  // namespace
 
-void executable_heap_init(uintptr_t allocate_chunk_addr,
-                          uintptr_t runtime_routines_for_address_addr,
-                          uintptr_t trace_write_mapping_record_addr) {
+void init_executable_heap_hooks(uintptr_t allocate_chunk_addr,
+                                uintptr_t runtime_routines_for_address_addr,
+                                uintptr_t trace_write_mapping_record_addr) {
     // Not hooked — called directly from our map_runtime_routines.  The reference
     // function stays in place and we just borrow it to write the trace record.
     g_trace_write_mapping_record =

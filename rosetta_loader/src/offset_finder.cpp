@@ -16,12 +16,6 @@ auto OffsetFinder::scanRuntime() -> bool {
         return false;
     }
 
-    auto findExportsFetch = [&]() -> std::optional<uint64_t> {
-        // LDR X2, [X19,#8]
-        // LDR W3, [X19,#0x10]
-        return findPattern(loader.buffer_, "62 06 40 F9 63 12 40 B9", "exportsFetch");
-    };
-
     auto findSvcCall = [&]() -> std::optional<uint64_t> {
         // MOV X16, #197; SVC 0x80; CSET X1, CS; RET
         return findPattern(loader.buffer_, "B0 18 80 D2 01 10 00 D4 E1 37 9F 9A C0 03 5F D6",
@@ -93,7 +87,19 @@ auto OffsetFinder::scanRuntime() -> bool {
         return aarch64::decodeBl(blInsn, blOffset);
     };
 
-    auto exportsFetch = findExportsFetch();
+    auto findBindLibraryStubs = [&]() -> std::optional<uint64_t> {
+        // MOV W1, #3
+        // BL bind_library_stubs  <-- we decode the BL (1 insn / 4 after match)
+        // The MOV W1, #3 alone is not unique; anchor on the following BL (high
+        // byte 94) to pin the single call site.
+        auto match = findPattern(loader.buffer_, "61 00 80 52 ? ? ? 94", "bindLibraryStubs");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 4;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
     auto svcCall = findSvcCall();
     auto disableAot = findDisableAot();
     auto classifyArmPc = findClassifyArmPc();
@@ -101,12 +107,13 @@ auto OffsetFinder::scanRuntime() -> bool {
     auto runtimeRoutinesForAddress = findRuntimeRoutinesForAddress();
     auto allocateChunk = findAllocateChunk();
     auto traceWriteMappingRecord = findTraceWriteMappingRecord();
+    auto bindLibraryStubs = findBindLibraryStubs();
 
-    if (!exportsFetch || !svcCall || !disableAot || !classifyArmPc || !sysCsrctl ||
-        !runtimeRoutinesForAddress || !allocateChunk || !traceWriteMappingRecord)
+    if (!svcCall || !disableAot || !classifyArmPc || !sysCsrctl ||
+        !runtimeRoutinesForAddress || !allocateChunk || !traceWriteMappingRecord ||
+        !bindLibraryStubs)
         return false;
 
-    offsetExportsFetch_ = *exportsFetch;
     offsetSvcCallEntry_ = *svcCall;
     offsetSvcCallRet_ = *svcCall + 0xC;
     offsetDisableAot_ = *disableAot;
@@ -115,6 +122,7 @@ auto OffsetFinder::scanRuntime() -> bool {
     offsetRuntimeRoutinesForAddress_ = *runtimeRoutinesForAddress;
     offsetAllocateChunk_ = *allocateChunk;
     offsetTraceWriteMappingRecord_ = *traceWriteMappingRecord;
+    offsetBindLibraryStubs_ = *bindLibraryStubs;
 
     return true;
 }
@@ -157,6 +165,9 @@ auto OffsetFinder::scanLibRosettaRuntime() -> bool {
             return std::nullopt;
         }
         auto* exports = reinterpret_cast<Exports*>(loader.buffer_.data() + exportsSection->offset);
+        // Capture the runtime's version (Exports field 0) while we have the
+        // section parsed — it feeds our kImports.version (see main.cpp).
+        runtimeVersion_ = exports->version;
         auto x87ExportsRva = exports->x87Exports & 0xFFFFFFFF;
         return (*reinterpret_cast<uint64_t*>(loader.buffer_.data() + x87ExportsRva)) & 0xFFFFFFFF;
     };

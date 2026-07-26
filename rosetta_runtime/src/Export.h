@@ -133,5 +133,6 @@ extern runtime_wide_udiv_64_t orig_runtime_wide_udiv_64;
 extern runtime_wide_sdiv_64_t orig_runtime_wide_sdiv_64;
 
 extern Exports kImports;
+extern Exports kExports;
 
 extern auto exportsInit() -> void;

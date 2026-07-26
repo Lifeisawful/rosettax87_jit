@@ -20,6 +20,30 @@
 #define PATCH_SIZE 16u
 #define AARCH64_PAGE_SIZE 16384u
 
+// A Rosetta-translated process has 4 KB VM granularity, not the 16 KB of native
+// arm64 — `vmmap` on the guest shows independent 4 KB regions.  So rounding a
+// patch target down to 16 KB and vm_protect'ing 16 KB spans up to FOUR unrelated
+// VM regions and silently re-protects the three neighbours.
+//
+// That is exactly how `make_page_executable(tramp)` used to corrupt the
+// executable heap: mmap hands back 4 KB-aligned (not 16 KB-aligned) trampolines,
+// so the 16 KB blast radius reached backwards into the preceding 4 KB pages —
+// which is where ExecutableHeap's SlabAllocator keeps its 4 KB metadata pages
+// (kSlabPageSize == 0x1000).  The Chunk and FreeBlock that allocate_chunk puts
+// on the first slab page became r-x, and the next JIT allocation that split a
+// free block took a write fault on `node->base_address += size` inside
+// BestFitAllocator::allocate_from_node.
+//
+// Always protect exactly the granule-aligned range covering [addr, addr + len).
+#define VM_GRANULE 4096u
+
+static kern_return_t protect_covering(const void* addr, size_t len, vm_prot_t prot) {
+    const vm_address_t a = (vm_address_t)addr;
+    const vm_address_t start = a & ~((vm_address_t)VM_GRANULE - 1);
+    const vm_address_t end = (a + len + VM_GRANULE - 1) & ~((vm_address_t)VM_GRANULE - 1);
+    return vm_protect(mach_task_self(), start, end - start, FALSE, prot);
+}
+
 static void write_abs_jump(void* dst, const void* target) {
     uint32_t ldr_x9 = 0x58000049u;  // LDR X9, #8
     uint32_t br_x9 = 0xD61F0120u;   // BR  X9
@@ -35,9 +59,9 @@ static void flush_cache(void* addr, size_t len) {
 }
 
 int make_page_executable(void* addr) {
-    vm_address_t page = (vm_address_t)addr & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
-    auto kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                         VM_PROT_READ | VM_PROT_EXECUTE);
+    // One granule only: callers pass an mmap base whose live contents are a few
+    // dozen bytes, and widening past that is what reached into foreign pages.
+    auto kr = protect_covering(addr, 1, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("make_page_executable: vm_protect failed");
@@ -93,10 +117,8 @@ int hook_install(void* target, void* hook_fn, void** trampoline) {
     // ------------------------------------------------------------------
     // 3. Make the target page writable (COW) and patch it.
     // ------------------------------------------------------------------
-    vm_address_t page = (vm_address_t)target & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
-
-    kern_return_t kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kern_return_t kr =
+        protect_covering(target, PATCH_SIZE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         munmap(tramp, AARCH64_PAGE_SIZE);
         errno = EPERM;
@@ -106,8 +128,7 @@ int hook_install(void* target, void* hook_fn, void** trampoline) {
 
     write_abs_jump(target, hook_fn);
 
-    kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
+    kr = protect_covering(target, PATCH_SIZE, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         munmap(tramp, AARCH64_PAGE_SIZE);
         errno = EPERM;
@@ -154,9 +175,8 @@ int patch_movz_imm(void* addr, uint16_t new_imm) {
     insn = (insn & ~0x001FFFE0u) | ((uint32_t)new_imm << 5);
 
     // Make the page writable (COW).
-    vm_address_t page = (vm_address_t)addr & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kern_return_t kr =
+        protect_covering(addr, 4, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("patch_movz_imm: vm_protect (write) failed");
@@ -166,8 +186,7 @@ int patch_movz_imm(void* addr, uint16_t new_imm) {
     memcpy(addr, &insn, 4);
 
     // Restore execute permission.
-    kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
+    kr = protect_covering(addr, 4, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("patch_movz_imm: vm_protect (exec) failed");
@@ -195,15 +214,9 @@ int patch_nop(void* addr, unsigned int count) {
     const uint32_t nop = 0xD503201Fu;
     const size_t len = (size_t)count * 4u;
 
-    // Compute the page-aligned range covering [addr, addr + len).
-    vm_address_t first_page = (vm_address_t)addr & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
-    vm_address_t last_page =
-        ((vm_address_t)addr + len - 1) & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
-    vm_size_t region = (last_page - first_page) + AARCH64_PAGE_SIZE;
-
     // Make the target page(s) writable (COW).
-    kern_return_t kr = vm_protect(mach_task_self(), first_page, region, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kern_return_t kr =
+        protect_covering(addr, len, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("patch_nop: vm_protect (write) failed");
@@ -216,8 +229,7 @@ int patch_nop(void* addr, unsigned int count) {
     }
 
     // Restore execute permission.
-    kr = vm_protect(mach_task_self(), first_page, region, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
+    kr = protect_covering(addr, len, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("patch_nop: vm_protect (exec) failed");
@@ -244,9 +256,8 @@ int patch_ret(void* addr) {
     const uint32_t ret = 0xD65F03C0u;  // RET X30
 
     // Make the target page writable (COW).
-    vm_address_t page = (vm_address_t)addr & ~((vm_address_t)AARCH64_PAGE_SIZE - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kern_return_t kr =
+        protect_covering(addr, 4, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("patch_ret: vm_protect (write) failed");
@@ -256,8 +267,7 @@ int patch_ret(void* addr) {
     memcpy(addr, &ret, 4);
 
     // Restore execute permission.
-    kr = vm_protect(mach_task_self(), page, AARCH64_PAGE_SIZE, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
+    kr = protect_covering(addr, 4, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         errno = EPERM;
         CORE_LOG("patch_ret: vm_protect (exec) failed");
