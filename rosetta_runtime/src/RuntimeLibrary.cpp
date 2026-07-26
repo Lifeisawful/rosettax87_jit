@@ -16,8 +16,10 @@ void* init_library(SymbolList const* a1, uint64_t stack_cookie, ThreadContextOff
 
     // The FCOS fast path (runtime_entry.S _stub_fcos_fast) addresses the
     // X87State at a baked-in x18+0xA0.  If a Rosetta update ever moves it,
-    // fall back to the classic stub for chunks mapped from here on and say so
-    // loudly — a silently wrong offset would corrupt guest floats.
+    // route FCOS back to the classic stub (rewrite_runtime_routine_offsets
+    // reads this flag when it builds the offset table, which happens after
+    // library init) and say so loudly — a silently wrong offset would corrupt
+    // guest floats.
     if (a3 && a3->x87_state_offset != 0xA0) {
         printf(
             "RosettaRuntimex87: WARNING x87_state_offset is 0x%x, expected 0xA0 — "

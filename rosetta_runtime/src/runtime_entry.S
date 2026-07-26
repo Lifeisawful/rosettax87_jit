@@ -284,11 +284,13 @@ _stub_fchs:
     b    tail_fchs
 
 // FCOS is dispatched through an in-blob fast path (see _stub_fcos_fast at the
-// end of this section) instead of the prologue/vtable/C++ route.  The slot
-// keeps its historical 0x34-byte footprint so every following stub stays at
-// its reference offset; the nops are dead padding, never executed.
-// ExecutableHeap.cpp patches the first word to `b _stub_fcos_slow` when
-// ROSETTA_X87_DISABLE_FCOS_FAST=1.
+// end of this section) instead of the prologue/vtable/C++ route.  Routing is
+// done in rewrite_runtime_routine_offsets (RuntimeRoutineOffsets.cpp): the
+// kRuntimeRoutine_fcos table entry points directly at _stub_fcos_fast, or at
+// _stub_fcos_slow when ROSETTA_X87_DISABLE_FCOS_FAST=1, so BL fixups never
+// actually target this slot.  It keeps its historical 0x34-byte footprint so
+// every following stub stays at its reference offset, and the `b` keeps the
+// slot a valid alias of the default body; the nops are dead padding.
 .globl _stub_fcos
 _stub_fcos:
     b    _stub_fcos_fast

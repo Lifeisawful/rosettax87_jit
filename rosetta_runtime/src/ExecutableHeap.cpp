@@ -5,7 +5,6 @@
 #include <sys/mman.h>
 
 #include "MachIPC.h"
-#include "RuntimeConfig.h"
 #include "ThreadSelfRestrict.h"
 #include "rosetta_core/hook.h"
 
@@ -25,12 +24,6 @@ extern char stub_far_jmp[];
 // section in runtime_entry.S.
 extern char runtime_blob_start[];
 extern char runtime_blob_end[];
-
-// FCOS stub slot and its classic (prologue + vtable) fallback body.  When the
-// fast path is disabled, the slot's first word is patched from `b
-// _stub_fcos_fast` to `b _stub_fcos_slow` in the copied blob.
-extern char stub_fcos[];
-extern char stub_fcos_slow[];
 }
 
 ExecutableHeap* g_executable_heap = nullptr;
@@ -124,17 +117,8 @@ void map_runtime_routines(uintptr_t dest, uint32_t task_port) {
     static_assert(kRemapReplyRcvSize <= sizeof(__Request__mach_vm_remap_t),
                   "reply+trailer must fit in the shared request/reply buffer");
 
-    // ROSETTA_X87_DISABLE_FCOS_FAST: reroute the FCOS slot to the classic
-    // prologue/vtable body by rewriting its first word in the mapped blob.
-    // The remap path maps the dylib's own pages copy-on-write and stays R-X,
-    // so it cannot be patched — force the memmove fallback instead (that path
-    // is the standard fallback and equally well tested).
-    const bool patch_fcos_slow = kConfig.disable_fcos_fast != 0;
-
-    uint32_t ret = 1;
-    if (!patch_fcos_slow)
-        ret = mach_vm_remap_msg(task_port, &msg, 1, 0, sizeof(__Request__mach_vm_remap_t),
-                                 kRemapReplyRcvSize, kMachVmRemapMsgId, 0);
+    uint32_t ret = mach_vm_remap_msg(task_port, &msg, 1, 0, sizeof(__Request__mach_vm_remap_t),
+                                     kRemapReplyRcvSize, kMachVmRemapMsgId, 0);
 
     // The address actually traced.  On the remap path the kernel reports where it
     // placed the mapping, which the reference reads back out of the reply
@@ -158,15 +142,6 @@ void map_runtime_routines(uintptr_t dest, uint32_t task_port) {
     if (use_fallback) {
         thread_self_restrict_rwx_to_rw();
         memmove(reinterpret_cast<void*>(dest), stub_far_jmp, runtime_routines_size());
-        if (patch_fcos_slow) {
-            // `b _stub_fcos_slow` in place of `b _stub_fcos_fast`.  Both label
-            // deltas are intra-blob, so the link-time difference is also the
-            // in-copy difference.
-            auto* slot = reinterpret_cast<uint32_t*>(
-                dest + static_cast<uintptr_t>(stub_fcos - stub_far_jmp));
-            const intptr_t delta = stub_fcos_slow - stub_fcos;
-            *slot = 0x14000000u | (static_cast<uint32_t>(delta >> 2) & 0x03FFFFFFu);
-        }
         thread_self_restrict_rwx_to_rx();
 
         // Make the freshly written stubs visible to the instruction fetcher.
