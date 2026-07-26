@@ -283,10 +283,18 @@ _stub_fchs:
     STUB_PROLOGUE
     b    tail_fchs
 
+// FCOS is dispatched through an in-blob fast path (see _stub_fcos_fast at the
+// end of this section) instead of the prologue/vtable/C++ route.  The slot
+// keeps its historical 0x34-byte footprint so every following stub stays at
+// its reference offset; the nops are dead padding, never executed.
+// ExecutableHeap.cpp patches the first word to `b _stub_fcos_slow` when
+// ROSETTA_X87_DISABLE_FCOS_FAST=1.
 .globl _stub_fcos
 _stub_fcos:
-    STUB_PROLOGUE
-    b    tail_fcos
+    b    _stub_fcos_fast
+    .rept 12
+    nop
+    .endr
 
 .globl _stub_fdecstp
 _stub_fdecstp:
@@ -698,6 +706,263 @@ _stub_cpuid:
     ldr     x29, [x18, #0x158]
     ldrb    w22, [x18, #0x222]
     br      x29
+
+// =============================================================================
+// FCOS fast path
+//
+// Computes ST(0) = cos(ST(0)) entirely in the blob for |x| < 2^20*(pi/2),
+// skipping STUB_PROLOGUE, the vtable dispatch, x87_fcos (C++ +
+// SIMDGuardFullAndX0X7 + openlibm) and runtime_exitinst.  Ported from the
+// openlibm sources this runtime already ships (s_cos.h, k_cos.h, k_sin.h and
+// the medium branch of e_rem_pio2.h) — same constants, same operation order
+// for the exactness-critical cancellation steps.
+//
+// Fallback (_stub_fcos_slow = the historical stub body) handles:
+//   - |x| >= 2^20*(pi/2), Inf, NaN  (Payne-Hanek reduction stays in C++)
+//   - debug/single-step sessions    (flag byte at [x18, #0x1C8])
+// so behaviour there is bit-identical to before.
+//
+// Register contract (must match what translated code can rely on across a
+// kRuntimeRoutine BL — see OPT-KA / test_keepalive):
+//   clobbered:  x27, x29            (already clobbered by the classic path)
+//   preserved:  x0-x15, x17, x19-x26, x28, x30, sp, NZCV, FPCR, v0-v15
+//   q16-q23 are used as scratch but saved/restored on the native stack —
+//   stricter than the classic path, which clobbers v16-v31 outright.
+// NZCV is never written: all control flow is cbz/tbz/tbnz on integer values.
+//
+// X87State layout at x18+0xA0 (x87_state_offset, verified against the JIT's
+// own inline lowering: `add x22, x18, #0xa0` / `ldrh w23, [x18, #0xA2]`, and
+// guarded at init_library — see RuntimeLibrary.cpp):
+//   +0xA0 controlWord  +0xA2 statusWord  +0xA4 tagWord  +0xA8 st[8]
+//
+// Semantics reproduced = current x87_fcos (X87.cpp), NOT the Intel C2 rule:
+//   statusWord &= ~(C1|C2); ST(0) = cos(ST(0)) for all inputs; tag of the
+//   physical ST(0) slot -> kValid (00); TOP unchanged.
+// =============================================================================
+
+.globl _stub_fcos_fast
+_stub_fcos_fast:
+    // Debug/single-step: take the classic path so exitinst's callback runs.
+    ldrb w29, [x18, #0x1C8]
+    cbnz w29, _stub_fcos_slow
+    sub  sp, sp, #0x90
+    stp  x25, x26, [sp, #0x80]
+    ldrh w29, [x18, #0xA2]           // statusWord
+    ubfx w26, w29, #11, #3           // x26 = TOP
+    add  x25, x18, #0xA0             // X87State base
+    add  x25, x25, x26, lsl #3       // x25 = base + TOP*8 (ST(0) at [x25, #8])
+    ldr  x29, [x25, #8]              // ST(0) bits (integer side; no FP touched yet)
+    ubfx x27, x29, #32, #31          // x27 = high word & 0x7fffffff
+    // Eligible iff |x| < 2^20*(pi/2)  <=>  hi31 < 0x413921fb  (also excludes
+    // Inf/NaN).  Classify before any FP register is dirtied so the bail path
+    // enters the classic stub with pristine state.
+    mov  w29, #0x21fb
+    movk w29, #0x4139, lsl #16
+    sub  w29, w27, w29
+    tbz  w29, #31, Lfcos_bail
+    stp  q16, q17, [sp]
+    stp  q18, q19, [sp, #0x20]
+    stp  q20, q21, [sp, #0x40]
+    stp  q22, q23, [sp, #0x60]
+    ldr  d16, [x25, #8]              // x = ST(0)
+    // |x| ~< pi/4  <=>  hi31 <= 0x3fe921fb
+    mov  w29, #0x21fc
+    movk w29, #0x3fe9, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfcos_small
+
+    // -------------------------------------------------------------------------
+    // Medium argument reduction (e_rem_pio2 medium branch, 33-bit pi chunks):
+    //   fn = rnint(x * 2/pi);  r = x - fn*pio2_1;  w = fn*pio2_1t
+    // with up to two more Cody-Waite iterations when leading bits cancel.
+    // fn*pio2_1 is exact (|fn| <= 2^20, pio2_1 has 33 mantissa bits), so the
+    // FMSUB matches the C code bit for bit.
+    // -------------------------------------------------------------------------
+Lfcos_medium:
+    lsr  w27, w27, #20               // j = biased exponent of x
+    ldr  d17, Lfcos_invpio2
+    fmul d17, d16, d17
+    frintn d17, d17                  // fn (round-to-nearest-even, FPCR-independent)
+    ldr  d20, Lfcos_pio2_1
+    fmsub d18, d17, d20, d16         // r = x - fn*pio2_1
+    ldr  d20, Lfcos_pio2_1t
+    fmul d19, d17, d20               // w = fn*pio2_1t
+    fsub d22, d18, d19               // y0 = r - w
+    fmov x29, d22
+    ubfx x29, x29, #52, #11          // biased exponent of y0
+    sub  w29, w27, w29               // i = j - exp(y0)
+    sub  w29, w29, #17
+    tbnz w29, #31, Lfcos_red_done    // i <= 16: 1st round good to 85 bits
+    // 2nd iteration (good to 118 bits)
+    fmov d20, d18                    // t = r
+    ldr  d21, Lfcos_pio2_2
+    fmul d19, d17, d21               // w = fn*pio2_2
+    fsub d18, d20, d19               // r = t - w
+    fsub d20, d20, d18               // t - r
+    fsub d20, d20, d19               // (t - r) - w
+    ldr  d21, Lfcos_pio2_2t
+    fmul d21, d17, d21
+    fsub d19, d21, d20               // w = fn*pio2_2t - ((t-r)-w)
+    fsub d22, d18, d19               // y0 = r - w
+    fmov x29, d22
+    ubfx x29, x29, #52, #11
+    sub  w29, w27, w29
+    sub  w29, w29, #50
+    tbnz w29, #31, Lfcos_red_done    // i <= 49
+    // 3rd iteration (151 bits, covers all medium cases)
+    fmov d20, d18
+    ldr  d21, Lfcos_pio2_3
+    fmul d19, d17, d21
+    fsub d18, d20, d19
+    fsub d20, d20, d18
+    fsub d20, d20, d19
+    ldr  d21, Lfcos_pio2_3t
+    fmul d21, d17, d21
+    fsub d19, d21, d20
+    fsub d22, d18, d19
+Lfcos_red_done:
+    fsub d23, d18, d22
+    fsub d23, d23, d19               // y1 = (r - y0) - w
+    fcvtzs w27, d17                  // n (fn is integral -> exact)
+    // n & 3 selects: 0 +cos, 1 -sin, 2 -cos, 3 +sin
+    tbz  w27, #0, Lfcos_kcos
+
+    // -------------------------------------------------------------------------
+    // __kernel_sin(y0, y1, 1):
+    //   z = x*x; w = z*z; r = S2+z*(S3+z*S4) + z*w*(S5+z*S6); v = z*x
+    //   sin = x - ((z*(half*y - v*r) - y) - v*S1)
+    // -------------------------------------------------------------------------
+Lfcos_ksin:
+    fmul d17, d22, d22               // z
+    fmul d18, d17, d17               // w = z*z
+    ldr  d20, Lfcos_S4
+    ldr  d21, Lfcos_S3
+    fmadd d20, d17, d20, d21         // S3 + z*S4
+    ldr  d21, Lfcos_S2
+    fmadd d20, d17, d20, d21         // S2 + z*(S3+z*S4)
+    ldr  d19, Lfcos_S6
+    ldr  d21, Lfcos_S5
+    fmadd d19, d17, d19, d21         // S5 + z*S6
+    fmul d21, d17, d18               // z*w
+    fmadd d20, d21, d19, d20         // r
+    fmul d19, d17, d22               // v = z*x
+    fmov d21, #0.5
+    fmul d21, d21, d23               // half*y
+    fmsub d21, d19, d20, d21         // half*y - v*r
+    fnmsub d21, d17, d21, d23        // z*(half*y - v*r) - y
+    ldr  d18, Lfcos_S1
+    fmsub d21, d19, d18, d21         // ... - v*S1
+    fsub d16, d22, d21               // x - (...)
+    b    Lfcos_negmaybe
+
+    // -------------------------------------------------------------------------
+    // __kernel_cos(y0, y1):
+    //   z = x*x; w = z*z; r = z*(C1+z*(C2+z*C3)) + w*w*(C4+z*(C5+z*C6))
+    //   hz = 0.5*z; w' = 1-hz
+    //   cos = w' + (((1-w') - hz) + (z*r - x*y))
+    // The 1-hz / (1-w')-hz cancellation steps stay unfused to match the C.
+    // -------------------------------------------------------------------------
+Lfcos_kcos:
+    fmul d17, d22, d22               // z
+    fmul d18, d17, d17               // w = z*z
+    ldr  d20, Lfcos_C3
+    ldr  d21, Lfcos_C2
+    fmadd d20, d17, d20, d21         // C2 + z*C3
+    ldr  d21, Lfcos_C1
+    fmadd d20, d17, d20, d21         // C1 + z*(...)
+    fmul d19, d17, d20               // z*(C1+...)
+    ldr  d20, Lfcos_C6
+    ldr  d21, Lfcos_C5
+    fmadd d20, d17, d20, d21         // C5 + z*C6
+    ldr  d21, Lfcos_C4
+    fmadd d20, d17, d20, d21         // C4 + z*(...)
+    fmul d21, d18, d18               // (z*z)*(z*z)
+    fmadd d19, d21, d20, d19         // r
+    fmov d20, #0.5
+    fmul d20, d20, d17               // hz
+    fmov d21, #1.0
+    fsub d18, d21, d20               // w' = 1 - hz
+    fsub d21, d21, d18               // 1 - w'
+    fsub d21, d21, d20               // (1-w') - hz
+    fmul d19, d17, d19               // z*r
+    fmul d17, d22, d23               // x*y
+    fsub d19, d19, d17               // z*r - x*y
+    fadd d21, d21, d19
+    fadd d16, d18, d21               // result
+
+Lfcos_negmaybe:
+    // negate iff (n&1) != ((n>>1)&1), i.e. quadrants 1 and 2
+    eor  w29, w27, w27, lsr #1
+    tbz  w29, #0, Lfcos_store
+    fneg d16, d16
+
+Lfcos_store:
+    str  d16, [x25, #8]              // ST(0) = result
+    sub  x25, x25, x26, lsl #3       // back to X87State base
+    lsl  w26, w26, #1
+    mov  w29, #3
+    lsl  w29, w29, w26               // 3 << (TOP*2)
+    ldrh w27, [x25, #4]              // tagWord: slot -> kValid (00)
+    bic  w27, w27, w29
+    strh w27, [x25, #4]
+    ldrh w27, [x25, #2]              // statusWord &= ~(C1|C2)
+    and  w27, w27, #0xfffff9ff
+    strh w27, [x25, #2]
+    ldp  q16, q17, [sp]
+    ldp  q18, q19, [sp, #0x20]
+    ldp  q20, q21, [sp, #0x40]
+    ldp  q22, q23, [sp, #0x60]
+    ldp  x25, x26, [sp, #0x80]
+    add  sp, sp, #0x90
+    ret
+
+Lfcos_small:
+    // |x| < 2^-27 * sqrt(2): cos(x) = 1.0 exactly (openlibm short-circuit)
+    mov  w29, #0xa09e
+    movk w29, #0x3e46, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfcos_one
+    fmov d22, d16                    // y0 = x
+    fmov d23, xzr                    // y1 = 0
+    mov  w27, wzr                    // n = 0: +cos, no negate
+    b    Lfcos_kcos
+Lfcos_one:
+    fmov d16, #1.0
+    b    Lfcos_store
+
+Lfcos_bail:
+    // Classification bailed before any FP/flag state was touched; undo the
+    // GPR spill and enter the classic stub exactly as translated code would.
+    ldp  x25, x26, [sp, #0x80]
+    add  sp, sp, #0x90
+.globl _stub_fcos_slow
+_stub_fcos_slow:
+    STUB_PROLOGUE
+    b    tail_fcos
+
+// Literal pool — IEEE-754 doubles from openlibm e_rem_pio2.h / k_cos.h /
+// k_sin.h.  PC-relative LDR (literal), so per-chunk blob copies need no
+// relocation.
+.p2align 3
+Lfcos_invpio2:  .quad 0x3FE45F306DC9C883   // 2/pi, 53 bits
+Lfcos_pio2_1:   .quad 0x3FF921FB54400000   // first 33 bits of pi/2
+Lfcos_pio2_1t:  .quad 0x3DD0B4611A626331   // pi/2 - pio2_1
+Lfcos_pio2_2:   .quad 0x3DD0B4611A600000   // second 33 bits of pi/2
+Lfcos_pio2_2t:  .quad 0x3BA3198A2E037073   // pi/2 - (pio2_1+pio2_2)
+Lfcos_pio2_3:   .quad 0x3BA3198A2E000000   // third 33 bits of pi/2
+Lfcos_pio2_3t:  .quad 0x397B839A252049C1   // pi/2 - (pio2_1+pio2_2+pio2_3)
+Lfcos_C1:       .quad 0x3FA555555555554C
+Lfcos_C2:       .quad 0xBF56C16C16C15177
+Lfcos_C3:       .quad 0x3EFA01A019CB1590
+Lfcos_C4:       .quad 0xBE927E4F809C52AD
+Lfcos_C5:       .quad 0x3E21EE9EBDB4B1C4
+Lfcos_C6:       .quad 0xBDA8FAE9BE8838D4
+Lfcos_S1:       .quad 0xBFC5555555555549
+Lfcos_S2:       .quad 0x3F8111111110F8A6
+Lfcos_S3:       .quad 0xBF2A01A019C161D5
+Lfcos_S4:       .quad 0x3EC71DE357B1FE7D
+Lfcos_S5:       .quad 0xBE5AE5E68A2B9CEB
+Lfcos_S6:       .quad 0x3DE5D93A5ACFD57C
 
 
 // =============================================================================

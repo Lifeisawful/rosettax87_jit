@@ -1,6 +1,7 @@
 #include "RuntimeLibrary.h"
 
 #include "Export.h"
+#include "RuntimeConfig.h"
 #include "RuntimeOffsets.h"
 #include "Log.h"
 
@@ -8,9 +9,22 @@
 
 #include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
+#include "rosetta_core/ThreadContextOffsets.h"
 
 void* init_library(SymbolList const* a1, uint64_t stack_cookie, ThreadContextOffsets const* a3) {
     printf("RosettaRuntimex87 built %s - Rosetta Version 0x%llx\n", __DATE__ " " __TIME__, (unsigned long long)kImports.version);
+
+    // The FCOS fast path (runtime_entry.S _stub_fcos_fast) addresses the
+    // X87State at a baked-in x18+0xA0.  If a Rosetta update ever moves it,
+    // fall back to the classic stub for chunks mapped from here on and say so
+    // loudly — a silently wrong offset would corrupt guest floats.
+    if (a3 && a3->x87_state_offset != 0xA0) {
+        printf(
+            "RosettaRuntimex87: WARNING x87_state_offset is 0x%x, expected 0xA0 — "
+            "disabling the FCOS fast path\n",
+            a3->x87_state_offset);
+        kConfig.disable_fcos_fast = 1;
+    }
 
     uintptr_t runtime_library_base =
         reinterpret_cast<uintptr_t>(orig_init_library) - kOffsets.init_library_rva;

@@ -86,6 +86,7 @@ ALL_TESTS=(
     test_bridge_pressure
     test_addr32
     test_keepalive
+    test_fcos
 )
 
 RED='\033[0;31m'
