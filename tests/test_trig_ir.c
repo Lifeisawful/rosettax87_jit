@@ -247,6 +247,106 @@ int main(void) {
         check_tol("64x dependent chain", cos_chain(0.7, 64), expected);
     }
 
+    /* ================= FSIN (Phase B) ================= */
+    {
+        /* sin inside a run with live values: r = (sin(x)*c1 + c0) * x */
+        volatile double x = 0.8, c0 = 1.5, c1 = -0.25;
+        double r;
+        __asm__ volatile(
+            "fldl %3\n\t"
+            "fldl %1\n\t"
+            "fsin\n\t"
+            "fmulp\n\t"
+            "fldl %2\n\t"
+            "faddp\n\t"
+            "fldl %1\n\t"
+            "fmulp\n\t"
+            "fstpl %0\n"
+            : "=m"(r) : "m"(x), "m"(c0), "m"(c1));
+        check_tol("fsin run: (sin(x)*c1+c0)*x", r, (sin(0.8) * c1 + c0) * 0.8);
+    }
+    {
+        volatile double nz = -0.0, tiny = 0x1p-40;
+        double t;
+        __asm__ volatile("fldl %1\n\t fsin\n\t fstpl %0\n" : "=m"(t) : "m"(nz));
+        check_bits("fsin(-0) == -0", t, -0.0);
+        __asm__ volatile("fldl %1\n\t fsin\n\t fstpl %0\n" : "=m"(t) : "m"(tiny));
+        check_bits("fsin(2^-40) == 2^-40", t, 0x1p-40);
+    }
+    {
+        /* huge fsin with live values across the mega-save */
+        volatile double a = 3.0, b = 7.0, huge = 1e18;
+        double r, s;
+        __asm__ volatile(
+            "fldl %2\n\t"
+            "fldl %3\n\t"
+            "fmul %%st(1), %%st(0)\n\t"
+            "fldl %4\n\t"
+            "fsin\n\t"
+            "fstpl %1\n\t"
+            "fmulp\n\t"
+            "fstpl %0\n"
+            : "=m"(r), "=m"(s)
+            : "m"(a), "m"(b), "m"(huge));
+        check_bits("fsin huge in run: (3*7)*3 == 63 bit-exact", r, 63.0);
+        check_near("fsin huge in run: sin(1e18) quadrant-level", s, sin(1e18), 1e-1);
+    }
+
+    /* ================= FPTAN (Phase B) ================= */
+    {
+        /* the push is now IR-materialized: ST0 must be exactly 1.0, ST1 tan */
+        volatile double x = 0.5;
+        double t, o;
+        __asm__ volatile(
+            "fldl %2\n\t"
+            "fptan\n\t"
+            "fstpl %1\n\t"
+            "fstpl %0\n"
+            : "=m"(t), "=m"(o) : "m"(x));
+        check_bits("fptan pushes exactly 1.0", o, 1.0);
+        check_tol("fptan value tan(0.5)", t, tan(0.5));
+    }
+    {
+        /* consume both results in-run: 1.0 + tan via faddp, with a guard */
+        volatile double x = 2.0, guard = 42.5;
+        double r, g;
+        __asm__ volatile(
+            "fldl %3\n\t"  /* guard              */
+            "fldl %2\n\t"  /* x    guard         */
+            "fptan\n\t"    /* 1.0  tan  guard    */
+            "faddp\n\t"    /* tan+1.0  guard     */
+            "fstpl %0\n\t"
+            "fstpl %1\n"
+            : "=m"(r), "=m"(g)
+            : "m"(x), "m"(guard));
+        check_tol("fptan in run: tan(2.0)+1", r, tan(2.0) + 1.0);
+        check_tol("fptan in run: deep guard intact", g, 42.5);
+    }
+    {
+        volatile double nz = -0.0;
+        double t, o;
+        __asm__ volatile(
+            "fldl %2\n\t fptan\n\t fstpl %1\n\t fstpl %0\n"
+            : "=m"(t), "=m"(o) : "m"(nz));
+        check_bits("fptan(-0): tan == -0", t, -0.0);
+        check_bits("fptan(-0): push == 1.0", o, 1.0);
+    }
+    {
+        /* big-kernel shape (0.7 >= 0.6744) and huge fallback */
+        volatile double bigk = 0.7, huge = 1e18;
+        double t, o;
+        __asm__ volatile(
+            "fldl %2\n\t fptan\n\t fstpl %1\n\t fstpl %0\n"
+            : "=m"(t), "=m"(o) : "m"(bigk));
+        check_tol("fptan big-kernel tan(0.7)", t, tan(0.7));
+        __asm__ volatile(
+            "fldl %2\n\t fptan\n\t fstpl %1\n\t fstpl %0\n"
+            : "=m"(t), "=m"(o) : "m"(huge));
+        check_near("fptan huge tan(1e18) quadrant-level", t, tan(1e18), 1e-1);
+        check_bits("fptan huge: push == 1.0", o, 1.0);
+    }
+    check_true("EFLAGS survive fsin(1e18) fallback", flags_survive(0.5));
+
     printf("================================\n");
     if (failures == 0) {
         printf("test_trig_ir: ALL PASS\n");

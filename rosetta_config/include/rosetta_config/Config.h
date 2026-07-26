@@ -66,9 +66,10 @@ enum class OpcodeId : int {
     fisttp,
     ficom,
     ficomp,
-    fcos,    // gates the OPT-TI translated FCOS (value call / IR node), not a
-             // classic inline translation — see trig_ir_fcos_enabled
-    kCount  // = 62, fits in uint64_t
+    fcos,    // these three gate the OPT-TI translated trig (value call / IR
+    fsin,    // node), not classic inline translations — see the
+    fptan,   // trig_ir_*_enabled predicates
+    kCount  // = 64, fits in uint64_t
 };
 
 // Bit positions for peephole fusion patterns in TranslatorX87Fusion.cpp.
@@ -140,6 +141,14 @@ inline bool fusion_is_disabled(const RosettaConfig& cfg, FusionId id) {
 inline bool trig_ir_fcos_enabled(const RosettaConfig& cfg) {
     return cfg.trig_ir != 0 && cfg.disable_fcos_fast == 0 &&
            !op_is_disabled(cfg, OpcodeId::fcos);
+}
+inline bool trig_ir_fsin_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_fsin_fast == 0 &&
+           !op_is_disabled(cfg, OpcodeId::fsin);
+}
+inline bool trig_ir_fptan_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_fptan_fast == 0 &&
+           !op_is_disabled(cfg, OpcodeId::fptan);
 }
 
 // Parse configuration from environment variables.

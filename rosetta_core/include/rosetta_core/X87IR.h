@@ -45,14 +45,18 @@ enum class Op : uint8_t {
     // Unary
     FNeg, FAbs, FSqrt, FRndInt,
 
-    // OPT-TI: cos(inputs[0]) via `BL _stub_fcos_val` (d16 in/out, everything
-    // else preserved by the stub — huge/Inf/NaN handled by value inside it).
-    // Pure unary value for DSE/use-count purposes; lowering additionally
-    // clears C1|C2 in status_word at the node's program position, so it must
-    // be emitted in order relative to FCmp/FTst/FStsw (it is: the node loop
-    // is program-ordered).  v16 is excluded from the FPR pool for runs that
-    // contain this node (see compile_run).
+    // OPT-TI: cos/sin/tan(inputs[0]) via `BL _stub_{fcos,fsin,fptan}_val`
+    // (d16 in/out, everything else preserved by the stub — huge/Inf/NaN
+    // handled by value inside it).  Pure unary values for DSE/use-count
+    // purposes; lowering additionally clears C1|C2 in status_word at the
+    // node's program position, so they must be emitted in order relative to
+    // FCmp/FTst/FStsw (they are: the node loop is program-ordered).  v16 is
+    // excluded from the FPR pool for runs containing any of them (see
+    // compile_run).  FPtanCall yields ONLY the tangent — build() pushes the
+    // architectural 1.0 as a separate ConstOne node.
     FCosCall,
+    FSinCall,
+    FPtanCall,
 
     // Conditional select (FCMOV): inputs[0]=ST(0) false arm, inputs[1]=ST(i) true arm
     // imm_bits[3:0] = AArch64 condition code

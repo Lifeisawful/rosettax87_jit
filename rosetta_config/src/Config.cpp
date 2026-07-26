@@ -69,6 +69,8 @@ static const NameBit kOpcodeBits[] = {
     {"fcmovu",   static_cast<int>(OpcodeId::fcmovu)},
     {"fcmovnu",  static_cast<int>(OpcodeId::fcmovnu)},
     {"fcos",     static_cast<int>(OpcodeId::fcos)},
+    {"fsin",     static_cast<int>(OpcodeId::fsin)},
+    {"fptan",    static_cast<int>(OpcodeId::fptan)},
 };
 
 static const NameBit kFusionBits[] = {

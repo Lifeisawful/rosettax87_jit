@@ -434,12 +434,18 @@ uint32_t x87_fcomi(X87State* state, uint32_t st_offset, bool pop) {
     return flags;
 }
 
-// Value-only fallback for _stub_fcos_val's huge/Inf/NaN path (OPT-TI, see
-// runtime_entry.S).  No SIMDGuard: the asm caller mega-saves everything an
-// AAPCS call can clobber before branching here.  Reached through a
-// dyld-rebased literal in the blob, so keep the C linkage name stable.
+// Value-only fallbacks for the _stub_*_val huge/Inf/NaN paths (OPT-TI, see
+// runtime_entry.S).  No SIMDGuard: the asm callers mega-save everything an
+// AAPCS call can clobber before branching here.  Reached through
+// dyld-rebased literals in the blob, so keep the C linkage names stable.
 extern "C" __attribute__((used)) double x87_trig_cos_value(double x) {
     return openlibm_cos(x);
+}
+extern "C" __attribute__((used)) double x87_trig_sin_value(double x) {
+    return openlibm_sin(x);
+}
+extern "C" __attribute__((used)) double x87_trig_tan_value(double x) {
+    return openlibm_tan(x);
 }
 
 void x87_fcos(X87State* state) {

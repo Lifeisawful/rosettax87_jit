@@ -357,9 +357,14 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
     // transcendental — Rosetta translates the latter as a runtime BL that
     // preserves the pinned cache GPRs.
     auto run_member = [&](uint16_t op) {
-        if (op == kOpcodeName_fcos && g_rosetta_config &&
-            trig_ir_fcos_enabled(*g_rosetta_config))
-            return true;
+        if (g_rosetta_config) {
+            if (op == kOpcodeName_fcos && trig_ir_fcos_enabled(*g_rosetta_config))
+                return true;
+            if (op == kOpcodeName_fsin && trig_ir_fsin_enabled(*g_rosetta_config))
+                return true;
+            if (op == kOpcodeName_fptan && trig_ir_fptan_enabled(*g_rosetta_config))
+                return true;
+        }
         if (is_handled_x87(op))
             return !op_disabled_for_run(op, disabled_ops_mask);
         return runtime_keepalive && runtime_keepalive_top_delta(op).has_value();

@@ -58,8 +58,10 @@ extern char stub_fcos[];
 extern char stub_fcos_fast[];
 extern char stub_fcos_val[];
 extern char stub_fsin_fast[];
+extern char stub_fsin_val[];
 extern char stub_fsincos_fast[];
 extern char stub_fptan_fast[];
+extern char stub_fptan_val[];
 extern char stub_fdecstp[];
 extern char stub_fdiv_f32[];
 extern char stub_fdiv_f64[];
@@ -286,17 +288,21 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
     // MUST resolve to _stub_fcos_val — and only then.  trig_ir_fcos_enabled is
     // the single shared predicate; see its comment in rosetta_config/Config.h.
     const bool fcos_val = trig_ir_fcos_enabled(kConfig);
+    const bool fsin_val = trig_ir_fsin_enabled(kConfig);
+    const bool fptan_val = trig_ir_fptan_enabled(kConfig);
     route(kRuntimeRoutine_fcos, fcos_val ? stub_fcos_val : stub_fcos_fast,
           kConfig.disable_fcos_fast);
-    route(kRuntimeRoutine_fsin, stub_fsin_fast, kConfig.disable_fsin_fast);
+    route(kRuntimeRoutine_fsin, fsin_val ? stub_fsin_val : stub_fsin_fast,
+          kConfig.disable_fsin_fast);
     route(kRuntimeRoutine_fsincos, stub_fsincos_fast, kConfig.disable_fsincos_fast);
-    route(kRuntimeRoutine_fptan, stub_fptan_fast, kConfig.disable_fptan_fast);
+    route(kRuntimeRoutine_fptan, fptan_val ? stub_fptan_val : stub_fptan_fast,
+          kConfig.disable_fptan_fast);
 
     CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
              "(fcos=%s fsin=%s fsincos=%s fptan=%s)",
              n, count,
              fcos_val ? "val" : (kConfig.disable_fcos_fast ? "classic" : "fast"),
-             kConfig.disable_fsin_fast ? "classic" : "fast",
+             fsin_val ? "val" : (kConfig.disable_fsin_fast ? "classic" : "fast"),
              kConfig.disable_fsincos_fast ? "classic" : "fast",
-             kConfig.disable_fptan_fast ? "classic" : "fast");
+             fptan_val ? "val" : (kConfig.disable_fptan_fast ? "classic" : "fast"));
 }

@@ -285,14 +285,21 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
             }
         }
 
-        // OPT-TI: FCOS translated as a value call when enabled (IR-declined
-        // runs and standalone sites take this singular form; IR runs consume
-        // it as an FCosCall node before ever reaching here).  When disabled it
-        // must NOT match a case: the default block's keepalive/native handling
-        // stays authoritative, hence if/else rather than a case.
+        // OPT-TI: trig translated as value calls when enabled (IR-declined
+        // runs and standalone sites take these singular forms; IR runs
+        // consume them as F*Call nodes before ever reaching here).  When
+        // disabled they must NOT match a case: the default block's
+        // keepalive/native handling stays authoritative, hence if/else
+        // rather than cases.
         if (opcode == Opcode::kOpcodeName_fcos && g_rosetta_config &&
             trig_ir_fcos_enabled(*g_rosetta_config)) {
             TranslatorX87::translate_fcos(translation_result, cur_instr);
+        } else if (opcode == Opcode::kOpcodeName_fsin && g_rosetta_config &&
+                   trig_ir_fsin_enabled(*g_rosetta_config)) {
+            TranslatorX87::translate_fsin(translation_result, cur_instr);
+        } else if (opcode == Opcode::kOpcodeName_fptan && g_rosetta_config &&
+                   trig_ir_fptan_enabled(*g_rosetta_config)) {
+            TranslatorX87::translate_fptan(translation_result, cur_instr);
         } else
         switch (opcode) {
             case Opcode::kOpcodeName_fldz:

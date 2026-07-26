@@ -2769,7 +2769,11 @@ auto runtime_keepalive_flush(TranslationResult* a1, int top_delta) -> void {
 // holds a live value (values live in X87State memory outside IR segments),
 // and this function performs no other FPR allocation.
 // =============================================================================
-auto translate_fcos(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+// Shared FCOS/FSIN body: ldr d16 <- ST(0), BL <routine>, store d16 back to
+// the ST(0) slot, then the C1|C2 status clear (0x600; ~mask = 0xFFFFF9FF =
+// immr 21, imms 29).  FPTAN has its own wrapper below (stores the tangent,
+// then pushes 1.0).
+static void emit_trig_value_call_inplace(TranslationResult* a1, int routine) {
     AssemblerBuffer& buf = a1->insn_buf;
     auto [Xbase, Wd_top] = x87_begin(*a1, buf);
     const int Xst_base = x87_get_st_base(*a1);
@@ -2782,20 +2786,66 @@ auto translate_fcos(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     Fixup fixup;
     fixup.kind = FixupKind::Branch26;
     fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
-    fixup.target = kRuntimeRoutine_fcos;
+    fixup.target = routine;
     a1->_fixups.push_back(fixup);
     a1->insn_buf.emit(0x94000000u);
 
     emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);
 
-    // status_word &= ~(C1|C2)  (0x600; ~mask = 0xFFFFF9FF = immr 21, imms 29).
-    // Wd_tmp is dead after the store (it held the slot offset).
+    // status_word &= ~(C1|C2).  Wd_tmp is dead after the store (slot offset).
     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
                      /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
     emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/21, /*imms=*/29, Wd_tmp);
     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
                      /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
 
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+auto translate_fcos(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    emit_trig_value_call_inplace(a1, kRuntimeRoutine_fcos);
+}
+
+auto translate_fsin(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    emit_trig_value_call_inplace(a1, kRuntimeRoutine_fsin);
+}
+
+// FPTAN: ST(0) = tan(ST(0)), then push 1.0.  The value stub returns only the
+// tangent; the push is emitted here — store tan, clear C1|C2, then the
+// fldz/fld1-style push + store of the constant.
+auto translate_fptan(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
+
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                                /*Dd=*/16, Xst_base);
+
+    Fixup fixup;
+    fixup.kind = FixupKind::Branch26;
+    fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
+    fixup.target = kRuntimeRoutine_fptan;
+    a1->_fixups.push_back(fixup);
+    a1->insn_buf.emit(0x94000000u);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);  // tan -> old ST(0)
+
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/21, /*imms=*/29, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+
+    // push 1.0 (translate_fld1's pattern; d16 is free again after the store)
+    x87_push(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+    emit_fmov_d_one(buf, /*Dd=*/16);
+    emit_store_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, /*Dd=*/16, Xst_base);
+
+    free_gpr(*a1, Wd_tmp2);
     x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
     free_gpr(*a1, Wd_tmp);
 }

@@ -900,6 +900,186 @@ L\name\()_red_done:
 .endif
 .endm
 
+// __kernel_tan (k_tan.h) -> d16.  In: d22 = y0, d23 = y1, w27 = n (only
+// bit 0 is consumed), w26 = flag storage — bits 3..5 are packed with
+// (n&1, sign(x), big); bits 0..2 are preserved (the memory-entry fptan keeps
+// TOP there).  Clobbers d16-d21, d24, x27, x29.
+// Three shapes: |x| >= 0.6744 (pi/4 substitution + rational fixup), plain
+// polynomial (n even), accurate -1/(x+r) via split high parts (n odd).
+.macro TRIG_KTAN name
+    and  w27, w27, #1
+    orr  w26, w26, w27, lsl #3
+    fmov x27, d22
+    lsr  x29, x27, #63
+    orr  w26, w26, w29, lsl #4
+    ubfx x27, x27, #32, #31          // hi31 of reduced x
+    mov  w29, #0x9428
+    movk w29, #0x3fe5, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, L\name\()_ktan_notbig
+    // |x| >= 0.6744: substitute x = pio4 - x (tail pio4lo - y), y = 0
+    orr  w26, w26, #0x20
+    tbz  w26, #4, L\name\()_ktan_bigpos
+    fneg d22, d22
+    fneg d23, d23
+L\name\()_ktan_bigpos:
+    ldr  d20, Ltrig_pio4
+    fsub d17, d20, d22               // z = pio4 - x
+    ldr  d20, Ltrig_pio4lo
+    fsub d18, d20, d23               // w = pio4lo - y
+    fadd d22, d17, d18               // x = z + w
+    fmov d23, xzr                    // y = 0
+L\name\()_ktan_notbig:
+    // polynomial: r = T1+w(T3+w(T5+w(T7+w(T9+wT11)))),
+    //             v = z*(T2+w(T4+w(T6+w(T8+w(T10+wT12)))))
+    fmul d17, d22, d22               // z
+    fmul d18, d17, d17               // w = z*z
+    ldr  d19, Ltrig_T11
+    ldr  d24, Ltrig_T9
+    fmadd d19, d18, d19, d24
+    ldr  d24, Ltrig_T7
+    fmadd d19, d18, d19, d24
+    ldr  d24, Ltrig_T5
+    fmadd d19, d18, d19, d24
+    ldr  d24, Ltrig_T3
+    fmadd d19, d18, d19, d24
+    ldr  d24, Ltrig_T1
+    fmadd d19, d18, d19, d24         // r
+    ldr  d20, Ltrig_T12
+    ldr  d24, Ltrig_T10
+    fmadd d20, d18, d20, d24
+    ldr  d24, Ltrig_T8
+    fmadd d20, d18, d20, d24
+    ldr  d24, Ltrig_T6
+    fmadd d20, d18, d20, d24
+    ldr  d24, Ltrig_T4
+    fmadd d20, d18, d20, d24
+    ldr  d24, Ltrig_T2
+    fmadd d20, d18, d20, d24
+    fmul d20, d17, d20               // v
+    fmul d21, d17, d22               // s = z*x
+    fadd d19, d19, d20               // r + v
+    fmul d19, d21, d19               // s*(r+v)
+    fadd d19, d19, d23               // s*(r+v) + y
+    fmul d19, d17, d19               // z*(...)
+    fadd d19, d19, d23               // r' = y + z*(s*(r+v)+y)
+    ldr  d24, Ltrig_T0
+    fmadd d19, d24, d21, d19         // r += T0*s
+    fadd d18, d22, d19               // w = x + r
+    tbz  w26, #5, L\name\()_ktan_plain
+    // big-branch final: f * (v - 2*(x - (w*w/(w+v) - r))), v = iy = +-1,
+    // f = -1 iff original x was negative
+    fmov d20, #1.0
+    tbz  w26, #3, L\name\()_ktan_bigiy
+    fneg d20, d20                    // v = -1 (odd n)
+L\name\()_ktan_bigiy:
+    fmul d21, d18, d18               // w*w
+    fadd d24, d18, d20               // w + v
+    fdiv d21, d21, d24               // w*w/(w+v)
+    fsub d21, d21, d19               // ... - r
+    fsub d21, d22, d21               // x - (...)
+    fmov d24, #2.0
+    fmsub d16, d24, d21, d20         // v - 2*(...)
+    tbz  w26, #4, L\name\()_ktan_done
+    fneg d16, d16
+    b    L\name\()_ktan_done
+L\name\()_ktan_plain:
+    tbnz w26, #3, L\name\()_ktan_recip
+    fmov d16, d18                    // n even: tan = w
+    b    L\name\()_ktan_done
+L\name\()_ktan_recip:
+    // n odd: accurate -1/(x+r) via split high parts (low words zeroed are
+    // exact 21-bit factors, so t*z and the corrections round once each)
+    fmov x29, d18
+    and  x29, x29, #0xFFFFFFFF00000000
+    fmov d17, x29                    // z = hi(w)
+    fsub d20, d17, d22               // z - x
+    fsub d20, d19, d20               // v' = r - (z - x)
+    fmov d21, #-1.0
+    fdiv d21, d21, d18               // a = -1/w
+    fmov x29, d21
+    and  x29, x29, #0xFFFFFFFF00000000
+    fmov d24, x29                    // t = hi(a)
+    fmov d19, #1.0
+    fmadd d19, d24, d17, d19         // s' = 1 + t*z (t*z exact)
+    fmadd d20, d24, d20, d19         // s' + t*v'
+    fmadd d16, d21, d20, d24         // t + a*(s' + t*v')
+L\name\()_ktan_done:
+.endm
+
+// By-value huge/Inf/NaN fallback for the _stub_*_val entries (OPT-TI): save
+// everything an AAPCS call can clobber and the JIT may have live — guest
+// GPRs x0-x15, x16/x17, x30, NZCV, guest vectors q0-q15 (FULL width — AAPCS
+// only preserves the low halves of v8-v15), and q16-q31 (live IR pool
+// values).  x18 is the reserved platform register on Apple targets — no
+// compiled C touches it.  Result returns via x29 so the q16 restore cannot
+// clobber it; ends at the entry's L\name\()_ret.
+.macro TRIG_VAL_HUGE name, fnptr
+L\name\()_huge:
+    sub  sp, sp, #0x2A0
+    stp  x0,  x1,  [sp]
+    stp  x2,  x3,  [sp, #0x10]
+    stp  x4,  x5,  [sp, #0x20]
+    stp  x6,  x7,  [sp, #0x30]
+    stp  x8,  x9,  [sp, #0x40]
+    stp  x10, x11, [sp, #0x50]
+    stp  x12, x13, [sp, #0x60]
+    stp  x14, x15, [sp, #0x70]
+    stp  x16, x17, [sp, #0x80]
+    mrs  x29, nzcv
+    stp  x29, x30, [sp, #0x90]
+    stp  q0,  q1,  [sp, #0xA0]
+    stp  q2,  q3,  [sp, #0xC0]
+    stp  q4,  q5,  [sp, #0xE0]
+    stp  q6,  q7,  [sp, #0x100]
+    stp  q8,  q9,  [sp, #0x120]
+    stp  q10, q11, [sp, #0x140]
+    stp  q12, q13, [sp, #0x160]
+    stp  q14, q15, [sp, #0x180]
+    stp  q16, q17, [sp, #0x1A0]
+    stp  q18, q19, [sp, #0x1C0]
+    stp  q20, q21, [sp, #0x1E0]
+    stp  q22, q23, [sp, #0x200]
+    stp  q24, q25, [sp, #0x220]
+    stp  q26, q27, [sp, #0x240]
+    stp  q28, q29, [sp, #0x260]
+    stp  q30, q31, [sp, #0x280]
+    ldr  x29, \fnptr
+    fmov d0, d16
+    blr  x29
+    fmov x29, d0                     // result survives the vector restores
+    ldp  q30, q31, [sp, #0x280]
+    ldp  q28, q29, [sp, #0x260]
+    ldp  q26, q27, [sp, #0x240]
+    ldp  q24, q25, [sp, #0x220]
+    ldp  q22, q23, [sp, #0x200]
+    ldp  q20, q21, [sp, #0x1E0]
+    ldp  q18, q19, [sp, #0x1C0]
+    ldp  q16, q17, [sp, #0x1A0]
+    ldp  q14, q15, [sp, #0x180]
+    ldp  q12, q13, [sp, #0x160]
+    ldp  q10, q11, [sp, #0x140]
+    ldp  q8,  q9,  [sp, #0x120]
+    ldp  q6,  q7,  [sp, #0x100]
+    ldp  q4,  q5,  [sp, #0xE0]
+    ldp  q2,  q3,  [sp, #0xC0]
+    ldp  q0,  q1,  [sp, #0xA0]
+    ldp  x27, x30, [sp, #0x90]       // x27 = saved NZCV (outer frame restores x27)
+    msr  nzcv, x27
+    ldp  x16, x17, [sp, #0x80]
+    ldp  x14, x15, [sp, #0x70]
+    ldp  x12, x13, [sp, #0x60]
+    ldp  x10, x11, [sp, #0x50]
+    ldp  x8,  x9,  [sp, #0x40]
+    ldp  x6,  x7,  [sp, #0x30]
+    ldp  x4,  x5,  [sp, #0x20]
+    ldp  x2,  x3,  [sp, #0x10]
+    ldp  x0,  x1,  [sp]
+    add  sp, sp, #0x2A0
+    fmov d16, x29
+    b    L\name\()_ret
+.endm
+
 // Store an in-place result (FCOS/FSIN): ST(TOP) = d16, tag -> kValid,
 // statusWord &= ~(C1|C2), TOP unchanged.  Then restore and return.
 .macro TRIG_STORE_INPLACE
@@ -1057,79 +1237,123 @@ Lfcosv_small:
 Lfcosv_one:
     fmov d16, #1.0
     b    Lfcosv_done
-Lfcosv_huge:
-    // Everything an AAPCS callee may clobber and the JIT may have live:
-    // guest GPRs x0-x15, x16/x17, x30, NZCV, guest vectors q0-q15 (FULL
-    // width — AAPCS only preserves the low halves of v8-v15), and q16-q31
-    // (live IR pool values; q16's high half for completeness).  x18 is the
-    // reserved platform register on Apple targets — no compiled C touches it.
-    sub  sp, sp, #0x2A0
-    stp  x0,  x1,  [sp]
-    stp  x2,  x3,  [sp, #0x10]
-    stp  x4,  x5,  [sp, #0x20]
-    stp  x6,  x7,  [sp, #0x30]
-    stp  x8,  x9,  [sp, #0x40]
-    stp  x10, x11, [sp, #0x50]
-    stp  x12, x13, [sp, #0x60]
-    stp  x14, x15, [sp, #0x70]
-    stp  x16, x17, [sp, #0x80]
-    mrs  x29, nzcv
-    stp  x29, x30, [sp, #0x90]
-    stp  q0,  q1,  [sp, #0xA0]
-    stp  q2,  q3,  [sp, #0xC0]
-    stp  q4,  q5,  [sp, #0xE0]
-    stp  q6,  q7,  [sp, #0x100]
-    stp  q8,  q9,  [sp, #0x120]
-    stp  q10, q11, [sp, #0x140]
-    stp  q12, q13, [sp, #0x160]
-    stp  q14, q15, [sp, #0x180]
-    stp  q16, q17, [sp, #0x1A0]
-    stp  q18, q19, [sp, #0x1C0]
-    stp  q20, q21, [sp, #0x1E0]
-    stp  q22, q23, [sp, #0x200]
-    stp  q24, q25, [sp, #0x220]
-    stp  q26, q27, [sp, #0x240]
-    stp  q28, q29, [sp, #0x260]
-    stp  q30, q31, [sp, #0x280]
-    ldr  x29, Lfcosv_fnptr
-    fmov d0, d16
-    blr  x29
-    fmov x29, d0                     // result survives the vector restores
-    ldp  q30, q31, [sp, #0x280]
-    ldp  q28, q29, [sp, #0x260]
-    ldp  q26, q27, [sp, #0x240]
-    ldp  q24, q25, [sp, #0x220]
-    ldp  q22, q23, [sp, #0x200]
-    ldp  q20, q21, [sp, #0x1E0]
-    ldp  q18, q19, [sp, #0x1C0]
-    ldp  q16, q17, [sp, #0x1A0]
-    ldp  q14, q15, [sp, #0x180]
-    ldp  q12, q13, [sp, #0x160]
-    ldp  q10, q11, [sp, #0x140]
-    ldp  q8,  q9,  [sp, #0x120]
-    ldp  q6,  q7,  [sp, #0x100]
-    ldp  q4,  q5,  [sp, #0xE0]
-    ldp  q2,  q3,  [sp, #0xC0]
-    ldp  q0,  q1,  [sp, #0xA0]
-    ldp  x27, x30, [sp, #0x90]       // x27 = saved NZCV (outer frame restores x27)
-    msr  nzcv, x27
-    ldp  x16, x17, [sp, #0x80]
-    ldp  x14, x15, [sp, #0x70]
-    ldp  x12, x13, [sp, #0x60]
-    ldp  x10, x11, [sp, #0x50]
-    ldp  x8,  x9,  [sp, #0x40]
-    ldp  x6,  x7,  [sp, #0x30]
-    ldp  x4,  x5,  [sp, #0x20]
-    ldp  x2,  x3,  [sp, #0x10]
-    ldp  x0,  x1,  [sp]
-    add  sp, sp, #0x2A0
-    fmov d16, x29
-    b    Lfcosv_ret
+TRIG_VAL_HUGE fcosv, Lfcosv_fnptr
 
 .p2align 3
 Lfcosv_fnptr:
     .quad _x87_trig_cos_value        // dyld-rebased in the image; every blob
                                      // copy/remap inherits the fixed pointer
+
+// -----------------------------------------------------------------------------
+// FSIN value call (OPT-TI Phase B): d16 = sin(d16), same contract as
+// _stub_fcos_val.  Tiny |x| < 2^-26 returns x unchanged (preserves -0);
+// quadrant map n&3: 0:+sin 1:+cos 2:-sin 3:-cos.
+// -----------------------------------------------------------------------------
+.globl _stub_fsin_val
+_stub_fsin_val:
+    sub  sp, sp, #0x80
+    stp  x27, x29, [sp, #0x70]
+    fmov x29, d16
+    ubfx x27, x29, #32, #31          // hi31
+    mov  w29, #0x21fb
+    movk w29, #0x4139, lsl #16
+    sub  w29, w27, w29
+    tbz  w29, #31, Lfsinv_huge
+    stp  q17, q18, [sp]
+    stp  q19, q20, [sp, #0x20]
+    stp  q21, q22, [sp, #0x40]
+    str  q23, [sp, #0x60]
+    mov  w29, #0x21fc
+    movk w29, #0x3fe9, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsinv_small
+    TRIG_REDUCE fsinv
+    tbz  w27, #0, Lfsinv_ksin
+    TRIG_KCOS d16
+    b    Lfsinv_negmaybe
+Lfsinv_ksin:
+    TRIG_KSIN d16
+Lfsinv_negmaybe:
+    tbz  w27, #1, Lfsinv_done        // negate for quadrants 2 and 3
+    fneg d16, d16
+Lfsinv_done:
+    ldp  q17, q18, [sp]
+    ldp  q19, q20, [sp, #0x20]
+    ldp  q21, q22, [sp, #0x40]
+    ldr  q23, [sp, #0x60]
+Lfsinv_ret:
+    ldp  x27, x29, [sp, #0x70]
+    add  sp, sp, #0x80
+    ret
+Lfsinv_small:
+    // |x| < 2^-26: sin(x) = x — d16 already holds it
+    mov  w29, #0x3e500000
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsinv_done
+    fmov d22, d16
+    fmov d23, xzr
+    TRIG_KSIN d16, 0                 // y known zero: openlibm's iy=0 form
+    b    Lfsinv_done
+TRIG_VAL_HUGE fsinv, Lfsinv_fnptr
+
+.p2align 3
+Lfsinv_fnptr:
+    .quad _x87_trig_sin_value
+
+// -----------------------------------------------------------------------------
+// FPTAN value call (OPT-TI Phase B): d16 = tan(d16) — ONLY the tangent; the
+// translated call site owns the push of 1.0 (in the IR it is a ConstOne node
+// pushed after the call, in the singular form an explicit x87_push).  Same
+// preserve-everything contract; additionally saves x26 (TRIG_KTAN's flag
+// register) and q24 (its constant scratch).  Tiny |x| < 2^-27 returns x
+// unchanged (preserves -0, which the odd polynomial would not).
+// -----------------------------------------------------------------------------
+.globl _stub_fptan_val
+_stub_fptan_val:
+    sub  sp, sp, #0xA0
+    str  x26, [sp, #0x88]
+    stp  x27, x29, [sp, #0x90]
+    fmov x29, d16
+    ubfx x27, x29, #32, #31          // hi31
+    mov  w29, #0x21fb
+    movk w29, #0x4139, lsl #16
+    sub  w29, w27, w29
+    tbz  w29, #31, Lfptanv_huge
+    stp  q17, q18, [sp]
+    stp  q19, q20, [sp, #0x20]
+    stp  q21, q22, [sp, #0x40]
+    stp  q23, q24, [sp, #0x60]
+    mov  w29, #0x21fc
+    movk w29, #0x3fe9, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfptanv_small
+    TRIG_REDUCE fptanv
+    b    Lfptanv_kernel
+Lfptanv_small:
+    mov  w29, #0x3e400000
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfptanv_done      // tiny: tan(x) = x, d16 unchanged
+    fmov d22, d16
+    fmov d23, xzr
+    mov  w27, wzr
+Lfptanv_kernel:
+    mov  w26, wzr                    // flag storage for TRIG_KTAN (x26 saved)
+    TRIG_KTAN fptanv
+Lfptanv_done:
+    ldp  q17, q18, [sp]
+    ldp  q19, q20, [sp, #0x20]
+    ldp  q21, q22, [sp, #0x40]
+    ldp  q23, q24, [sp, #0x60]
+Lfptanv_ret:
+    ldr  x26, [sp, #0x88]
+    ldp  x27, x29, [sp, #0x90]
+    add  sp, sp, #0xA0
+    ret
+TRIG_VAL_HUGE fptanv, Lfptanv_fnptr
+
+.p2align 3
+Lfptanv_fnptr:
+    .quad _x87_trig_tan_value
 
 // -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
@@ -1239,104 +1463,9 @@ Lfptan_small:
     fmov d23, xzr
     mov  w27, wzr
 Lfptan_kernel:
-    // pack: w26 = TOP | (n&1)<<3 | sign(x)<<4 | big<<5
-    and  w27, w27, #1
-    orr  w26, w26, w27, lsl #3
-    fmov x27, d22
-    lsr  x29, x27, #63
-    orr  w26, w26, w29, lsl #4
-    ubfx x27, x27, #32, #31          // hi31 of reduced x
-    mov  w29, #0x9428
-    movk w29, #0x3fe5, lsl #16
-    sub  w29, w27, w29
-    tbnz w29, #31, Lfptan_notbig
-    // |x| >= 0.6744: substitute x = pio4 - x (tail pio4lo - y), y = 0
-    orr  w26, w26, #0x20
-    tbz  w26, #4, Lfptan_bigpos
-    fneg d22, d22
-    fneg d23, d23
-Lfptan_bigpos:
-    ldr  d20, Ltrig_pio4
-    fsub d17, d20, d22               // z = pio4 - x
-    ldr  d20, Ltrig_pio4lo
-    fsub d18, d20, d23               // w = pio4lo - y
-    fadd d22, d17, d18               // x = z + w
-    fmov d23, xzr                    // y = 0
-Lfptan_notbig:
-    // polynomial: r = T1+w(T3+w(T5+w(T7+w(T9+wT11)))),
-    //             v = z*(T2+w(T4+w(T6+w(T8+w(T10+wT12)))))
-    fmul d17, d22, d22               // z
-    fmul d18, d17, d17               // w = z*z
-    ldr  d19, Ltrig_T11
-    ldr  d24, Ltrig_T9
-    fmadd d19, d18, d19, d24
-    ldr  d24, Ltrig_T7
-    fmadd d19, d18, d19, d24
-    ldr  d24, Ltrig_T5
-    fmadd d19, d18, d19, d24
-    ldr  d24, Ltrig_T3
-    fmadd d19, d18, d19, d24
-    ldr  d24, Ltrig_T1
-    fmadd d19, d18, d19, d24         // r
-    ldr  d20, Ltrig_T12
-    ldr  d24, Ltrig_T10
-    fmadd d20, d18, d20, d24
-    ldr  d24, Ltrig_T8
-    fmadd d20, d18, d20, d24
-    ldr  d24, Ltrig_T6
-    fmadd d20, d18, d20, d24
-    ldr  d24, Ltrig_T4
-    fmadd d20, d18, d20, d24
-    ldr  d24, Ltrig_T2
-    fmadd d20, d18, d20, d24
-    fmul d20, d17, d20               // v
-    fmul d21, d17, d22               // s = z*x
-    fadd d19, d19, d20               // r + v
-    fmul d19, d21, d19               // s*(r+v)
-    fadd d19, d19, d23               // s*(r+v) + y
-    fmul d19, d17, d19               // z*(...)
-    fadd d19, d19, d23               // r' = y + z*(s*(r+v)+y)
-    ldr  d24, Ltrig_T0
-    fmadd d19, d24, d21, d19         // r += T0*s
-    fadd d18, d22, d19               // w = x + r
-    tbz  w26, #5, Lfptan_plain
-    // big-branch final: f * (v - 2*(x - (w*w/(w+v) - r))), v = iy = +-1,
-    // f = -1 iff original x was negative
-    fmov d20, #1.0
-    tbz  w26, #3, Lfptan_bigiy
-    fneg d20, d20                    // v = -1 (odd n)
-Lfptan_bigiy:
-    fmul d21, d18, d18               // w*w
-    fadd d24, d18, d20               // w + v
-    fdiv d21, d21, d24               // w*w/(w+v)
-    fsub d21, d21, d19               // ... - r
-    fsub d21, d22, d21               // x - (...)
-    fmov d24, #2.0
-    fmsub d16, d24, d21, d20         // v - 2*(...)
-    tbz  w26, #4, Lfptan_store
-    fneg d16, d16
-    b    Lfptan_store
-Lfptan_plain:
-    tbnz w26, #3, Lfptan_recip
-    fmov d16, d18                    // n even: tan = w
-    b    Lfptan_store
-Lfptan_recip:
-    // n odd: accurate -1/(x+r) via split high parts (low words zeroed are
-    // exact 21-bit factors, so t*z and the corrections round once each)
-    fmov x29, d18
-    and  x29, x29, #0xFFFFFFFF00000000
-    fmov d17, x29                    // z = hi(w)
-    fsub d20, d17, d22               // z - x
-    fsub d20, d19, d20               // v' = r - (z - x)
-    fmov d21, #-1.0
-    fdiv d21, d21, d18               // a = -1/w
-    fmov x29, d21
-    and  x29, x29, #0xFFFFFFFF00000000
-    fmov d24, x29                    // t = hi(a)
-    fmov d19, #1.0
-    fmadd d19, d24, d17, d19         // s' = 1 + t*z (t*z exact)
-    fmadd d20, d24, d20, d19         // s' + t*v'
-    fmadd d16, d21, d20, d24         // t + a*(s' + t*v')
+    // TRIG_KTAN packs (n&1, sign, big) into w26 bits 3..5, above the TOP the
+    // memory entry keeps in bits 0..2; the store unpacks with `and #7`.
+    TRIG_KTAN fptan
 Lfptan_store:
     and  w26, w26, #7                // unpack TOP
     fmov d17, #1.0

@@ -1045,21 +1045,25 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
 
-        // ── OPT-TI: FCOS value call ─────────────────────────────────────
-        case Op::FCosCall: {
+        // ── OPT-TI: trig value calls ────────────────────────────────────
+        case Op::FCosCall:
+        case Op::FSinCall:
+        case Op::FPtanCall: {
             int Dn = fprs.get(n.inputs[0]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            // v16 is excluded from the pool for runs containing this node
+            // v16 is excluded from the pool for runs containing these nodes
             // (compile_run), so Dn/Dd are never d16 and the moves are real.
             if (Dn != 16)
                 emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, /*Dd=*/16, Dn);
             Fixup fixup;
             fixup.kind = FixupKind::Branch26;
             fixup.insn_offset = static_cast<uint32_t>(buf.end);
-            fixup.target = kRuntimeRoutine_fcos;   // routed to _stub_fcos_val
-            result->_fixups.push_back(fixup);
+            fixup.target = (n.op == Op::FCosCall)   ? kRuntimeRoutine_fcos
+                           : (n.op == Op::FSinCall) ? kRuntimeRoutine_fsin
+                                                    : kRuntimeRoutine_fptan;
+            result->_fixups.push_back(fixup);       // routed to _stub_*_val
             buf.emit(0x94000000u);
             if (Dd != 16)
                 emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, Dd, /*Dn=*/16);
@@ -1820,8 +1824,8 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             if (!rc_cache) transient = 1;
             break;
 
-        // OPT-TI FCosCall: 1 transient GPR for the C1|C2 status RMW
-        case Op::FCosCall:
+        // OPT-TI trig calls: 1 transient GPR for the C1|C2 status RMW
+        case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
             transient = 1;
             break;
 
@@ -1991,7 +1995,7 @@ int peak_live_fprs(const Context& ctx) {
             case Op::FNMul:
             case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
             case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
-            case Op::FCosCall:
+            case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
             case Op::FCSel:
             case Op::CvtF32ToF64: case Op::CvtF64ToF32:
                 produces_fpr = true;
@@ -2083,13 +2087,16 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     ctx.nzcv_dead = nzcv_dead_after_run(instr_array, num_instrs,
                                         start_idx + ctx.consumed) ? 1 : 0;
 
-    // OPT-TI: runs containing an FCosCall must never keep a value resident in
-    // v16 across the call (d16 is the call's in/out register).  Exclude v16
-    // from the pool for the whole run — BEFORE the pressure gate, so the gate
-    // and the allocator agree on the available count.  Restored after lower().
+    // OPT-TI: runs containing a trig value call must never keep a value
+    // resident in v16 across the call (d16 is the call's in/out register).
+    // Exclude v16 from the pool for the whole run — BEFORE the pressure gate,
+    // so the gate and the allocator agree on the available count.  Restored
+    // after lower().
     bool has_fcos_call = false;
     for (int ni = 0; ni < ctx.num_nodes; ni++) {
-        if (!(ctx.nodes[ni].flags & kDead) && ctx.nodes[ni].op == Op::FCosCall) {
+        const auto op = ctx.nodes[ni].op;
+        if (!(ctx.nodes[ni].flags & kDead) &&
+            (op == Op::FCosCall || op == Op::FSinCall || op == Op::FPtanCall)) {
             has_fcos_call = true;
             break;
         }

@@ -1040,6 +1040,44 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ctx.slot_val[0] = id;
                 break;
             }
+            case kOpcodeName_fsin: {
+                if (!(g_rosetta_config && trig_ir_fsin_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto id = ctx.add_node(Op::FSinCall, st0);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[0] = id;
+                break;
+            }
+            case kOpcodeName_fptan: {
+                // OPT-TI value call yielding the tangent; the architectural
+                // push of 1.0 is a plain ConstOne node — the IR epilogue
+                // handles TOP and tags exactly as for fld1.
+                if (!(g_rosetta_config && trig_ir_fptan_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                // All failable allocations BEFORE any semantic mutation: a
+                // failure after slot_val/push would leave a half-applied
+                // fptan in a run that then lowers without consuming it.  (A
+                // stray ConstOne on the failure path is pure and DSE-able.)
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto one = ctx.const_one_node;
+                if (one < 0) {
+                    one = ctx.add_node(Op::ConstOne);
+                    if (one < 0) { ok = false; break; }
+                    ctx.const_one_node = one;
+                }
+                auto id = ctx.add_node(Op::FPtanCall, st0);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[0] = id;
+                ctx.push(one);
+                break;
+            }
             case kOpcodeName_frndint: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }
