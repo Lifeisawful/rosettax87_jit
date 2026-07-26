@@ -1,5 +1,13 @@
 #include "MachIPC.h"
 
+#include <cstddef>
+
+#include "ThreadContext.h"
+
+// Note: no <mach/message.h>.  It #defines MACH_SEND_MSG / MACH_RCV_MSG, which
+// collide with the constants below, so the message layout is spelled out here
+// the same way the rest of this file treats messages — as raw words.
+
 #ifdef ROSETTA_RUNTIME
 #include "rosetta_core/RuntimeLibC.h"
 #endif
@@ -34,8 +42,17 @@ constexpr uint32_t MSGH_BITS_COMPLEX = 0x80001513;
 // 0x12620, and x18 is only set later by create_from_mach_thread (0x1348C, called
 // at 0x1294C), so the tag/slot arithmetic — not a fresh port per call — is what
 // the runtime expects here.
-constexpr uintptr_t kReplyPortSlotOffset = 0x330;
-
+//
+// The +0x330 slot now lives in the ThreadContext layout (ThreadContext.h), which
+// is also where ThreadContext::create is seen zeroing it at init.
+//
+// Deliberately NOT rewritten in terms of current_thread_context(): the two do
+// different things.  When the tag is nonzero the reference uses `x18 & ~3` as
+// the slot address DIRECTLY — it is not a context pointer at all — and
+// current_thread_context() cannot express that.  It also clears bit 63 (the
+// stub prologue's "in runtime" flag) and demands 16-byte alignment, neither of
+// which the reference does here.  Staying literal keeps this path bit-identical
+// to 0x1CE9C.
 static inline uint32_t* reply_port_slot() {
     uintptr_t x18;
     __asm__ volatile("mov %0, x18" : "=r"(x18));
@@ -48,7 +65,10 @@ static inline uint32_t* reply_port_slot() {
     if (base == 0)
         return nullptr;
 
-    return reinterpret_cast<uint32_t*>(tag == 0 ? base + kReplyPortSlotOffset : base);
+    if (tag != 0)
+        return reinterpret_cast<uint32_t*>(base);
+
+    return &reinterpret_cast<ThreadContext*>(base)->reply_port;
 }
 
 static uint32_t mach_msg2_with_retry(void* data, uint64_t option,
@@ -115,6 +135,90 @@ static uint32_t mach_msg2_send_receive(uint32_t* msg_buf, uint32_t option,
     return mach_msg2_with_retry(msg_buf, opt64, bits_and_send_size,
                                 remote_and_local, voucher_and_id,
                                 desc_and_rcv_name, rcv_size, 0);
+}
+
+// thread_get_state — reference 0x1D0F4, transcribed.
+//
+// The request is Head(0x18) + NDR(0x8) + flavor(0x4) + count(0x4) = 0x28 bytes;
+// the reply reuses those last two words as RetCode + the count actually written,
+// with the state words following at +0x28.  A short reply of exactly 0x24 is the
+// error form (Head + NDR + RetCode, no count).
+namespace {
+
+constexpr uint32_t kThreadStateMax = 0x266;         // THREAD_STATE_MAX, in words
+constexpr int32_t kThreadGetStateMsgId = 0xE13;     // thread_act subsystem 3600 + 3
+constexpr uint32_t kThreadGetStateSendSize = 0x28;  // header + NDR + flavor + count
+constexpr uint32_t kThreadGetStateHeaderSize = 0x28;
+constexpr uint32_t kThreadGetStateErrorSize = 0x24;  // header + NDR + RetCode only
+constexpr uint32_t kThreadGetStateMaxReplySize = 0x9C0;  // 0x28 + 0x266 * 4
+constexpr uint32_t kMigTypeError = 0xFFFFFED4;           // MIG_TYPE_ERROR (-300)
+
+struct MachMsgHeader {
+    uint32_t msgh_bits;
+    uint32_t msgh_size;
+    uint32_t msgh_remote_port;
+    uint32_t msgh_local_port;
+    uint32_t msgh_voucher_port;
+    int32_t msgh_id;
+};
+static_assert(sizeof(MachMsgHeader) == 0x18);
+
+struct ThreadGetStateMsg {
+    MachMsgHeader Head;  // +0x00
+    uint8_t NDR[8];      // +0x18
+    // Request: flavor.  Reply: RetCode.
+    uint32_t flavor_or_retcode;  // +0x20
+    uint32_t state_count;        // +0x24
+    uint32_t state[kThreadStateMax];
+    uint8_t trailer[8];
+};
+
+static_assert(offsetof(ThreadGetStateMsg, flavor_or_retcode) == 0x20);
+static_assert(offsetof(ThreadGetStateMsg, state_count) == 0x24);
+static_assert(offsetof(ThreadGetStateMsg, state) == 0x28);
+static_assert(sizeof(ThreadGetStateMsg) == kThreadGetStateMaxReplySize + 8);
+
+}  // namespace
+
+uint32_t mach_thread_get_state(uint32_t thread, uint32_t flavor, void* state,
+                               uint32_t* state_count) {
+    ThreadGetStateMsg msg;
+
+    uint32_t requested = *state_count;
+    if (requested > kThreadStateMax)
+        requested = kThreadStateMax;
+
+    msg.flavor_or_retcode = flavor;
+    msg.state_count = requested;
+
+    // mach_vm_remap_msg fills in msgh_bits, the remote/reply ports, the voucher
+    // and the msgid itself, and passes the send size in a register rather than
+    // reading msgh_size — so those four words need no presetting here either.
+    const uint32_t ret =
+        mach_vm_remap_msg(thread, &msg, 0, 0, kThreadGetStateSendSize, sizeof(msg),
+                          kThreadGetStateMsgId, 0);
+    if (ret)
+        return ret;
+
+    const uint32_t reply_size = msg.Head.msgh_size;
+    if (reply_size >= kThreadGetStateHeaderSize) {
+        if (reply_size > kThreadGetStateMaxReplySize)
+            return kMigTypeError;
+    } else if (reply_size != kThreadGetStateErrorSize) {
+        return kMigTypeError;
+    }
+
+    if (msg.flavor_or_retcode)  // RetCode
+        return msg.flavor_or_retcode;
+
+    const uint32_t written = msg.state_count;
+    if (written > kThreadStateMax ||
+        reply_size != 4 * written + kThreadGetStateHeaderSize)
+        return kMigTypeError;
+
+    memmove(state, msg.state, 4 * static_cast<size_t>(written));
+    *state_count = written;
+    return 0;
 }
 
 uint32_t mach_vm_remap_msg(uint32_t task_port, void* msg_buf, int has_complex,

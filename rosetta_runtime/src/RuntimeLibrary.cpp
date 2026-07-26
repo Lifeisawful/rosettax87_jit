@@ -6,6 +6,8 @@
 #include "Log.h"
 
 #include "RuntimeRoutineOffsets.h"
+#include "ThreadContext.h"
+#include "TranslationCacheAbi.h"
 
 #include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
@@ -59,6 +61,19 @@ void register_runtime_routine_offsets(intptr_t* runtime_routine_offsets, const c
     // at the wrong stub.  Recompute them against our labels before handing the
     // array on — this is what makes our stubs actually reachable.
     rewrite_runtime_routine_offsets(runtime_routine_offsets, count);
+
+    // Earliest point where X18 is a usable ThreadContext, which is what makes
+    // the classify_arm_pc_objc hook possible without a byte pattern: that
+    // function is only ever named by ThreadContext vtable slot +0xF8, and
+    // ThreadContext::create stores the shared g_thread_context_vtable POINTER,
+    // so one read here yields the table every thread will use.
+    //
+    // main() calls create_from_mach_thread (0x1294C, sets X18 at 0x1348C) before
+    // it calls us (0x129DC) — and our _start runs before main(), where X18 is
+    // still unset.  Nothing guest-side can reach the objc trap before this
+    // point, so installing here is early enough.
+    if (const ThreadContext* ctx = current_thread_context())
+        init_classify_arm_pc_objc_hook(ctx->vtable);
 
     orig_register_runtime_routine_offsets(runtime_routine_offsets, runtime_routine_names, count);
 }

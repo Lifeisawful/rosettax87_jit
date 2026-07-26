@@ -49,6 +49,27 @@
 // abi_info_for_runtime_routines_address helper are file-local (anonymous
 // namespace) in TranslationCacheAbi.cpp — nothing outside the hook calls them.
 
+// ── classify_arm_pc_objc ─────────────────────────────────────────────────────
+//
+// The runtime carries a SECOND copy of the runtime-routines classification, in
+// classify_arm_pc_objc (0x15FC0), reached through ThreadContext vtable slot
+// +0xF8 rather than by a call to classify_arm_pc.  Hooking classify_arm_pc
+// therefore does nothing for it, and it repeats the same
+// `ASSERT(offset < kRuntimeRoutinesSize)` at 0x16194 — which our 0x4E7C-byte
+// blob fails for everything from runtime_syscall (blob offset 0x4020) onward.
+//
+// It exists to serve libobjc's restartable ranges: the guest registers x86
+// ranges via MIG msgid 0x1F40, the kernel cannot police them under translation,
+// so the guest asks Rosetta for a given thread's x86 pc.
+//
+// Hooked separately from init_translation_cache_abi_hooks because it is reached
+// through the vtable rather than found by a byte pattern, and the vtable pointer
+// only exists once X18 is live — i.e. from a library export called by main, not
+// from our _start.  See RuntimeLibrary.cpp.
+struct ThreadContextVTable;
+
+void init_classify_arm_pc_objc_hook(const ThreadContextVTable* vtable);
+
 // Installs the hook over the reference classify_arm_pc and records the bounds of
 // our own loaded library image.  Called from runtime_early_init.
 //
