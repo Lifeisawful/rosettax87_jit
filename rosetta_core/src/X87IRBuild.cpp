@@ -1025,6 +1025,21 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ctx.slot_val[0] = id;
                 break;
             }
+            case kOpcodeName_fcos: {
+                // OPT-TI value call. Only a member when the predicate holds
+                // (lookahead applies the same gate; this is belt-and-braces
+                // for direct build() callers).
+                if (!(g_rosetta_config && trig_ir_fcos_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto id = ctx.add_node(Op::FCosCall, st0);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[0] = id;
+                break;
+            }
             case kOpcodeName_frndint: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }

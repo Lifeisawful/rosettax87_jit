@@ -1,5 +1,6 @@
 #include "rosetta_core/X87Cache.h"
 
+#include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/Opcode.h"
 #include "rosetta_config/Config.h"
@@ -350,10 +351,15 @@ static bool op_disabled_for_run(uint16_t op, uint64_t disabled_ops_mask) {
 
 int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                         uint64_t disabled_ops_mask, bool bridge, bool runtime_keepalive) {
-    // A run member is a handled+enabled x87 instruction, or (OPT-KA) a
-    // keepalive transcendental — Rosetta translates the latter as a runtime
-    // BL that preserves the pinned cache GPRs.
+    // A run member is a handled+enabled x87 instruction, an OPT-TI value-call
+    // FCOS (a real member: the IR consumes it as a node, the singular form
+    // uses x87_begin/x87_end like any handled op), or (OPT-KA) a keepalive
+    // transcendental — Rosetta translates the latter as a runtime BL that
+    // preserves the pinned cache GPRs.
     auto run_member = [&](uint16_t op) {
+        if (op == kOpcodeName_fcos && g_rosetta_config &&
+            trig_ir_fcos_enabled(*g_rosetta_config))
+            return true;
         if (is_handled_x87(op))
             return !op_disabled_for_run(op, disabled_ops_mask);
         return runtime_keepalive && runtime_keepalive_top_delta(op).has_value();

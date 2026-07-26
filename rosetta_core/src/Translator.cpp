@@ -285,6 +285,15 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
             }
         }
 
+        // OPT-TI: FCOS translated as a value call when enabled (IR-declined
+        // runs and standalone sites take this singular form; IR runs consume
+        // it as an FCosCall node before ever reaching here).  When disabled it
+        // must NOT match a case: the default block's keepalive/native handling
+        // stays authoritative, hence if/else rather than a case.
+        if (opcode == Opcode::kOpcodeName_fcos && g_rosetta_config &&
+            trig_ir_fcos_enabled(*g_rosetta_config)) {
+            TranslatorX87::translate_fcos(translation_result, cur_instr);
+        } else
         switch (opcode) {
             case Opcode::kOpcodeName_fldz:
                 TranslatorX87::translate_fldz(translation_result, cur_instr);

@@ -56,6 +56,7 @@ extern char stub_fcos[];
 // slot when its ROSETTA_X87_DISABLE_*_FAST flag is set (see
 // rewrite_runtime_routine_offsets).
 extern char stub_fcos_fast[];
+extern char stub_fcos_val[];
 extern char stub_fsin_fast[];
 extern char stub_fsincos_fast[];
 extern char stub_fptan_fast[];
@@ -281,14 +282,20 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
         if (idx < n && !disabled)
             offsets[idx] = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(fast) - base);
     };
-    route(kRuntimeRoutine_fcos, stub_fcos_fast, kConfig.disable_fcos_fast);
+    // OPT-TI: when the translator emits FCOS as a value call, the table entry
+    // MUST resolve to _stub_fcos_val — and only then.  trig_ir_fcos_enabled is
+    // the single shared predicate; see its comment in rosetta_config/Config.h.
+    const bool fcos_val = trig_ir_fcos_enabled(kConfig);
+    route(kRuntimeRoutine_fcos, fcos_val ? stub_fcos_val : stub_fcos_fast,
+          kConfig.disable_fcos_fast);
     route(kRuntimeRoutine_fsin, stub_fsin_fast, kConfig.disable_fsin_fast);
     route(kRuntimeRoutine_fsincos, stub_fsincos_fast, kConfig.disable_fsincos_fast);
     route(kRuntimeRoutine_fptan, stub_fptan_fast, kConfig.disable_fptan_fast);
 
     CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
              "(fcos=%s fsin=%s fsincos=%s fptan=%s)",
-             n, count, kConfig.disable_fcos_fast ? "classic" : "fast",
+             n, count,
+             fcos_val ? "val" : (kConfig.disable_fcos_fast ? "classic" : "fast"),
              kConfig.disable_fsin_fast ? "classic" : "fast",
              kConfig.disable_fsincos_fast ? "classic" : "fast",
              kConfig.disable_fptan_fast ? "classic" : "fast");

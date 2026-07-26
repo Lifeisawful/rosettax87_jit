@@ -995,6 +995,143 @@ Lfcos_one:
 TRIG_BAIL fcos
 
 // -----------------------------------------------------------------------------
+// FCOS value call (OPT-TI, research/optimizations/16-ir-trig-value-call.md):
+//   d16 = x on entry, d16 = cos(x) on return.  Preserves EVERYTHING else —
+//   d17-d23 and x27/x29 are saved here, NZCV is never written, and X87State
+//   is never touched (the translated call site owns all state semantics).
+//   Targeted only by translator-emitted calls (ROSETTA_X87_TRIG_IR); never by
+//   plain argument-less BLs, so there is no classic-stub bail path.
+//
+// Huge/Inf/NaN arguments cannot fall back to the classic stub (inside an IR
+// run the X87State memory is stale — values live in FPRs), so they are
+// computed BY VALUE: save everything an AAPCS call can clobber and call the
+// C fallback x87_trig_cos_value (openlibm_cos incl. Payne-Hanek) through a
+// dyld-rebased absolute literal.  Rare path; only correctness matters.
+// -----------------------------------------------------------------------------
+.globl _stub_fcos_val
+_stub_fcos_val:
+    sub  sp, sp, #0x80
+    stp  x27, x29, [sp, #0x70]
+    fmov x29, d16
+    ubfx x27, x29, #32, #31          // hi31
+    mov  w29, #0x21fb
+    movk w29, #0x4139, lsl #16
+    sub  w29, w27, w29
+    tbz  w29, #31, Lfcosv_huge       // >= 2^20*(pi/2), Inf, NaN
+    stp  q17, q18, [sp]
+    stp  q19, q20, [sp, #0x20]
+    stp  q21, q22, [sp, #0x40]
+    str  q23, [sp, #0x60]
+    mov  w29, #0x21fc
+    movk w29, #0x3fe9, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfcosv_small
+    TRIG_REDUCE fcosv
+    tbz  w27, #0, Lfcosv_kcos
+    TRIG_KSIN d16
+    b    Lfcosv_negmaybe
+Lfcosv_kcos:
+    TRIG_KCOS d16
+Lfcosv_negmaybe:
+    eor  w29, w27, w27, lsr #1
+    tbz  w29, #0, Lfcosv_done
+    fneg d16, d16
+Lfcosv_done:
+    ldp  q17, q18, [sp]
+    ldp  q19, q20, [sp, #0x20]
+    ldp  q21, q22, [sp, #0x40]
+    ldr  q23, [sp, #0x60]
+Lfcosv_ret:
+    ldp  x27, x29, [sp, #0x70]
+    add  sp, sp, #0x80
+    ret
+Lfcosv_small:
+    mov  w29, #0xa09e
+    movk w29, #0x3e46, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfcosv_one
+    fmov d22, d16
+    fmov d23, xzr
+    mov  w27, wzr
+    b    Lfcosv_kcos
+Lfcosv_one:
+    fmov d16, #1.0
+    b    Lfcosv_done
+Lfcosv_huge:
+    // Everything an AAPCS callee may clobber and the JIT may have live:
+    // guest GPRs x0-x15, x16/x17, x30, NZCV, guest vectors q0-q15 (FULL
+    // width — AAPCS only preserves the low halves of v8-v15), and q16-q31
+    // (live IR pool values; q16's high half for completeness).  x18 is the
+    // reserved platform register on Apple targets — no compiled C touches it.
+    sub  sp, sp, #0x2A0
+    stp  x0,  x1,  [sp]
+    stp  x2,  x3,  [sp, #0x10]
+    stp  x4,  x5,  [sp, #0x20]
+    stp  x6,  x7,  [sp, #0x30]
+    stp  x8,  x9,  [sp, #0x40]
+    stp  x10, x11, [sp, #0x50]
+    stp  x12, x13, [sp, #0x60]
+    stp  x14, x15, [sp, #0x70]
+    stp  x16, x17, [sp, #0x80]
+    mrs  x29, nzcv
+    stp  x29, x30, [sp, #0x90]
+    stp  q0,  q1,  [sp, #0xA0]
+    stp  q2,  q3,  [sp, #0xC0]
+    stp  q4,  q5,  [sp, #0xE0]
+    stp  q6,  q7,  [sp, #0x100]
+    stp  q8,  q9,  [sp, #0x120]
+    stp  q10, q11, [sp, #0x140]
+    stp  q12, q13, [sp, #0x160]
+    stp  q14, q15, [sp, #0x180]
+    stp  q16, q17, [sp, #0x1A0]
+    stp  q18, q19, [sp, #0x1C0]
+    stp  q20, q21, [sp, #0x1E0]
+    stp  q22, q23, [sp, #0x200]
+    stp  q24, q25, [sp, #0x220]
+    stp  q26, q27, [sp, #0x240]
+    stp  q28, q29, [sp, #0x260]
+    stp  q30, q31, [sp, #0x280]
+    ldr  x29, Lfcosv_fnptr
+    fmov d0, d16
+    blr  x29
+    fmov x29, d0                     // result survives the vector restores
+    ldp  q30, q31, [sp, #0x280]
+    ldp  q28, q29, [sp, #0x260]
+    ldp  q26, q27, [sp, #0x240]
+    ldp  q24, q25, [sp, #0x220]
+    ldp  q22, q23, [sp, #0x200]
+    ldp  q20, q21, [sp, #0x1E0]
+    ldp  q18, q19, [sp, #0x1C0]
+    ldp  q16, q17, [sp, #0x1A0]
+    ldp  q14, q15, [sp, #0x180]
+    ldp  q12, q13, [sp, #0x160]
+    ldp  q10, q11, [sp, #0x140]
+    ldp  q8,  q9,  [sp, #0x120]
+    ldp  q6,  q7,  [sp, #0x100]
+    ldp  q4,  q5,  [sp, #0xE0]
+    ldp  q2,  q3,  [sp, #0xC0]
+    ldp  q0,  q1,  [sp, #0xA0]
+    ldp  x27, x30, [sp, #0x90]       // x27 = saved NZCV (outer frame restores x27)
+    msr  nzcv, x27
+    ldp  x16, x17, [sp, #0x80]
+    ldp  x14, x15, [sp, #0x70]
+    ldp  x12, x13, [sp, #0x60]
+    ldp  x10, x11, [sp, #0x50]
+    ldp  x8,  x9,  [sp, #0x40]
+    ldp  x6,  x7,  [sp, #0x30]
+    ldp  x4,  x5,  [sp, #0x20]
+    ldp  x2,  x3,  [sp, #0x10]
+    ldp  x0,  x1,  [sp]
+    add  sp, sp, #0x2A0
+    fmov d16, x29
+    b    Lfcosv_ret
+
+.p2align 3
+Lfcosv_fnptr:
+    .quad _x87_trig_cos_value        // dyld-rebased in the image; every blob
+                                     // copy/remap inherits the fixed pointer
+
+// -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
 // -----------------------------------------------------------------------------
 TRIG_ENTRY fsin

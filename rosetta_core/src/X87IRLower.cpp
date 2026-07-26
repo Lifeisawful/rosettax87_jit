@@ -13,6 +13,7 @@
 #include "rosetta_core/TranslatorX87Helpers.hpp"
 #include "rosetta_config/Config.h"
 #include "rosetta_core/CoreConfig.h"
+#include "rosetta_core/RuntimeRoutine.h"
 #include "rosetta_core/X87Cache.h"
 #include "rosetta_core/CoreLog.h"
 
@@ -42,7 +43,8 @@ inline int x87_get_st_base(TranslationResult& a1) {
 
 namespace X87IR {
 
-static constexpr int16_t kX87TagWordImm12 = kX87TagWordOff / 2;  // = 2
+static constexpr int16_t kX87TagWordImm12 = kX87TagWordOff / 2;      // = 2
+static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;  // = 1
 
 // ── FPR assignment ──────────────────────────────────────────────────────────
 
@@ -1043,6 +1045,41 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
 
+        // ── OPT-TI: FCOS value call ─────────────────────────────────────
+        case Op::FCosCall: {
+            int Dn = fprs.get(n.inputs[0]);
+            int Dd = fprs.try_reuse_input(ctx, i);
+            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            // v16 is excluded from the pool for runs containing this node
+            // (compile_run), so Dn/Dd are never d16 and the moves are real.
+            if (Dn != 16)
+                emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, /*Dd=*/16, Dn);
+            Fixup fixup;
+            fixup.kind = FixupKind::Branch26;
+            fixup.insn_offset = static_cast<uint32_t>(buf.end);
+            fixup.target = kRuntimeRoutine_fcos;   // routed to _stub_fcos_val
+            result->_fixups.push_back(fixup);
+            buf.emit(0x94000000u);
+            if (Dd != 16)
+                emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, Dd, /*Dn=*/16);
+            // status_word &= ~(C1|C2) at the node's program position, so a
+            // later FStsw in the same run observes it and an earlier
+            // FCmp/FTst's C2 is legitimately overwritten (hardware order).
+            // ~0x600 as a 32-bit logical immediate: immr=21, imms=29.
+            {
+                int Wd = alloc_free_gpr(*result);
+                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                                 kX87StatusWordImm12, Xbase, Wd);
+                emit_and_imm(buf, /*is_64bit=*/0, Wd, /*N=*/0, /*immr=*/21,
+                             /*imms=*/29, Wd);
+                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                                 kX87StatusWordImm12, Xbase, Wd);
+                free_gpr(*result, Wd);
+            }
+            break;
+        }
+
         // ── Conditional select (FCMOV) ────────────────────────────────
         case Op::FCSel: {
             int Dn = fprs.get(n.inputs[0]);   // ST(0) — false arm
@@ -1783,6 +1820,11 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             if (!rc_cache) transient = 1;
             break;
 
+        // OPT-TI FCosCall: 1 transient GPR for the C1|C2 status RMW
+        case Op::FCosCall:
+            transient = 1;
+            break;
+
         // FCmp/FTst: 4 peak inside emit_fcom_cc_pack
         // (Wd_save + Wd_packed + Wd_cc + Wd_vs simultaneously live)
         // Hoisted: no per-node Wd_save (3 transient), but Wd_nzcv_saved is
@@ -1949,6 +1991,7 @@ int peak_live_fprs(const Context& ctx) {
             case Op::FNMul:
             case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
             case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
+            case Op::FCosCall:
             case Op::FCSel:
             case Op::CvtF32ToF64: case Op::CvtF64ToF32:
                 produces_fpr = true;
@@ -2039,6 +2082,27 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     // FCmp/FTst NZCV save/restore is elided in lowering.
     ctx.nzcv_dead = nzcv_dead_after_run(instr_array, num_instrs,
                                         start_idx + ctx.consumed) ? 1 : 0;
+
+    // OPT-TI: runs containing an FCosCall must never keep a value resident in
+    // v16 across the call (d16 is the call's in/out register).  Exclude v16
+    // from the pool for the whole run — BEFORE the pressure gate, so the gate
+    // and the allocator agree on the available count.  Restored after lower().
+    bool has_fcos_call = false;
+    for (int ni = 0; ni < ctx.num_nodes; ni++) {
+        if (!(ctx.nodes[ni].flags & kDead) && ctx.nodes[ni].op == Op::FCosCall) {
+            has_fcos_call = true;
+            break;
+        }
+    }
+    const uint32_t fpr_mask_before_v16_excl = result->free_fpr_mask;
+    if (has_fcos_call)
+        result->free_fpr_mask &= ~(1u << 16);
+    // Restore on EVERY exit from here on (fail() paths included).
+    struct V16Restore {
+        TranslationResult* r;
+        uint32_t mask;
+        ~V16Restore() { r->free_fpr_mask = mask; }
+    } v16_restore{result, fpr_mask_before_v16_excl};
 
     // Gate lowering on actual FPR pressure vs. available pool.
     uint32_t fpr_pool = result->free_fpr_mask;

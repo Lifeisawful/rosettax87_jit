@@ -55,6 +55,7 @@ ALL_BENCHMARKS=(
     bench_f32
     bench_fcos
     bench_trig
+    bench_trig_run
     bench_interleaved_mov
     bench_const_promote
 )

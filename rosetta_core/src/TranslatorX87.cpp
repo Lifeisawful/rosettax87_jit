@@ -2749,4 +2749,55 @@ auto runtime_keepalive_flush(TranslationResult* a1, int top_delta) -> void {
         emit_x87_pop_top_only(buf, Wd_top);  // TOP = (TOP + 1) & 7
 }
 
+// =============================================================================
+// FCOS — OPT-TI value call (singular form, IR-declined runs and standalone).
+//
+// x87 semantics reproduced (= the classic x87_fcos helper):
+//   ST(0) = cos(ST(0)); status_word &= ~(C1|C2); TOP and tags unchanged
+//   (value in, value out — same tag discipline as translate_fsqrt).
+//
+// The ST(0) value crosses the call in d16: _stub_fcos_val (runtime_entry.S)
+// preserves everything except d16 — no guard, no state access, huge/Inf/NaN
+// handled by value inside the stub.  Modeled on translate_fsqrt; the only
+// additions are the BL (Branch26 fixup, routed to _stub_fcos_val by
+// rewrite_runtime_routine_offsets under the same trig_ir_fcos_enabled
+// predicate) and the C1|C2 status clear, which the classic helper performed
+// and real guest code observes (the "fcos; fnstsw; test C2" range-check
+// idiom).
+//
+// d16 is written raw, not allocated: at an instruction boundary no pool FPR
+// holds a live value (values live in X87State memory outside IR segments),
+// and this function performs no other FPR allocation.
+// =============================================================================
+auto translate_fcos(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                                /*Dd=*/16, Xst_base);
+
+    Fixup fixup;
+    fixup.kind = FixupKind::Branch26;
+    fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
+    fixup.target = kRuntimeRoutine_fcos;
+    a1->_fixups.push_back(fixup);
+    a1->insn_buf.emit(0x94000000u);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);
+
+    // status_word &= ~(C1|C2)  (0x600; ~mask = 0xFFFFF9FF = immr 21, imms 29).
+    // Wd_tmp is dead after the store (it held the slot offset).
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/21, /*imms=*/29, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
 };  // namespace TranslatorX87

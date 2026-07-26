@@ -88,6 +88,7 @@ ALL_TESTS=(
     test_keepalive
     test_fcos
     test_trig
+    test_trig_ir
 )
 
 RED='\033[0;31m'
@@ -292,6 +293,26 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             continue
         fi
         OUT=$(ROSETTA_X87_DISABLE_ALL_OPS=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1 ROSETTA_X87_DISABLE_IR=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        check_output "$t" "$OUT"
+    done
+fi
+
+# ── Phase 9: runtime_loader, TRIG_IR (OPT-TI) ────────────────────────────────
+# FCOS as a value call: IR runs keep ST(0) in an FPR across the BL to
+# _stub_fcos_val.  Stacked on KEEPALIVE + EXTENDED_FPR_SCRATCH so the
+# extended pool includes v16 and the run-level v16 exclusion is exercised.
+if [[ $NATIVE_ONLY -eq 0 ]]; then
+    echo ""
+    echo -e "${BOLD}=== Phase 9: runtime_loader (TRIG_IR + KEEPALIVE + EXTENDED_FPR_SCRATCH) ===${NC}"
+
+    for t in "${TESTS[@]}"; do
+        BINARY="$BIN/$t"
+        if [[ ! -x "$BINARY" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        OUT=$(ROSETTA_X87_TRIG_IR=1 ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi

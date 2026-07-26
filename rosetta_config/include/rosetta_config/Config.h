@@ -66,7 +66,9 @@ enum class OpcodeId : int {
     fisttp,
     ficom,
     ficomp,
-    kCount  // = 61, fits in uint64_t
+    fcos,    // gates the OPT-TI translated FCOS (value call / IR node), not a
+             // classic inline translation — see trig_ir_fcos_enabled
+    kCount  // = 62, fits in uint64_t
 };
 
 // Bit positions for peephole fusion patterns in TranslatorX87Fusion.cpp.
@@ -111,6 +113,7 @@ struct RosettaConfig {
     uint8_t  disable_fsin_fast;      // ROSETTA_X87_DISABLE_FSIN_FAST=1 — same for FSIN
     uint8_t  disable_fsincos_fast;   // ROSETTA_X87_DISABLE_FSINCOS_FAST=1 — same for FSINCOS
     uint8_t  disable_fptan_fast;     // ROSETTA_X87_DISABLE_FPTAN_FAST=1 — same for FPTAN
+    uint8_t  trig_ir;                // ROSETTA_X87_TRIG_IR=1 — translate FCOS as a value call (_stub_fcos_val): IR node inside runs, ldr/BL/str singular form outside (opt-in)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
@@ -126,6 +129,17 @@ inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
 
 inline bool fusion_is_disabled(const RosettaConfig& cfg, FusionId id) {
     return (cfg.disabled_fusions_mask >> static_cast<int>(id)) & 1u;
+}
+
+// OPT-TI: FCOS is translated as a value call (and the runtime routes
+// kRuntimeRoutine_fcos at _stub_fcos_val) only when this agrees on ALL
+// sides — Translator dispatch, X87Cache lookahead membership, X87IRBuild,
+// and rewrite_runtime_routine_offsets MUST use this one predicate: a plain
+// argument-less BL landing on the value stub computes cos of garbage, and a
+// value call landing on a memory stub loses its result.  Boot-constant.
+inline bool trig_ir_fcos_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_fcos_fast == 0 &&
+           !op_is_disabled(cfg, OpcodeId::fcos);
 }
 
 // Parse configuration from environment variables.

@@ -68,6 +68,7 @@ static const NameBit kOpcodeBits[] = {
     {"fcmovne",  static_cast<int>(OpcodeId::fcmovne)},
     {"fcmovu",   static_cast<int>(OpcodeId::fcmovu)},
     {"fcmovnu",  static_cast<int>(OpcodeId::fcmovnu)},
+    {"fcos",     static_cast<int>(OpcodeId::fcos)},
 };
 
 static const NameBit kFusionBits[] = {
@@ -188,6 +189,12 @@ RosettaConfig parse_config_from_env() {
         cfg.disable_fsincos_fast = (*v == '1') ? 1 : 0;
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FPTAN_FAST"))
         cfg.disable_fptan_fast = (*v == '1') ? 1 : 0;
+
+    // Translate FCOS as a value call — the ST(0) value crosses the call in
+    // d16 instead of X87State memory, and IR runs keep it in an FPR
+    // (research/optimizations/16-ir-trig-value-call.md). Opt-in pending soak.
+    if (const char* v = std::getenv("ROSETTA_X87_TRIG_IR"))
+        cfg.trig_ir = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')

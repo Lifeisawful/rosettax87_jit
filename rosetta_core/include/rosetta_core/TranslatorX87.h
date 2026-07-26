@@ -95,5 +95,6 @@ auto translate_fnop(TranslationResult* a1, IRInstr* a2) -> void;
 // carried pins first (frees the flush scratch slots and evicts x27, which the
 // runtime round trip clobbers).
 auto runtime_keepalive_flush(TranslationResult* a1, int top_delta) -> void;
+auto translate_fcos(TranslationResult* a1, IRInstr* a2) -> void;
 
 };  // namespace TranslatorX87
