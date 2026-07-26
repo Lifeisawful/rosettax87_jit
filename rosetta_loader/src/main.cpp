@@ -129,8 +129,27 @@ private:
                 }
                 continue;
             }
-            fprintf(stderr, "Unexpected exception type=%d before breakpoint; forwarding\n",
-                    lastEvent_.type);
+            // type 1 = EXC_BAD_ACCESS, 2 = EXC_BAD_INSTRUCTION. codes[0] is the
+            // kern_return / fault kind and codes[1] the faulting address. Dump PC
+            // too: together they say whether we jumped somewhere unmapped or
+            // executed garbage at a plausible address.
+            {
+                arm_thread_state64_t st{};
+                mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+                uint64_t pc = 0, lr = 0, sp = 0;
+                if (lastEvent_.thread != MACH_PORT_NULL &&
+                    thread_get_state(lastEvent_.thread, ARM_THREAD_STATE64, (thread_state_t)&st,
+                                     &c) == KERN_SUCCESS) {
+                    pc = st.__pc;
+                    lr = st.__lr;
+                    sp = st.__sp;
+                }
+                fprintf(stderr,
+                        "Unexpected exception type=%d codes=[0x%llx, 0x%llx] "
+                        "pc=0x%llx lr=0x%llx sp=0x%llx; forwarding\n",
+                        lastEvent_.type, (unsigned long long)lastEvent_.codes[0],
+                        (unsigned long long)lastEvent_.codes[1], pc, lr, sp);
+            }
             exc_.forward();
             return false;
         }
@@ -568,13 +587,24 @@ public:
         return readSize == size;
     }
 
-    bool writeMemory(uint64_t address, const void* buffer, size_t size) {
+    // flushICache: whether to follow the write with an i-cache flush. Default
+    // true — every caller that patches CODE needs it (see below). Pass false for
+    // pure DATA writes (stack strings, __DATA sections): the flush is a
+    // cache-maintenance operation on a range that will never be executed, and
+    // issuing it against stack memory is meaningless work on a page
+    // mach_vm_write may have just COW-split.
+    bool writeMemory(uint64_t address, const void* buffer, size_t size,
+                     bool flushICache = true) {
         kern_return_t kr = mach_vm_write(taskPort_, address, (vm_offset_t)buffer, size);
 
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "Failed to write memory at 0x%llx (error 0x%x: %s)\n", address, kr,
                     mach_error_string(kr));
             return false;
+        }
+
+        if (!flushICache) {
+            return true;
         }
 
         // Flush the target's instruction cache for the written range. ARM64 I/D
@@ -653,6 +683,77 @@ public:
             return false;
         }
 
+        return true;
+    }
+
+    // Call the mapped image's entry point (_start) on the currently stopped
+    // thread, then restore the thread exactly as it was.
+    //
+    // Save state, point PC at _start, resume, catch the BRK it ends with,
+    // restore. The tracee is stopped at the post-exec SIGTRAP, so the borrowed
+    // thread is the process's only thread and nothing else is running.
+    //
+    // No breakpoint is planted here: _start does not return, it ends in its own
+    // `brk #0` (see rosetta_runtime/src/main.cpp). That keeps this side free of
+    // any return-address choice, and works because the loader is _start's only
+    // caller. Nothing restores the original instruction afterwards because we
+    // never overwrote one — the BRK is part of the image as built.
+    bool callImageEntry(MachoLoader& image, uint64_t imageBase, uint64_t imagePreferredBase,
+                        uint64_t scratchStackTop) {
+        uint64_t entryVmaddr = image.entryPoint();
+        if (entryVmaddr == 0) {
+            fprintf(stderr, "callImageEntry: image declares no entry point\n");
+            return false;
+        }
+        // entryPoint() is a link-time vmaddr; convert to the loaded address.
+        uint64_t entryAddr = imageBase + (entryVmaddr - imagePreferredBase);
+
+        LOG("callImageEntry: entry vmaddr=0x%llx -> 0x%llx sp=0x%llx\n", entryVmaddr, entryAddr,
+            scratchStackTop);
+
+        arm_thread_state64_t saved;
+        if (!copyThreadState(saved)) {
+            fprintf(stderr, "callImageEntry: failed to save thread state\n");
+            return false;
+        }
+
+        arm_thread_state64_t callState;
+        memcpy(&callState, &saved, sizeof(callState));
+        callState.__pc = entryAddr;
+        // _start MUST run on a stack we provide.
+        //
+        // At the post-exec stop the thread's SP points at the very top of the
+        // kernel-built argument block (argc/argv/envp/apple + strings) and there
+        // is no allocated stack BELOW it — the process has not yet run the
+        // runtime's own start (0x319C), which is what establishes a usable stack.
+        // _start's first instruction is `stp x29, x30, [sp, #-0x10]!`, a push, so
+        // inheriting that SP faults immediately with EXC_BAD_ACCESS at exactly
+        // the SP value (observed: codes=[0x103, <sp>], pc=_start).
+        //
+        // Point SP at scratch space inside our own freshly-mapped, writable image
+        // instead. 16-byte aligned, as the AArch64 ABI requires.
+        callState.__sp = scratchStackTop & ~0xFULL;
+        callState.__fp = 0;
+        // _start takes no arguments and never returns, so LR is left as-is.
+
+        if (!restoreThreadState(callState)) {
+            fprintf(stderr, "callImageEntry: failed to set call state\n");
+            return false;
+        }
+
+        // Resume and wait for _start's trailing BRK.
+        if (!continueExecution()) {
+            fprintf(stderr, "callImageEntry: did not reach _start's breakpoint\n");
+            restoreThreadState(saved);
+            return false;
+        }
+
+        if (!restoreThreadState(saved)) {
+            fprintf(stderr, "callImageEntry: failed to restore thread state\n");
+            return false;
+        }
+
+        LOG("callImageEntry: _start completed\n");
         return true;
     }
 
@@ -811,10 +912,13 @@ int main(int argc, char* argv[]) {
     }
     LOG("Found rosetta runtime offsets successfully!\n");
     LOG("offset_exports_fetch=%llx offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
-        "offset_classify_arm_pc=%llx offset_sys_csrctl=%llx\n",
+        "offset_classify_arm_pc=%llx offset_sys_csrctl=%llx "
+        "offset_runtime_routines_for_address=%llx offset_allocate_chunk=%llx "
+        "offset_trace_write_mapping_record=%llx\n",
         offsetFinder.offsetExportsFetch_, offsetFinder.offsetSvcCallEntry_,
         offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_,
-        offsetFinder.offsetSysCsrctl_);
+        offsetFinder.offsetSysCsrctl_, offsetFinder.offsetRuntimeRoutinesForAddress_,
+        offsetFinder.offsetAllocateChunk_, offsetFinder.offsetTraceWriteMappingRecord_);
 
     if (!offsetFinder.scanLibRosettaRuntime()) {
         fprintf(stderr, "Fatal: failed to scan libRosettaRuntime for offsets.\n");
@@ -846,9 +950,25 @@ int main(int argc, char* argv[]) {
     // environment variable" once the SIP check passes), then patch sys_csrctl
     // to always return 0 so that check does pass.
     if (disableSip) {
-        // Scrub ROSETTA_X87_* entries from existing apple[] — the kernel mirrors
-        // ROSETTA_* env vars into apple[]. NUL the first byte of each matching
-        // string so the runtime skips it.
+        // Hide our ROSETTA_X87_* variables from the runtime's env scan.
+        //
+        // main (0x11E74) walks this array and rejects any entry whose first 8
+        // bytes are "ROSETTA_" or "CAMBRIA_" (strncmp with W2 = 8). Once the SIP
+        // check below starts passing, our own ROSETTA_X87_* vars would trip that
+        // and be reported as invalid, so we rename them out of the way first.
+        //
+        // Overwriting byte 0 is enough — the comparison never looks past the
+        // 8-byte prefix. We write '.' rather than NUL so the entry stays a
+        // well-formed "KEY=VALUE" pair for any other env parser in the process;
+        // a NUL would leave a zero-length string in the middle of envp.
+        //
+        // This targets envp, NOT apple[]. Verified by dumping both arrays: the
+        // block at SP+(count+6)*8 is envp (PATH=, HOME=, ...), and apple[] —
+        // which begins after envp's NULL terminator — holds only kernel-provided
+        // entries (executable_path, pfz, stack_guard, malloc_entropy, ptr_munge,
+        // main_stack, executable_file, dyld_file) and never any ROSETTA_* at all.
+        // start (0x319C) reflects the same layout: it walks past this array and
+        // hands what follows to the apple[] parser at 0x1CA4C.
         arm_thread_state64_t state;
         dbg.copyThreadState(state);
         uint64_t oldSP = state.__sp;
@@ -856,23 +976,43 @@ int main(int argc, char* argv[]) {
         uint64_t count;
         dbg.readMemory(oldSP + 0x20, &count, sizeof(count));
         uint64_t headerSize = (count + 6) * 8;
-        uint64_t oldAppleBase = oldSP + headerSize;
+        uint64_t envpBase = oldSP + headerSize;
 
-        LOG("apple[]: SP=0x%llx count=%llu headerSize=%llu appleBase=0x%llx\n",
-            oldSP, count, headerSize, oldAppleBase);
+        LOG("envp: SP=0x%llx count=%llu headerSize=%llu envpBase=0x%llx\n",
+            oldSP, count, headerSize, envpBase);
 
+        // Rename any ROSETTA_X87_* entry by overwriting byte 0 with '.'.
+        // main's scan only strncmp's the 8-byte "ROSETTA_" prefix, so a single
+        // byte is enough to make it miss.
+        //
+        // Collected first, then written, so that entries sharing a page cost one
+        // mach_vm_write instead of one per entry. mach_vm_write is page-granular
+        // COW under the hood; these strings live on the tracee's stack, and
+        // splitting the same stack page repeatedly under a stopped thread was
+        // implicated in an intermittent EXC_BAD_ACCESS on the DISABLE_SIP path.
+        // The writes are also flagged as data (flushICache=false): the i-cache
+        // flush exists for __TEXT patches and is meaningless for stack strings.
         uint64_t ptr;
-        for (uint64_t addr = oldAppleBase; ; addr += 8) {
+        std::vector<uint64_t> toRename;
+        uint64_t addr = envpBase;
+        for (;; addr += 8) {
             dbg.readMemory(addr, &ptr, 8);
-            if (ptr == 0) break;
+            if (ptr == 0)
+                break;  // envp terminator; apple[] follows, and we leave it alone
             char prefix[13] = {};
             dbg.readMemory(ptr, prefix, 12);
             if (strncmp(prefix, "ROSETTA_X87_", 12) == 0) {
-                uint8_t nul = 0;
-                dbg.writeMemory(ptr, &nul, 1);
-                LOG("apple[]: scrubbed ROSETTA_X87_* entry at 0x%llx\n", ptr);
+                toRename.push_back(ptr);
+                LOG("envp: will hide entry at 0x%llx\n", ptr);
             }
         }
+
+        const uint8_t dot = '.';
+        for (uint64_t p : toRename) {
+            dbg.writeMemory(p, &dot, 1, /*flushICache=*/false);
+        }
+        LOG("envp: hid %zu ROSETTA_X87_* entr%s (terminator at 0x%llx)\n", toRename.size(),
+            toRename.size() == 1 ? "y" : "ies", addr);
 
         // Patch sys_csrctl to always return 0, bypassing the SIP check.
         // Original: MOV X16,#0x1E3; SVC 0x80; MOV X1,#-1; CSEL X0,X1,X0,CS; RET
@@ -886,24 +1026,22 @@ int main(int argc, char* argv[]) {
         LOG("Patched sys_csrctl at 0x%llx to return 0\n", csrctlAddr);
     }
 
-    // Plant the one BRK at exports_fetch. Our EXC_MASK_ALL task-level port
-    // catches the resulting EXC_BREAKPOINT (mirroring lldb debugserver, which
-    // registers at task level for all exception types).
-    dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-    dbg.continueExecution();
-    // Read X19 (Exports struct addr) from the thread that hit the BRK, then
-    // restore the original instruction. The process stays stopped (we hold the
-    // breakpoint exception reply) through the stub install below until detach.
-    auto rosettaRuntimeExportsAddress =
-        dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
-    dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
-    LOG("Rosetta runtime exports: 0x%llx\n", rosettaRuntimeExportsAddress);
-
-    Exports exports;
-    dbg.readMemory(rosettaRuntimeExportsAddress, &exports, sizeof(exports));
-
-    LOG("Rosetta version: %llx\n", exports.version);
-
+    // ── Early phase ───────────────────────────────────────────────────────────
+    //
+    // Everything from here until the exports_fetch breakpoint runs while the
+    // tracee is still stopped at the post-exec SIGTRAP, i.e. BEFORE the Rosetta
+    // runtime's main() has executed a single instruction.
+    //
+    // This ordering is load-bearing.  main() calls ExecutableHeap::allocate_chunk
+    // at 0x12620 — creating the 128 MB heap and copying the REFERENCE
+    // runtime_entry blob into its stub page — long before exports_fetch (0x1289c),
+    // where the loader used to first get control.  Mapping our image and running
+    // its _start here means our allocate_chunk hook is installed before that
+    // first chunk exists, so chunk 0 is ours rather than the reference's.
+    //
+    // What CANNOT move here: anything touching libRosettaRuntime's exports.  That
+    // image is only mapped by main() at 0x12708 — after allocate_chunk — so the
+    // export swap necessarily stays behind the breakpoint below.
     char path[PATH_MAX];
     uint32_t pathSize = sizeof(path);
     if (_NSGetExecutablePath(path, &pathSize) != 0) {
@@ -929,8 +1067,20 @@ int main(int argc, char* argv[]) {
     arm_thread_state64_t mmapThreadState;
     memcpy(&mmapThreadState, &backupThreadState, sizeof(arm_thread_state64_t));
 
+    // Allocate the image PLUS a scratch stack for _start, in one mapping.
+    //
+    // _start cannot run on the thread's current stack: at the post-exec stop SP
+    // points at the top of the kernel-built argument block with nothing mapped
+    // below it (the runtime's own start, which establishes a real stack, has not
+    // run yet), so _start's opening `stp x29, x30, [sp, #-0x10]!` faults.
+    //
+    // The stack goes at the FRONT of the mapping and the image after it, so the
+    // stack grows down into its own guard-free region rather than into image
+    // data. machoBase is therefore mmapResult + kScratchStackSize.
+    constexpr uint64_t kScratchStackSize = 0x10000;  // 64 KB, ample for early init
+
     mmapThreadState.__x[0] = 0LL;                                      // addr
-    mmapThreadState.__x[1] = machoLoader.imageSize();                  // size
+    mmapThreadState.__x[1] = machoLoader.imageSize() + kScratchStackSize;  // size
     mmapThreadState.__x[2] = VM_PROT_READ | VM_PROT_WRITE;             // prot
     mmapThreadState.__x[3] = MAP_ANON | MAP_TRANSLATED_ALLOW_EXECUTE;  // flags
     mmapThreadState.__x[4] = -1;                                       // fd
@@ -944,8 +1094,16 @@ int main(int argc, char* argv[]) {
     dbg.setBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
     dbg.continueExecution();
 
-    uint64_t machoBase = dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X0);
+    uint64_t mmapResult = dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X0);
     dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetSvcCallRet_);
+
+    // [mmapResult, +kScratchStackSize) is _start's stack; the image follows it.
+    uint64_t machoBase = mmapResult + kScratchStackSize;
+    // Start SP one 16-byte slot BELOW the image so the first push cannot touch
+    // image bytes; the stack then grows down through its own region.
+    uint64_t scratchStackTop = machoBase - 16;
+    LOG("Scratch stack: 0x%llx - 0x%llx (initial sp 0x%llx), image at 0x%llx\n", mmapResult,
+        machoBase, scratchStackTop, machoBase);
 
     LOG("Allocated memory at 0x%llx\n", machoBase);
 
@@ -1078,6 +1236,8 @@ int main(int argc, char* argv[]) {
 
         uint64_t segOffset = segm->vmaddr - machoPreferredBase;
         uint64_t dest = machoBase + segOffset;
+        LOG("Protecting segment %s: dest=0x%llx vmsize=0x%llx initprot=0x%x\n",
+            segm->segname, dest, (uint64_t)segm->vmsize, segm->initprot);
         dbg.adjustMemoryProtection(dest, segm->initprot, segm->vmsize);
     });
 
@@ -1092,6 +1252,9 @@ int main(int argc, char* argv[]) {
         .rosettax87_size = machoLoader.imageSize(),
         .classify_arm_pc_rva = offsetFinder.offsetClassifyArmPc_,
         .decode_opcode_rva = offsetFinder.offsetDecodeOpcode_,
+        .runtime_routines_for_address_rva = offsetFinder.offsetRuntimeRoutinesForAddress_,
+        .allocate_chunk_rva = offsetFinder.offsetAllocateChunk_,
+        .trace_write_mapping_record_rva = offsetFinder.offsetTraceWriteMappingRecord_,
     };
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));
@@ -1102,6 +1265,35 @@ int main(int argc, char* argv[]) {
         uint64_t machoConfigAddress = machoBase + configSection->addr;
         dbg.writeMemory(machoConfigAddress, &runtimeConfig, sizeof(runtimeConfig));
     }
+
+    // Run our image's entry point (_start) on the stopped thread, before the
+    // runtime's main() gets to run.  __DATA,offsets and __DATA,config are both
+    // populated above, which is everything _start's early init depends on —
+    // it must NOT touch kImports, which is still zeroed until the export swap
+    // below.
+    if (!dbg.callImageEntry(machoLoader, machoBase, machoPreferredBase, scratchStackTop)) {
+        fprintf(stderr, "Fatal: failed to run libRuntimeRosettax87 _start\n");
+        return 1;
+    }
+
+    // ── Late phase ────────────────────────────────────────────────────────────
+    //
+    // Resume and run until exports_fetch.  Only now does libRosettaRuntime exist
+    // (main() maps it at 0x12708), so only now can we read its Exports from X19
+    // and splice ours in.
+    dbg.setBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
+    dbg.continueExecution();
+    // Read X19 (Exports struct addr) from the thread that hit the BRK, then
+    // restore the original instruction. The process stays stopped (we hold the
+    // breakpoint exception reply) through the stub install below until detach.
+    auto rosettaRuntimeExportsAddress =
+        dbg.readRegister(dbg.stoppedThread(), MuhDebugger::Register::X19);
+    dbg.removeBreakpoint(runtimeBase + offsetFinder.offsetExportsFetch_);
+    LOG("Rosetta runtime exports: 0x%llx\n", rosettaRuntimeExportsAddress);
+
+    Exports exports;
+    dbg.readMemory(rosettaRuntimeExportsAddress, &exports, sizeof(exports));
+    LOG("Rosetta version: %llx\n", exports.version);
 
     // fix up Exports segment of mapped macho
     uint64_t machoExportsAddress = machoBase + machoLoader.getSection("__DATA", "exports")->addr;

@@ -39,6 +39,18 @@
 // Standard prologue stubs — batch 1
 // =============================================================================
 
+// Start of the mapped blob.  Deliberately co-located with _stub_far_jmp rather
+// than placed at the top of the file: every offset in the codebase is computed
+// from _stub_far_jmp (TranslationCacheAbi::off(), map_runtime_routines' copy
+// source), so the two MUST resolve to the same address.  Nothing may be emitted
+// between this label and _stub_far_jmp.
+//
+// Paired with _runtime_blob_end at the end of this file; ExecutableHeap.cpp
+// subtracts the two to size the region it maps, so the stub page grows
+// automatically as stubs are added.
+.globl _runtime_blob_start
+_runtime_blob_start:
+
 .globl _stub_far_jmp
 _stub_far_jmp:
     STUB_PROLOGUE
@@ -700,6 +712,12 @@ _stub_cpuid:
 // =============================================================================
 .section runtime_savedreg,runtime_savedreg,regular,pure_instructions
 .p2align 2
+
+// Boundary between the entry stubs and the dispatch tails.  TranslationCacheAbi
+// splits AbiKind_Library / AbiKind_RuntimeRoutine here (reference: runtime_savedreg
+// at 0x21370).
+.globl _runtime_savedreg_start
+_runtime_savedreg_start:
 
 // Tail pattern macros
 // TAIL_F:  no args, no result, vtable call
@@ -2021,6 +2039,8 @@ Lreturn_miss_slow:
 _runtime_exit_ret:
 runtime_exit_ret:
     ldr  w27, [x18, #0x1C8]
+.globl _exit_ret_debug_check
+_exit_ret_debug_check:
 Lexit_ret_check:
     cbz  w27, Lexit_ret_restore
     tbz  w27, #9, Lexit_ret_run
@@ -2036,6 +2056,8 @@ Lexit_ret_run:
     ldr  x29, [x29]
     mov  x0, x18
     blr  x29
+.globl _exit_ret_post_callback
+_exit_ret_post_callback:
 Lexit_ret_post:
     strb wzr, [x18, #0x208]
     ldr  x29, [x18, #0x198]
@@ -2054,6 +2076,8 @@ Lexit_ret_post:
     svc  #0x80
     b.cc Lexit_ret_restore
     brk  #6
+.globl _exit_ret_gpr_restore
+_exit_ret_gpr_restore:
 Lexit_ret_restore:
     ldp  x29, x17, [x18, #0x90]
     msr  nzcv, x29
@@ -2079,6 +2103,8 @@ Lexit_ret_restore:
 _runtime_exitcall:
 runtime_exitcall:
     ldr  w27, [x18, #0x1C8]
+.globl _exitcall_debug_check
+_exitcall_debug_check:
 Lexitcall_check:
     cbz  w27, Lexitcall_restore
     tbz  w27, #9, Lexitcall_run
@@ -2094,6 +2120,8 @@ Lexitcall_run:
     ldr  x29, [x29, #0x8]
     mov  x0, x18
     blr  x29
+.globl _exitcall_post_callback
+_exitcall_post_callback:
 Lexitcall_post:
     strb wzr, [x18, #0x208]
     ldr  x29, [x18, #0x198]
@@ -2112,6 +2140,8 @@ Lexitcall_post:
     svc  #0x80
     b.cc Lexitcall_restore
     brk  #6
+.globl _exitcall_gpr_restore
+_exitcall_gpr_restore:
 Lexitcall_restore:
     ldp  x29, x17, [x18, #0x90]
     msr  nzcv, x29
@@ -2137,6 +2167,8 @@ Lexitcall_restore:
 _runtime_exitljmp:
 runtime_exitljmp:
     ldr  w27, [x18, #0x1C8]
+.globl _exitljmp_debug_check
+_exitljmp_debug_check:
 Lexitljmp_check:
     cbz  w27, Lexitljmp_restore
     tbz  w27, #9, Lexitljmp_run
@@ -2152,6 +2184,8 @@ Lexitljmp_run:
     ldr  x29, [x29]
     mov  x0, x18
     blr  x29
+.globl _exitljmp_post_callback
+_exitljmp_post_callback:
 Lexitljmp_post:
     strb wzr, [x18, #0x208]
     ldr  x29, [x18, #0x198]
@@ -2170,6 +2204,8 @@ Lexitljmp_post:
     svc  #0x80
     b.cc Lexitljmp_restore
     brk  #6
+.globl _exitljmp_gpr_restore
+_exitljmp_gpr_restore:
 Lexitljmp_restore:
     ldp  x29, x17, [x18, #0x90]
     msr  nzcv, x29
@@ -2195,6 +2231,8 @@ Lexitljmp_restore:
 _runtime_exit_br:
 runtime_exit_br:
     ldr  w27, [x18, #0x1C8]
+.globl _exit_br_debug_check
+_exit_br_debug_check:
 Lexit_br_check:
     cbz  w27, Lexit_br_restore
     tbz  w27, #9, Lexit_br_run
@@ -2210,6 +2248,8 @@ Lexit_br_run:
     ldr  x29, [x29]
     mov  x0, x18
     blr  x29
+.globl _exit_br_post_callback
+_exit_br_post_callback:
 Lexit_br_post:
     strb wzr, [x18, #0x208]
     mov  x22, x0
@@ -2229,6 +2269,8 @@ Lexit_br_post:
     svc  #0x80
     b.cc Lexit_br_restore
     brk  #6
+.globl _exit_br_gpr_restore
+_exit_br_gpr_restore:
 Lexit_br_restore:
     ldp  x29, x17, [x18, #0x90]
     msr  nzcv, x29
@@ -2261,6 +2303,8 @@ runtime_exit_sys_nzcv:
     ldr  x27, [x27]
     str  x27, [x18, #0x1B8]
     ldr  w27, [x18, #0x1C8]
+.globl _exit_sys_debug_check
+_exit_sys_debug_check:
 Lexit_sys_check:
     cbz  w27, Lexit_sys_restore
     tbz  w27, #9, Lexit_sys_save
@@ -2281,6 +2325,8 @@ Lexit_sys_run:
     ldr  x29, [x29]
     mov  x0, x18
     blr  x29
+.globl _exit_sys_post_callback
+_exit_sys_post_callback:
 Lexit_sys_post:
     strb wzr, [x18, #0x208]
     ldr  x29, [x18, #0x198]
@@ -2304,6 +2350,8 @@ Lexit_sys_nzcv_restore:
     msr  nzcv, x29
     ldr  x2, [x18, #0x20]
     ldr  x0, [x18, #0x10]
+.globl _exit_sys_gpr_restore
+_exit_sys_gpr_restore:
 Lexit_sys_restore:
     ldp  xzr, x17, [x18, #0x90]
     ldp  x14, x15, [x18, #0x80]
@@ -2328,6 +2376,8 @@ Lexit_sys_restore:
 _runtime_exitinst:
 runtime_exitinst:
     ldrb w27, [x18, #0x1C8]
+.globl _exitinst_debug_check
+_exitinst_debug_check:
 Lexitinst_check:
     cbz  w27, Lexitinst_restore
 Lexitinst_run:
@@ -2339,6 +2389,8 @@ Lexitinst_run:
     ldr  x29, [x29, #0x10]
     mov  x0, x18
     blr  x29
+.globl _exitinst_post_callback
+_exitinst_post_callback:
 Lexitinst_post:
     strb wzr, [x18, #0x208]
     ldrb w27, [x18, #0x1C8]
@@ -2352,6 +2404,8 @@ Lexitinst_post:
     svc  #0x80
     b.cc Lexitinst_restore
     brk  #6
+.globl _exitinst_gpr_restore
+_exitinst_gpr_restore:
 Lexitinst_restore:
     ldp  x29, x17, [x18, #0x90]
     msr  nzcv, x29
@@ -2377,6 +2431,8 @@ Lexitinst_restore:
 _runtime_exitsigr:
 runtime_exitsigr:
     ldrb w27, [x18, #0x1C8]
+.globl _exitsigr_debug_check
+_exitsigr_debug_check:
 Lexitsigr_check:
     cbz  w27, Lexitsigr_do_sigreturn
 Lexitsigr_run:
@@ -2388,8 +2444,12 @@ Lexitsigr_run:
     ldr  x29, [x29, #0x10]
     mov  x0, x18
     blr  x29
+.globl _exitsigr_post_callback
+_exitsigr_post_callback:
 Lexitsigr_post:
     strb wzr, [x18, #0x208]
+.globl _exitsigr_sigreturn
+_exitsigr_sigreturn:
 Lexitsigr_do_sigreturn:
     mov  x0, x22
     mov  x1, x23
@@ -2425,6 +2485,11 @@ _sa_tramp_handler:
     sub  sp, sp, #0x10
     mov  x6, sp
     bl   _sa_tramp
+// Everything from here on has returned from sa_tramp; TranslationCacheAbi uses
+// this boundary for AbiKind_Sigtramp's subkind (reference: sigtramp_post_sa_tramp
+// at 0x227F4).
+.globl _sigtramp_post_sa_tramp
+_sigtramp_post_sa_tramp:
     ldr  x21, [sp]
     mov  x22, x0
     mov  x28, x1
@@ -2667,10 +2732,17 @@ mach_default:
     str  x22, [x18, #0x1B8]
 Lsyscall_svc:
     svc  #0x80
+// Post-SVC: the syscall has been issued and cannot be restarted.  sa_tramp reads
+// AbiKind_Syscall's subkind across this boundary (reference: syscall_post_svc at
+// 0x22AE0, bounded above by syscall_sigreturn_case = our sysent_case31).
+.globl _syscall_post_svc
+_syscall_post_svc:
 Lsyscall_svc_ret:
     mov  x2, x1
     b    runtime_exit_sys_nzcv
 
+.globl _syscall_sigreturn_case
+_syscall_sigreturn_case:
 sysent_case31:
     and  w22, w6, #3
     cmp  w22, #3
@@ -3616,4 +3688,22 @@ jpt_bsd7:
 
 Lsyscall_sentinel:
     .long 0xFFFFFFFF
+
+// =============================================================================
+// End of the mapped blob.
+//
+// Paired with _runtime_blob_start (at _stub_far_jmp).  ExecutableHeap.cpp sizes
+// the runtime-routines region as round_up(_runtime_blob_end - _runtime_blob_start,
+// 16 KB), so adding stubs grows the mapped page automatically instead of
+// silently overflowing a hand-maintained constant.
+//
+// This label must remain in the LAST section of this file and be the last thing
+// emitted: the size is an end-minus-start span, so anything placed after it is
+// outside the region that gets copied to the heap.
+//
+// Note the span is only meaningful because the linker lays these sections out
+// contiguously and in order; ExecutableHeap.cpp range-checks the computed size
+// rather than trusting it blindly.
+.globl _runtime_blob_end
+_runtime_blob_end:
 

@@ -36,6 +36,24 @@ static long _syscall6(long n, long a, long b, long c, long d, long e, long f) {
     return x0;
 }
 
+// Like _syscall*, but also reports the carry flag, which is how the kernel
+// signals that the trap itself failed.  x0/x1 are the two return registers, so
+// both must be outputs; `cs` is early-clobber so it can't alias a live input.
+static long _syscall4_carry(long n, long a, long b, long c, long d, int* failed) {
+    register long x16 __asm__("x16") = n;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    long cs;
+    __asm__ volatile("svc #0x80\n\tcset %2, cs"
+                     : "+r"(x0), "+r"(x1), "=&r"(cs)
+                     : "r"(x16), "r"(x2), "r"(x3)
+                     : "memory", "cc");
+    *failed = (int)cs;
+    return x0;
+}
+
 // ── Memory ───────────────────────────────────────────────────────────────────
 
 void* rt_mmap(void* addr, size_t len, int prot, int flags, int fd, long offset) {
@@ -381,15 +399,68 @@ static long _mach_trap(long trap, long a0, long a1, long a2, long a3, long a4) {
     return x0;
 }
 
+static long _mach_trap0(long trap) {
+    register long x16 __asm__("x16") = trap;
+    register long x0 __asm__("x0");
+    __asm__ volatile("svc #0x80" : "=r"(x0) : "r"(x16) : "memory", "cc");
+    return x0;
+}
+
+static long _mach_trap8(long trap, long a0, long a1, long a2, long a3,
+                        long a4, long a5, long a6, long a7) {
+    register long x16 __asm__("x16") = trap;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    register long x6 __asm__("x6") = a6;
+    register long x7 __asm__("x7") = a7;
+    __asm__ volatile("svc #0x80"
+                     : "+r"(x0)
+                     : "r"(x16), "r"(x1), "r"(x2), "r"(x3), "r"(x4),
+                       "r"(x5), "r"(x6), "r"(x7)
+                     : "memory", "cc");
+    return x0;
+}
+
 // task_self_trap = mach trap 28
 rt_mach_port_t rt_mach_task_self(void) {
     return (rt_mach_port_t)_mach_trap(-28, 0, 0, 0, 0, 0);
+}
+
+// thread_self_trap = mach trap 27
+rt_mach_port_name_t rt_mach_thread_self(void) {
+    return (rt_mach_port_name_t)_mach_trap0(-27);
+}
+
+// mach_reply_port = mach trap 26
+rt_mach_port_name_t rt_mach_reply_port(void) {
+    return (rt_mach_port_name_t)_mach_trap0(-26);
+}
+
+// kernelrpc_mach_port_mod_refs_trap = mach trap 19
+rt_kern_return_t rt_mach_port_mod_refs(rt_mach_port_name_t task, rt_mach_port_name_t name,
+                                       rt_mach_port_right_t right, rt_mach_port_delta_t delta) {
+    return (rt_kern_return_t)_mach_trap(-19, task, name, right, delta, 0);
 }
 
 // vm_protect = mach trap 14
 rt_kern_return_t rt_vm_protect(rt_mach_port_t task, rt_vm_address_t addr, rt_vm_size_t size,
                                int set_max, rt_vm_prot_t prot) {
     return (rt_kern_return_t)_mach_trap(-14, task, addr, size, set_max, prot);
+}
+
+// mach_msg2_trap = mach trap 47
+rt_mach_msg_return_t rt_mach_msg2(void* data, uint64_t option, uint64_t msgh_bits_and_send_size,
+                                  uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id,
+                                  uint64_t desc_count_and_rcv_name, uint64_t rcv_size_and_priority,
+                                  uint64_t timeout) {
+    return (rt_mach_msg_return_t)_mach_trap8(-47, (long)data, (long)option,
+        (long)msgh_bits_and_send_size, (long)msgh_remote_and_local_port,
+        (long)msgh_voucher_and_id, (long)desc_count_and_rcv_name,
+        (long)rcv_size_and_priority, (long)timeout);
 }
 
 // getpid = BSD syscall 20
@@ -404,6 +475,38 @@ int rt_proc_pidinfo(int pid, unsigned int flavor, unsigned long long arg, void* 
                     int buffersize) {
     return (int)_syscall6(336, /*PROC_INFO_CALL_PIDINFO*/ 2, pid, (long)flavor, (long)arg,
                           (long)buffer, buffersize);
+}
+
+// ── ulock ────────────────────────────────────────────────────────────────────
+
+#ifndef SYS_ulock_wait
+#define SYS_ulock_wait 515
+#endif
+#ifndef SYS_ulock_wake
+#define SYS_ulock_wake 516
+#endif
+
+int rt_ulock_wait_e(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us,
+                    int* failed) {
+    return (int)_syscall4_carry(SYS_ulock_wait, (long)operation, (long)addr, (long)value,
+                                (long)timeout_us, failed);
+}
+
+int rt_ulock_wake_e(uint32_t operation, void* addr, uint64_t wake_value, int* failed) {
+    return (int)_syscall4_carry(SYS_ulock_wake, (long)operation, (long)addr, (long)wake_value, 0,
+                                failed);
+}
+
+int rt_ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us) {
+    int failed = 0;
+    int r = rt_ulock_wait_e(operation, addr, value, timeout_us, &failed);
+    return failed ? -1 : r;
+}
+
+int rt_ulock_wake(uint32_t operation, void* addr, uint64_t wake_value) {
+    int failed = 0;
+    int r = rt_ulock_wake_e(operation, addr, wake_value, &failed);
+    return failed ? -1 : r;
 }
 
 // ── Cache / JIT ───────────────────────────────────────────────────────────────

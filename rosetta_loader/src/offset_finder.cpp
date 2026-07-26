@@ -58,13 +58,52 @@ auto OffsetFinder::scanRuntime() -> bool {
                            "sysCsrctl");
     };
 
+    auto findRuntimeRoutinesForAddress = [&]() -> std::optional<uint64_t> {
+        // LDR X2, [X19,#0x58]; MOV X0, X21; MOV X1, X20
+        // BL runtime_routines_for_address  <-- we decode the BL (3 insns / 0x0C after match)
+        auto match = findPattern(loader.buffer_, "62 2E 40 F9 E0 03 15 AA E1 03 14 AA",
+                                 "runtimeRoutinesForAddress");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 0x0C;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
+    auto findAllocateChunk = [&]() -> std::optional<uint64_t> {
+        // BL allocate_chunk  <-- the BL we want, the instruction BEFORE the match (match - 4)
+        // ADD X8, X20, #imm; ADRP X9, #page; STR X8, [X9,#imm]
+        auto match = findPattern(loader.buffer_, "? ? 15 91 ? 01 00 ? 28 ? ? ?", "allocateChunk");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match - 4;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
+    auto findTraceWriteMappingRecord = [&]() -> std::optional<uint64_t> {
+        // MOV X1, X19; MOV W2, #0x4000
+        // BL trace_write_mapping_record  <-- we decode the BL (2 insns / 8 after match)
+        auto match = findPattern(loader.buffer_, "E1 03 13 AA 02 00 88 52",
+                                 "traceWriteMappingRecord");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 8;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
     auto exportsFetch = findExportsFetch();
     auto svcCall = findSvcCall();
     auto disableAot = findDisableAot();
     auto classifyArmPc = findClassifyArmPc();
     auto sysCsrctl = findSysCsrctl();
+    auto runtimeRoutinesForAddress = findRuntimeRoutinesForAddress();
+    auto allocateChunk = findAllocateChunk();
+    auto traceWriteMappingRecord = findTraceWriteMappingRecord();
 
-    if (!exportsFetch || !svcCall || !disableAot || !classifyArmPc || !sysCsrctl)
+    if (!exportsFetch || !svcCall || !disableAot || !classifyArmPc || !sysCsrctl ||
+        !runtimeRoutinesForAddress || !allocateChunk || !traceWriteMappingRecord)
         return false;
 
     offsetExportsFetch_ = *exportsFetch;
@@ -73,6 +112,9 @@ auto OffsetFinder::scanRuntime() -> bool {
     offsetDisableAot_ = *disableAot;
     offsetClassifyArmPc_ = *classifyArmPc;
     offsetSysCsrctl_ = *sysCsrctl;
+    offsetRuntimeRoutinesForAddress_ = *runtimeRoutinesForAddress;
+    offsetAllocateChunk_ = *allocateChunk;
+    offsetTraceWriteMappingRecord_ = *traceWriteMappingRecord;
 
     return true;
 }

@@ -15,6 +15,11 @@ struct Offsets {
     uint64_t rosettax87_size;
     uint64_t classify_arm_pc_rva;  // classify_arm_pc offset within libRosettaRuntime
     uint64_t decode_opcode_rva;    // decode_opcode offset within libRosettaRuntime
+    uint64_t runtime_routines_for_address_rva;  // ExecutableHeap::runtime_routines_for_address,
+                                                // offset within the runtime image
+    uint64_t allocate_chunk_rva;   // ExecutableHeap::allocate_chunk, offset within the runtime image
+    uint64_t trace_write_mapping_record_rva;  // trace_write_mapping_record, offset within the
+                                              // runtime image
 };
 
-static_assert(sizeof(Offsets) == 0x40, "Invalid size for Offsets");
+static_assert(sizeof(Offsets) == 0x58, "Invalid size for Offsets");

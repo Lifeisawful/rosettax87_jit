@@ -1,6 +1,5 @@
 #include "rosetta_core/RosettaCore.h"
 
-#include "rosetta_core/ClassifyArmPCHook.h"
 #include "rosetta_core/CustomTranslationHook.h"
 #include "rosetta_core/DecodeOpcodeHook.h"
 
@@ -11,7 +10,6 @@ void rosetta_core_init(const RosettaCoreConfig& config) {
     init_custom_translation_hook(config.translate_insn_addr, config.transaction_result_size_addr,
                                  config.default_free_gpr_mask_addr, config.free_temporary_gpr_addr,
                                  config.translation_hook);
-    init_classify_arm_pc_hook(config.classify_arm_pc_addr, config.rosettax87_base, config.rosettax87_size);
     init_decode_opcode_hook(config.decode_opcode_addr);
 }
 

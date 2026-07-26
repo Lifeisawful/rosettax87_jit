@@ -1,9 +1,7 @@
 // clang-format off
 #include "X87.h"
 
-#include <csignal>
 #include <cstring>
-#include <sys/syscall.h>
 
 #include "Export.h"
 #include "RuntimeOffsets.h"
@@ -21,15 +19,6 @@
 #include "openlibm/e_atan2.h"
 #include "openlibm/e_fmod.h"
 #include "openlibm/s_ilogb.h"
-
-#include "rosetta_core/CoreConfig.h"
-#include "rosetta_core/Opcode.h"
-#include "rosetta_core/RosettaCore.h"
-// Capture the real `struct sigaction` type before RuntimeLibC.h's
-// `#define sigaction rt_sigaction` alias, which would otherwise rewrite the tag.
-using rt_sigaction_t = struct sigaction;
-#include "rosetta_core/RuntimeLibC.h"
-#include "RuntimeConfig.h"
 // clang-format on
 
 #define X87_TRAMPOLINE(NAME, REGISTER)                                 \
@@ -53,45 +42,6 @@ using rt_sigaction_t = struct sigaction;
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
-
-void* init_library(SymbolList const* a1, uint64_t a2, ThreadContextOffsets const* a3) {
-    SIMDGuardFull simdGuard;
-    exportsInit();
-    rosetta_set_config(&kConfig);
-
-    printf("RosettaRuntimex87 built %s - Rosetta Version 0x%llx\n", __DATE__ " " __TIME__, (unsigned long long)kImports.version);
-
-    uintptr_t runtime_library_base =
-        reinterpret_cast<uintptr_t>(orig_init_library) - kOffsets.init_library_rva;
-    uintptr_t translation_ptr = runtime_library_base + kOffsets.translate_insn_addr;
-    uintptr_t transaction_result_size_addr =
-        runtime_library_base + kOffsets.transaction_result_size_addr;
-    uintptr_t classify_arm_pc_ptr = kOffsets.runtime_base + kOffsets.classify_arm_pc_rva;
-    uintptr_t decode_opcode_ptr = runtime_library_base + kOffsets.decode_opcode_rva;
-
-    rosetta_core_init({
-        .runtime_version = kImports.version,
-        .translate_insn_addr = translation_ptr,
-        .transaction_result_size_addr = transaction_result_size_addr,
-        .classify_arm_pc_addr = classify_arm_pc_ptr,
-        .decode_opcode_addr = decode_opcode_ptr,
-        .default_free_gpr_mask_addr = 0,
-        .rosettax87_base = kOffsets.rosettax87_base,
-        .rosettax87_size = kOffsets.rosettax87_size,
-    });
-
-    return orig_init_library(a1, a2, a3);
-}
-
-void register_runtime_routine_offsets(intptr_t* runtime_routine_offsets, const char** runtime_routine_names, int32_t count) {
-    // original code calculates the offsets to each runtime routine. 
-    //  for ( i = 0; i != 0x62; ++i )
-    //     g_runtime_routine_offsets[i] = (char *)g_rt_branch_slot[i] - (char *)stub_far_jmp;
- 
-    // TODO: Overwrite runtime_routine_offsets here with the new offsets to OUR entry stubs. 
-
-    orig_register_runtime_routine_offsets(runtime_routine_offsets, runtime_routine_names, count);
-}
 
 X87_TRAMPOLINE(translator_use_t8027_codegen, x9)
 X87_TRAMPOLINE(translator_reset, x9)

@@ -41,9 +41,36 @@ typedef unsigned int rt_vm_prot_t;
 typedef unsigned long rt_vm_size_t;
 typedef unsigned long rt_vm_address_t;
 
+typedef int rt_mach_port_delta_t;
+typedef unsigned int rt_mach_port_right_t;
+typedef unsigned int rt_mach_port_name_t;
+typedef unsigned int rt_mach_msg_return_t;
+
 rt_mach_port_t rt_mach_task_self(void);
+rt_mach_port_name_t rt_mach_thread_self(void);
+rt_mach_port_name_t rt_mach_reply_port(void);
+rt_kern_return_t rt_mach_port_mod_refs(rt_mach_port_name_t task, rt_mach_port_name_t name,
+                                       rt_mach_port_right_t right, rt_mach_port_delta_t delta);
 rt_kern_return_t rt_vm_protect(rt_mach_port_t task, rt_vm_address_t addr, rt_vm_size_t size,
                                int set_max, rt_vm_prot_t prot);
+rt_mach_msg_return_t rt_mach_msg2(void* data, uint64_t option, uint64_t msgh_bits_and_send_size,
+                                  uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id,
+                                  uint64_t desc_count_and_rcv_name, uint64_t rcv_size_and_priority,
+                                  uint64_t timeout);
+
+// ── ulock ────────────────────────────────────────────────────────────────────
+// Raw SYS_ulock_wait (515) / SYS_ulock_wake (516), the futex the runtime's
+// os_unfair_lock clone is built on.  Callers pass ULF_NO_ERRNO, so the kernel
+// reports a *logical* failure as a negative errno return value with the carry
+// flag clear; carry set means the trap itself failed.  The plain variants
+// collapse a set carry to -1 (matching sys_ulock_wait / sys_ulock_wake); the
+// _e variants hand back the raw value and report the carry via `failed`
+// (matching sys_ulock_wait_v2 / sys_ulock_wake_e, which return it in x1).
+int rt_ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us);
+int rt_ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+int rt_ulock_wait_e(uint32_t operation, void* addr, uint64_t value, uint32_t timeout_us,
+                    int* failed);
+int rt_ulock_wake_e(uint32_t operation, void* addr, uint64_t wake_value, int* failed);
 
 // Process info
 int rt_getpid(void);
@@ -94,6 +121,11 @@ void rt_pthread_jit_write_protect_np(int enabled);
 #define vm_protect(task, addr, size, set_max, prot)                                      \
     rt_vm_protect((rt_mach_port_t)(task), (rt_vm_address_t)(addr), (rt_vm_size_t)(size), \
                   (set_max), (rt_vm_prot_t)(prot))
+
+// __ulock_wait/__ulock_wake are private libsystem_kernel entry points with no
+// public declaration, so callers declare them themselves; redirect to ours.
+#define __ulock_wait rt_ulock_wait
+#define __ulock_wake rt_ulock_wake
 
 #define sys_dcache_flush rt_sys_dcache_flush
 #define sys_icache_invalidate rt_sys_icache_invalidate

@@ -7,15 +7,31 @@ Parses trace files produced by:
 Loads all Type 3 (JIT Code Emitted) records as ARM64 code segments,
 allowing disassembly and analysis of Rosetta's JIT output.
 
-The rt_routines segment is a 0x4000-byte copy of the runtime binary's
-stub page at 0x20000. All 98 known stub functions (from the
-g_rt_* pointer table at 0x31080) are labeled at their correct offsets.
+The rt_routines segment is a copy of the runtime binary's stub page. Stub
+functions are labeled at their offsets within it.
+
+Two stub layouts are supported:
+
+  stock  -- the reference Rosetta runtime's page at 0x20000 (98 stubs, from the
+            g_rt_* pointer table at 0x31080). This is the built-in table.
+  custom -- rosettax87's own runtime_entry.S blob, which runtime_loader maps over
+            that region. Its layout differs for most stubs and adds xrstor/xsave,
+            so the stock table mislabels nearly everything on such a trace.
+
+Generate the custom table with:
+  scripts/extract_stub_offsets.py -o stub_offsets.json
+
+The loader finds it via $ROSETTA_STUB_OFFSETS, or as stub_offsets.json beside the
+trace file, beside this script, or in build/. Selection is controlled by
+$ROSETTA_STUB_LAYOUT = auto (default) | custom | stock.
 
 Installation:
   Copy (or symlink) this file to <IDA>/loaders/
   e.g. /Applications/IDA Professional 9.3.app/Contents/MacOS/loaders/
 """
 
+import json
+import os
 import struct
 import ida_idaapi
 import ida_ida
@@ -153,6 +169,98 @@ RT_ROUTINE_STUBS = [
 ]
 
 
+# ── Custom (rosettax87) stub layout ───────────────────────────────────────────
+#
+# RT_ROUTINE_STUBS above describes the STOCK Rosetta runtime's stub page. When a
+# trace is produced under rosettax87's runtime_loader, our own runtime_entry.S
+# blob is mapped over that region instead, and the layouts differ for most stubs
+# (86 of 98 measured) plus we add xrstor/xsave. Using the stock table on such a
+# trace mislabels nearly every stub.
+#
+# scripts/extract_stub_offsets.py reads the linked libRuntimeRosettax87 symbol
+# table and writes the same triples as JSON. Point STUB_OFFSETS_JSON at it, or
+# drop stub_offsets.json next to this file / in the trace's directory.
+STUB_OFFSETS_ENV = "ROSETTA_STUB_OFFSETS"
+STUB_OFFSETS_BASENAME = "stub_offsets.json"
+
+# Which table to use. "auto" prefers the extracted one when it is found AND its
+# blob size matches the traced region, else falls back to stock.
+#   auto | custom | stock
+LAYOUT_MODE_ENV = "ROSETTA_STUB_LAYOUT"
+
+
+def _candidate_json_paths(trace_path):
+    """Where to look for the extracted offsets, most specific first."""
+    paths = []
+    env = os.environ.get(STUB_OFFSETS_ENV)
+    if env:
+        paths.append(env)
+    if trace_path:
+        paths.append(os.path.join(os.path.dirname(os.path.abspath(trace_path)),
+                                  STUB_OFFSETS_BASENAME))
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths.append(os.path.join(here, STUB_OFFSETS_BASENAME))
+    # Also try the repo layout: <repo>/scripts/../build/bin next to scripts/.
+    paths.append(os.path.join(here, "..", "build", STUB_OFFSETS_BASENAME))
+    return paths
+
+
+def _load_custom_stubs(trace_path):
+    """Load extracted stub triples. Returns (stubs, blob_size, source) or None."""
+    for path in _candidate_json_paths(trace_path):
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            stubs = [(s["offset"], s["size"], s["name"]) for s in data["stubs"]]
+            if not stubs:
+                continue
+            return stubs, data.get("blob_size", 0), path
+        except Exception as exc:
+            ida_kernwin.msg("  WARNING: could not read %s: %s\n" % (path, exc))
+    return None
+
+
+def _select_stub_layout(trace_path, rt_routines_size):
+    """Pick the stub table to label with.
+
+    Returns (stubs, description). Honours ROSETTA_STUB_LAYOUT:
+      stock  — always the built-in reference table
+      custom — the extracted table; errors out loudly if unavailable
+      auto   — extracted when present and consistent, else stock
+    """
+    mode = os.environ.get(LAYOUT_MODE_ENV, "auto").strip().lower()
+
+    if mode == "stock":
+        return RT_ROUTINE_STUBS, "stock (forced by %s)" % LAYOUT_MODE_ENV
+
+    loaded = _load_custom_stubs(trace_path)
+
+    if mode == "custom":
+        if not loaded:
+            ida_kernwin.warning(
+                "%s=custom but no %s found.\nRun scripts/extract_stub_offsets.py "
+                "-o %s" % (LAYOUT_MODE_ENV, STUB_OFFSETS_BASENAME, STUB_OFFSETS_BASENAME))
+            return RT_ROUTINE_STUBS, "stock (custom requested but unavailable)"
+        stubs, blob_size, path = loaded
+        return stubs, "custom from %s (%d stubs)" % (path, len(stubs))
+
+    # auto
+    if not loaded:
+        return RT_ROUTINE_STUBS, "stock (no %s found)" % STUB_OFFSETS_BASENAME
+
+    stubs, blob_size, path = loaded
+    # A traced region smaller than the extracted blob means the trace came from a
+    # different build (or the stock runtime); labelling it with our table would
+    # place stubs past the end of the segment.
+    if rt_routines_size and blob_size and blob_size > rt_routines_size:
+        return (RT_ROUTINE_STUBS,
+                "stock (extracted blob 0x%X exceeds traced region 0x%X — "
+                "mismatched build?)" % (blob_size, rt_routines_size))
+    return stubs, "custom from %s (%d stubs)" % (path, len(stubs))
+
+
 def _parse_records(li):
     """Parse all records from the trace file, returning raw tuples."""
     li.seek(0, 2)
@@ -196,14 +304,26 @@ def _coalesce_ranges(sorted_ranges):
     return merged
 
 
-def _apply_rt_routine_labels(base):
-    """Name and define functions for all known runtime routine stubs."""
+def _apply_rt_routine_labels(base, stubs, region_size=0):
+    """Name and define functions for all known runtime routine stubs.
+
+    Stubs falling outside [base, base+region_size) are skipped rather than
+    labelled at a bogus address — that happens when the table and the traced
+    region come from different builds.
+    """
     count = 0
-    for offset, size, name in RT_ROUTINE_STUBS:
+    skipped = 0
+    for offset, size, name in stubs:
+        if region_size and (offset < 0 or offset + size > region_size):
+            skipped += 1
+            continue
         addr = base + offset
         ida_name.set_name(addr, name, ida_name.SN_NOCHECK | ida_name.SN_NOWARN)
         ida_funcs.add_func(addr, addr + size)
         count += 1
+    if skipped:
+        ida_kernwin.msg("  WARNING: %d stub(s) outside the traced region were skipped\n"
+                        % skipped)
     return count
 
 
@@ -433,14 +553,19 @@ def load_file(li, neflags, format):
             seg_obj.bitness = 2
             seg_obj.perm = 5
 
-        stub_count = _apply_rt_routine_labels(rt_routines_base)
+        stub_table, layout_desc = _select_stub_layout(
+            ida_loader.get_path(ida_loader.PATH_TYPE_CMD), rt_routines_size)
+        ida_kernwin.msg("  Stub layout: %s\n" % layout_desc)
+
+        stub_count = _apply_rt_routine_labels(rt_routines_base, stub_table,
+                                              rt_routines_size)
 
         rt_comment = ("Rosetta runtime routines (trampolines/stubs)\n"
                       "Base: 0x%X  Size: 0x%X  Stubs: %d\n"
-                      "Verbatim copy of runtime binary page at 0x20000\n"
+                      "Stub layout: %s\n"
                       "Runtime binary at: 0x%X" % (
                           rt_routines_base, rt_routines_size,
-                          stub_count, rt_binary_base))
+                          stub_count, layout_desc, rt_binary_base))
         idc.set_cmt(rt_routines_base, rt_comment, 0)
 
     first_addr = jit_records[0][2]
@@ -467,8 +592,7 @@ def load_file(li, neflags, format):
         ida_kernwin.msg("  Runtime binary base: %s\n" % hex(rt_binary_base))
     if rt_routines_base:
         ida_kernwin.msg("  Runtime routines: %s (size %s, %d stubs labeled)\n"
-                        % (hex(rt_routines_base), hex(rt_routines_size),
-                           len(RT_ROUTINE_STUBS)))
+                        % (hex(rt_routines_base), hex(rt_routines_size), stub_count))
 
 
     # Nuke any functions auto-analysis created (it may have merged

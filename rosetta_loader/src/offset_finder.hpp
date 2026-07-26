@@ -14,6 +14,10 @@ struct OffsetFinder {
 
     uint64_t offsetSysCsrctl_{};
 
+    uint64_t offsetRuntimeRoutinesForAddress_{};
+    uint64_t offsetAllocateChunk_{};
+    uint64_t offsetTraceWriteMappingRecord_{};
+
     uint64_t offsetTransactionResultSize_{};
     uint64_t offsetTranslateInsn_{};
     uint64_t offsetInitLibrary_{};

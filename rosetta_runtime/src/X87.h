@@ -3,9 +3,8 @@
 #include <cstdint>
 
 #include "X87Float80.h"
+#include "RuntimeLibrary.h"
 
-struct SymbolList;
-struct ThreadContextOffsets;
 struct X86FloatState64 {};
 enum X87Constant {
     kOne = 0,
@@ -35,12 +34,6 @@ struct X87ResultStatusWord {
     uint16_t statusWord;
 };
 static_assert(sizeof(X87ResultStatusWord) == 0x10);
-
-void* init_library(SymbolList const*, uint64_t, ThreadContextOffsets const*);
-using init_library_t = decltype(&init_library);
-
-void register_runtime_routine_offsets(intptr_t* runtime_routine_offsets, const char** runtime_routine_names, int32_t count);
-using register_runtime_routine_offsets_t = decltype(&register_runtime_routine_offsets);
 
 void translator_use_t8027_codegen();
 using translator_use_t8027_codegen_t = decltype(&translator_use_t8027_codegen);

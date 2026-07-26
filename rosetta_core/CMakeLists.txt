@@ -2,7 +2,6 @@ set(ROSETTA_CORE_SOURCES
     src/CoreConfig.cpp
     src/CoreLog.cpp
     src/CustomTranslationHook.cpp
-    src/ClassifyArmPCHook.cpp
     src/DecodeOpcodeHook.cpp
     src/hook.cpp
     src/AssemblerHelpers.cpp
