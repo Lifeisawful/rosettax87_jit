@@ -3,6 +3,7 @@
 #include "ExecutableHeap.h"
 #include "MachIPC.h"
 #include "SIMDGuard.h"
+#include "Thread.h"
 #include "ThreadContext.h"
 #include "rosetta_core/hook.h"
 
@@ -224,13 +225,45 @@ void abi_info_for_runtime_routines_address(AbiInfo* result, uintptr_t o) {
         (o >= off(syscall_post_svc) && o < off(syscall_sigreturn_case)) ? 1 : 0;
 }
 
-// Is arm_pc inside a mapped runtime-routines region, and if so how far in?
+// 0xB854 / 0x16188 both spell this `kind - 6 < 2`: RuntimeRoutines(6) and
+// InvalidRuntimeRoutines(7) — a retired region still classifies until the AOT GC
+// reclaims it.
+inline bool is_runtime_routines_kind(CodeFragmentKind kind) {
+    return kind == CodeFragmentKind::RuntimeRoutines ||
+           kind == CodeFragmentKind::InvalidRuntimeRoutines;
+}
+
+// Which fragment owns a pc, decided by the arm tree exactly as the reference
+// does it (0xB7AC-0xB7E0, 0x160C4-0x160EC) — NOT by a cached region base.  There
+// is one RuntimeRoutines fragment per heap chunk, and allocate_chunk runs again
+// every time the heap fills, so any single base/size pair is wrong the moment a
+// second chunk exists.
 //
-// Which fragment owns a pc is decided by the arm tree, exactly as the reference
-// does it (0xB7AC-0xB7E0) — NOT by a cached region base.  There is one
-// RuntimeRoutines fragment per heap chunk, and allocate_chunk runs again every
-// time the heap fills, so any single base/size pair is wrong the moment a second
-// chunk exists.
+// The caller must ALREADY hold arm_tree_lock.  It cannot be taken here because
+// classify_arm_pc_objc_full has to keep it across the
+// instruction_extents_for_arm_address call — the reference issues that at
+// 0x161D8, before its unlock at 0x161E0, and the fragment's offset map is only
+// stable under the lock.
+const CodeFragmentMetadata* find_fragment_locked(uintptr_t arm_pc) {
+    const CodeFragmentMetadata* node = g_executable_heap->arm_tree.root;
+
+    while (node) {
+        const uint64_t base = node->arm_base;
+        if (arm_pc < base) {
+            node = node->bst_left;               // 0xB7C0: child at 0x30
+            continue;
+        }
+        if (base + node->arm_size <= arm_pc) {
+            node = node->bst_right;              // 0xB7D8: child at 0x38
+            continue;
+        }
+        return node;
+    }
+
+    return nullptr;
+}
+
+// Is arm_pc inside a mapped runtime-routines region, and if so how far in?
 //
 // `lock_owner` is the caller's own mach thread port, the `self` token
 // os_unfair_lock_*_no_tsd takes.
@@ -243,27 +276,12 @@ bool runtime_routines_offset_for(uintptr_t arm_pc, uint32_t lock_owner, uintptr_
     os_unfair_lock_lock_no_tsd(&heap->arm_tree_lock, OS_UNFAIR_LOCK_DATA_SYNCHRONIZATION,
                                lock_owner);
 
-    const CodeFragmentMetadata* node = heap->arm_tree.root;
+    const CodeFragmentMetadata* node = find_fragment_locked(arm_pc);
     uintptr_t offset = 0;
     bool is_runtime_routines = false;
-
-    while (node) {
-        const uint64_t base = node->arm_base;
-        if (arm_pc < base) {
-            node = node->bst_left;               // 0xB7C0: child at 0x30
-            continue;
-        }
-        if (base + node->arm_size <= arm_pc) {
-            node = node->bst_right;              // 0xB7D8: child at 0x38
-            continue;
-        }
-        // Fragment found.  0xB854: `kind - 6 < 2` accepts RuntimeRoutines(6)
-        // and InvalidRuntimeRoutines(7) — a retired region still classifies
-        // until the AOT GC reclaims it.
-        is_runtime_routines = (node->kind == CodeFragmentKind::RuntimeRoutines ||
-                               node->kind == CodeFragmentKind::InvalidRuntimeRoutines);
-        offset = static_cast<uintptr_t>(arm_pc - base);
-        break;
+    if (node) {
+        is_runtime_routines = is_runtime_routines_kind(node->kind);
+        offset = static_cast<uintptr_t>(arm_pc - node->arm_base);
     }
 
     os_unfair_lock_unlock_no_tsd(&heap->arm_tree_lock, lock_owner);
@@ -352,6 +370,27 @@ using classify_arm_pc_objc_t = ObjcPcResult (*)(ThreadContext*, uint32_t, uint64
 
 classify_arm_pc_objc_t g_original_classify_arm_pc_objc = nullptr;
 
+// ── the three reference helpers the full replacement calls ───────────────────
+//
+// All internal (non-exported) runtime functions; the loader locates them and
+// hands the addresses to init_classify_arm_pc_objc_hook.  Null until then, which
+// is what selects the pre-filter fallback.
+//
+// Signatures come from the reference call sites in classify_arm_pc_objc:
+//   0x16048-0x16050  X0 = &AbiInfo, X1 = arm_pc
+//   0x160F8-0x16104  X0 = &out, X1 = ctx->thread_port, X2 = thread
+//   0x161D0-0x161D8  X0 = &TranslatedCodePayload, X1 = fragment, X2 = arm_pc
+using abi_info_for_runtime_t = void (*)(AbiInfo* result, uintptr_t arm_pc);
+using thread_entry_for_port_t = void (*)(ThreadLookupResult* out, uint32_t lock_owner,
+                                         uint32_t thread);
+using instruction_extents_for_arm_address_t = void (*)(TranslatedCodePayload* out,
+                                                       const CodeFragmentMetadata* fragment,
+                                                       uintptr_t arm_pc);
+
+abi_info_for_runtime_t g_abi_info_for_runtime = nullptr;
+thread_entry_for_port_t g_thread_entry_for_port = nullptr;
+instruction_extents_for_arm_address_t g_instruction_extents_for_arm_address = nullptr;
+
 // The reference's two answers, from 0x16068 (success) and 0x16024 (failure).
 // 5 with the carry flag set reads as EIO to the guest: "cannot determine".
 constexpr ObjcPcResult kObjcPcOk{0, 0};
@@ -391,7 +430,24 @@ constexpr uint32_t kArmThreadState64Count = 0x44;
 // registered any ranges.  Reaching it requires the guest to make this call at
 // all, which only libobjc's restartable-range support does, and that registers
 // first.  We answer rather than abort in that (unreachable) ordering.
-ObjcPcResult classify_arm_pc_objc(ThreadContext* ctx, uint32_t thread, uint64_t* out_x86_pc) {
+//
+// ── KNOWN WEAKNESS — this is the fallback, not the fix ───────────────────────
+//
+// Forwarding is a second sample.  The original re-reads the thread state in its
+// own prologue (0x1601C), and the interrogated thread is NOT suspended — the
+// whole "return 5, caller retries" protocol exists because it is running.  So
+// between our read and theirs it can move, and it only has to move into the
+// syscall dispatcher (blob offset 0x4020 onward, where every blocked thread
+// parks) for the original to compute an offset >= 0x4000 and trip
+//
+//     ASSERT(offset < kRuntimeRoutinesSize)      [0x16194, traps at 0x1622C]
+//
+// The window is microseconds, but a launch issues thousands of these queries.
+// classify_arm_pc_objc_full below closes it by never forwarding; this version
+// survives only so that a failed helper lookup degrades to the old behaviour
+// instead of leaving the trap completely unhooked.
+ObjcPcResult classify_arm_pc_objc_prefilter(ThreadContext* ctx, uint32_t thread,
+                                            uint64_t* out_x86_pc) {
     // We are reached from the syscall dispatcher, whose entry stub spills the
     // guest GPRs to [x18] and nothing else — guest XMM state is still sitting in
     // the caller-saved v registers.  Our own AbiInfo stores compile to
@@ -424,9 +480,182 @@ ObjcPcResult classify_arm_pc_objc(ThreadContext* ctx, uint32_t thread, uint64_t*
         }
     }
 
-    // Not ours: the original re-reads the thread state.  This runs once per
-    // thread per objc cache flush, so the duplicate thread_get_state is free.
+    // Not ours: the original re-reads the thread state.  Cheap, but see the
+    // KNOWN WEAKNESS note above — that re-read is the race.
     return g_original_classify_arm_pc_objc(ctx, thread, out_x86_pc);
+}
+
+// The thread-registry fallback — reference LABEL_18 at 0x16104.
+//
+// MUST NOT be called with arm_tree_lock held: thread_entry_for_port takes
+// g_threads.lock, and every reference path releases arm_tree first (the unlocks
+// at 0x160F4 and 0x161C0 both precede the call).  Holding both would invent a
+// lock order nothing else in the runtime uses.
+ObjcPcResult objc_registry_answer(ThreadContext* ctx, uint32_t thread, uint64_t* out_x86_pc) {
+    // Deliberately not value-initialised: a 0x28-byte zero-init compiles to a
+    // q-register store, which is exactly what the SIMD guard exists to contain.
+    // On a miss the callee writes only thread_id and found (see Thread.h), so
+    // `found` is the one field that has to be sane going in.
+    ThreadLookupResult entry;
+    entry.found = 0;
+    entry.thread.is_runtime_thread = 0;
+
+    g_thread_entry_for_port(&entry, ctx->thread_port, thread);
+
+    // 0x16128: `found == 1 && is_runtime_thread == 1`.  Only the runtime's own
+    // threads — registered by register_runtime_mach_thread, which sets
+    // is_runtime_thread — may legitimately answer "x86 pc 0" for a pc we could
+    // not place.  A guest thread here is genuinely unresolvable.
+    if (entry.found == 1 && entry.thread.is_runtime_thread == 1) {
+        *out_x86_pc = 0;
+        return kObjcPcOk;
+    }
+
+    return kObjcPcCannotDetermine;
+}
+
+// Full replacement for classify_arm_pc_objc (0x15FC0) — the actual fix.
+//
+// Samples the interrogated thread's pc exactly ONCE and never calls the
+// original, which is the only way to close the race documented on the pre-filter
+// above.  What follows is the reference's own control flow in its own order,
+// with the one region we own answered from our own landmark table.
+//
+// Three regions, three authorities:
+//
+//   the two static image ranges  -> g_abi_info_for_runtime, the reference's.
+//       Its landmark table is right for those, because we never overwrite them:
+//       map_runtime_routines remaps OUR blob onto the JIT heap and leaves the
+//       translator's in-image copy untouched.  That copy really is executed —
+//       mig_task_subsystem (0x14790) and vtable_bsdthread_register
+//       (0x14364/0x1436C) plant its addresses as thread entry points — which is
+//       where AbiKind_NewThread comes from and why the arm_tree walk alone
+//       cannot replace this call.
+//
+//   the mapped blob              -> ours, keyed on offsets into our own
+//       runtime_entry.S.  No 0x4000 bound: our blob is 0x4E7C and every byte of
+//       it is addressable here.
+//
+//   translated guest code        -> the reference's offset-map decoder.
+ObjcPcResult classify_arm_pc_objc_full(ThreadContext* ctx, uint32_t thread,
+                                       uint64_t* out_x86_pc) {
+    // Reached from the syscall dispatcher, which spills the guest GPRs to [x18]
+    // and nothing else — no FP anywhere in runtime_syscall — so the guest's XMM
+    // state is still live in v0-v7.  The reference survives without a guard only
+    // because its codegen happens to be v-register-free (abi_info_for_runtime
+    // zeroes its AbiInfo with `STP XZR, XZR` at 0xB1E8, not `movi v0.2d`); ours
+    // is not, and AbiInfo/TranslatedCodePayload zero-inits are exactly the shape
+    // clang lowers to `movi.2d v0` + `stur q0`.  v8-v15 are callee-saved, so
+    // q0-q7 is the whole exposure.  The guard spans the entire body, including
+    // the calls into reference code.
+    SIMDGuardFull simdGuard;
+
+    // Not zero-initialised: thread_get_state fills it and we only read `pc`
+    // after it reports success.
+    ArmThreadState64 state;
+    uint32_t count = kArmThreadState64Count;
+
+    if (!ctx || mach_thread_get_state(thread, kArmThreadState64Flavor, &state, &count) != 0)
+        return kObjcPcCannotDetermine;   // 0x16024
+
+    if (state.pc == 0) {                 // 0x16038: not executing guest code
+        *out_x86_pc = 0;
+        return kObjcPcOk;
+    }
+
+    const uintptr_t arm_pc = static_cast<uintptr_t>(state.pc);
+
+    // 0x16050.  Writes kind unconditionally and zeroes the payload, so no
+    // initialisation is needed here.
+    AbiInfo info;
+    g_abi_info_for_runtime(&info, arm_pc);
+    if (info.kind != AbiKind_Unknown) {
+        // 0x16060.  A thread still inside a thread-entry trampoline has never
+        // run guest code, so "x86 pc 0" is exact.
+        if (info.kind == AbiKind_NewThread) {
+            *out_x86_pc = 0;
+            return kObjcPcOk;
+        }
+        return objc_registry_answer(ctx, thread, out_x86_pc);
+    }
+
+    // No heap yet means no fragments yet; nothing to walk.
+    if (!g_executable_heap)
+        return objc_registry_answer(ctx, thread, out_x86_pc);
+
+    ExecutableHeap* const heap = g_executable_heap;
+    const uint32_t lock_owner = ctx->thread_port;
+
+    os_unfair_lock_lock_no_tsd(&heap->arm_tree_lock, OS_UNFAIR_LOCK_DATA_SYNCHRONIZATION,
+                               lock_owner);
+
+    const CodeFragmentMetadata* const node = find_fragment_locked(arm_pc);
+    if (!node) {
+        os_unfair_lock_unlock_no_tsd(&heap->arm_tree_lock, lock_owner);
+        return objc_registry_answer(ctx, thread, out_x86_pc);
+    }
+
+    const CodeFragmentKind kind = node->kind;
+
+    // Our mapped runtime_entry blob.  This is the arm the reference gets wrong.
+    if (is_runtime_routines_kind(kind)) {
+        AbiInfo blob;
+        abi_info_for_runtime_routines_address(&blob,
+                                              static_cast<uintptr_t>(arm_pc - node->arm_base));
+        os_unfair_lock_unlock_no_tsd(&heap->arm_tree_lock, lock_owner);
+
+        // 0x161C4.  Blocked in the syscall stub: the guest GPRs are committed to
+        // [x18] and the thread is definitively not inside an objc restartable
+        // range, so "not executing guest code" is exact.  Every other blob kind
+        // is transient and falls through to the registry.
+        if (blob.kind == AbiKind_Syscall) {
+            *out_x86_pc = 0;
+            return kObjcPcOk;
+        }
+        return objc_registry_answer(ctx, thread, out_x86_pc);
+    }
+
+    // The translator binary / libRosettaRuntime images.  The reference ASSERT2s
+    // here (0x161F8, "address is in a runtime code fragment but
+    // abi_kind_for_runtime did not catch it") because abi_info_for_runtime
+    // should already have claimed the pc.  It can miss — a pc in the translator
+    // image at or above its in-image blob window returns Unknown and lands here
+    // — so we answer instead of trapping.
+    if (kind == CodeFragmentKind::RuntimeBinary) {
+        os_unfair_lock_unlock_no_tsd(&heap->arm_tree_lock, lock_owner);
+        return objc_registry_answer(ctx, thread, out_x86_pc);
+    }
+
+    // Translated guest code.
+    //
+    // The reference first tests the fragment's x86 range against every
+    // registered objc restartable range (0x16158-0x16184) and only decodes the
+    // exact pc when one overlaps, answering with the coarse node->x86_base
+    // otherwise.  We always decode instead: the exact pc is a strictly better
+    // answer to the caller's real question ("is this thread inside a restartable
+    // range?"), it agrees with the reference wherever the reference decodes, and
+    // it removes any need for g_objc_restartable_ranges / _count / _valid.
+    //
+    // Retired fragments are the exception.  InvalidAot/InvalidJit are on their
+    // way out and their offset maps may already be gone, so those keep the
+    // coarse answer — the reference reaches them far more rarely and we would
+    // rather not widen that exposure for a pc no thread should be executing.
+    uint64_t x86_pc = node->x86_base;
+    if (kind == CodeFragmentKind::Aot || kind == CodeFragmentKind::AotSharedCache ||
+        kind == CodeFragmentKind::Jit) {
+        // Decoded under the lock, as at 0x161D8.  Pre-seeded so a callee that
+        // declines to write leaves us with the coarse answer rather than stack
+        // garbage.
+        TranslatedCodePayload payload;
+        payload.x86_pc = x86_pc;
+        g_instruction_extents_for_arm_address(&payload, node, arm_pc);
+        x86_pc = payload.x86_pc;
+    }
+
+    os_unfair_lock_unlock_no_tsd(&heap->arm_tree_lock, lock_owner);
+
+    *out_x86_pc = x86_pc;
+    return kObjcPcOk;
 }
 
 // Is the pointer in vtable slot +0xF8 really classify_arm_pc_objc?
@@ -480,7 +709,10 @@ void init_translation_cache_abi_hooks(uintptr_t classify_arm_pc_addr, uintptr_t 
                  reinterpret_cast<void**>(&g_original_classify_arm_pc));
 }
 
-void init_classify_arm_pc_objc_hook(const ThreadContextVTable* vtable) {
+void init_classify_arm_pc_objc_hook(const ThreadContextVTable* vtable,
+                                    uintptr_t abi_info_for_runtime_addr,
+                                    uintptr_t thread_entry_for_port_addr,
+                                    uintptr_t instruction_extents_for_arm_address_addr) {
     if (!vtable || !vtable->classify_arm_pc_objc)
         return;
 
@@ -497,8 +729,35 @@ void init_classify_arm_pc_objc_hook(const ThreadContextVTable* vtable) {
         return;
     }
 
+    g_abi_info_for_runtime =
+        reinterpret_cast<abi_info_for_runtime_t>(abi_info_for_runtime_addr);
+    g_thread_entry_for_port =
+        reinterpret_cast<thread_entry_for_port_t>(thread_entry_for_port_addr);
+    g_instruction_extents_for_arm_address =
+        reinterpret_cast<instruction_extents_for_arm_address_t>(
+            instruction_extents_for_arm_address_addr);
+
+    // All three or none: the full replacement calls every one of them on some
+    // path, and a null there would fault instead of merely misclassifying.
+    const bool have_helpers = g_abi_info_for_runtime && g_thread_entry_for_port &&
+                              g_instruction_extents_for_arm_address;
+
+#ifdef ROSETTA_RUNTIME
+    if (!have_helpers) {
+        printf(
+            "RosettaRuntimex87: WARNING classify_arm_pc_objc helpers unresolved "
+            "(abi_info_for_runtime=%p thread_entry_for_port=%p "
+            "instruction_extents_for_arm_address=%p) — installing the pre-filter hook; the "
+            "thread_get_state race that trips kRuntimeRoutinesSize stays open\n",
+            reinterpret_cast<void*>(abi_info_for_runtime_addr),
+            reinterpret_cast<void*>(thread_entry_for_port_addr),
+            reinterpret_cast<void*>(instruction_extents_for_arm_address_addr));
+    }
+#endif
+
     g_original_classify_arm_pc_objc = reinterpret_cast<classify_arm_pc_objc_t>(target);
     hook_install(reinterpret_cast<void*>(g_original_classify_arm_pc_objc),
-                 reinterpret_cast<void*>(&classify_arm_pc_objc),
+                 reinterpret_cast<void*>(have_helpers ? &classify_arm_pc_objc_full
+                                                      : &classify_arm_pc_objc_prefilter),
                  reinterpret_cast<void**>(&g_original_classify_arm_pc_objc));
 }

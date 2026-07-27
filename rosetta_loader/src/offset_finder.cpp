@@ -100,6 +100,53 @@ auto OffsetFinder::scanRuntime() -> bool {
         return aarch64::decodeBl(blInsn, blOffset);
     };
 
+    // ── classify_arm_pc_objc's three helpers ────────────────────────────────
+    //
+    // Each is anchored on the two argument-setup instructions immediately before
+    // its call, and the BL two instructions later (+8) is decoded.  Anchoring on
+    // the argument shuffle rather than on a prologue keeps these independent of
+    // how the callee itself is compiled; all three patterns are unique in the
+    // runtime image and were checked against two Rosetta versions.
+
+    auto findAbiInfoForRuntime = [&]() -> std::optional<uint64_t> {
+        // SUB X0, X29, #0x88; MOV X1, X23
+        // BL abi_info_for_runtime  <-- we decode the BL (2 insns / 8 after match)
+        // The classify_arm_pc_objc site: X0 = &AbiInfo on the frame, X1 = the arm
+        // pc just read out of the interrogated thread's state.
+        auto match = findPattern(loader.buffer_, "A0 23 02 D1 E1 03 17 AA", "abiInfoForRuntime");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 8;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
+    auto findThreadEntryForPort = [&]() -> std::optional<uint64_t> {
+        // SUB X0, X29, #0x68; MOV X1, X19
+        // BL thread_entry_for_port  <-- we decode the BL (2 insns / 8 after match)
+        // X0 = the 0x21-byte ThreadLookupResult out-parameter, X1 = lock_owner.
+        auto match = findPattern(loader.buffer_, "A0 A3 01 D1 E1 03 13 AA", "threadEntryForPort");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 8;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
+    auto findInstructionExtentsForArmAddress = [&]() -> std::optional<uint64_t> {
+        // ADD X0, SP, #0x60; MOV X2, X23
+        // BL instruction_extents_for_arm_address  <-- the BL 8 after the match
+        // X0 = &TranslatedCodePayload, X2 = arm_pc (X1 is the fragment, already
+        // live from the tree walk, so it is not part of the anchor).
+        auto match = findPattern(loader.buffer_, "E0 23 00 91 E2 03 17 AA",
+                                 "instructionExtentsForArmAddress");
+        if (!match)
+            return std::nullopt;
+        uint64_t blOffset = *match + 8;
+        uint32_t blInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[blOffset]);
+        return aarch64::decodeBl(blInsn, blOffset);
+    };
+
     auto svcCall = findSvcCall();
     auto disableAot = findDisableAot();
     auto classifyArmPc = findClassifyArmPc();
@@ -108,10 +155,14 @@ auto OffsetFinder::scanRuntime() -> bool {
     auto allocateChunk = findAllocateChunk();
     auto traceWriteMappingRecord = findTraceWriteMappingRecord();
     auto bindLibraryStubs = findBindLibraryStubs();
+    auto abiInfoForRuntime = findAbiInfoForRuntime();
+    auto threadEntryForPort = findThreadEntryForPort();
+    auto instructionExtentsForArmAddress = findInstructionExtentsForArmAddress();
 
     if (!svcCall || !disableAot || !classifyArmPc || !sysCsrctl ||
         !runtimeRoutinesForAddress || !allocateChunk || !traceWriteMappingRecord ||
-        !bindLibraryStubs)
+        !bindLibraryStubs || !abiInfoForRuntime || !threadEntryForPort ||
+        !instructionExtentsForArmAddress)
         return false;
 
     offsetSvcCallEntry_ = *svcCall;
@@ -123,6 +174,9 @@ auto OffsetFinder::scanRuntime() -> bool {
     offsetAllocateChunk_ = *allocateChunk;
     offsetTraceWriteMappingRecord_ = *traceWriteMappingRecord;
     offsetBindLibraryStubs_ = *bindLibraryStubs;
+    offsetAbiInfoForRuntime_ = *abiInfoForRuntime;
+    offsetThreadEntryForPort_ = *threadEntryForPort;
+    offsetInstructionExtentsForArmAddress_ = *instructionExtentsForArmAddress;
 
     return true;
 }

@@ -68,7 +68,41 @@
 // from our _start.  See RuntimeLibrary.cpp.
 struct ThreadContextVTable;
 
-void init_classify_arm_pc_objc_hook(const ThreadContextVTable* vtable);
+// Installs the classify_arm_pc_objc hook.
+//
+// Two implementations exist and the arguments pick between them:
+//
+//   all three addresses non-zero — the FULL replacement.  Samples the
+//     interrogated thread's pc exactly once and never calls the original, which
+//     is the only way to close the race described in TranslationCacheAbi.cpp.
+//
+//   any address zero — the PRE-FILTER.  Answers for pcs inside our mapped blob
+//     and forwards everything else to the original.  This is the older, weaker
+//     behaviour: the original re-reads the thread state, so a thread that moves
+//     into the syscall dispatcher in between still trips its 0x4000 assert.
+//     Kept as the fallback so a failed lookup degrades instead of breaking.
+//
+// The three are internal (non-exported) runtime functions, located by the loader
+// and passed through Offsets:
+//
+//   abi_info_for_runtime                (0xB138)  classifies the two static
+//       image ranges — the translator binary and libRosettaRuntime — including
+//       the translator's own in-image copy of runtime_entry, which really is
+//       executed: mig_task_subsystem (0x14790) and vtable_bsdthread_register
+//       (0x14364/0x1436C) plant those image addresses as thread entry points.
+//       That is where AbiKind_NewThread comes from, and it is why this cannot be
+//       replaced by the arm_tree walk.
+//
+//   thread_entry_for_port               (0x96E4)  the thread-registry fallback:
+//       only the runtime's own threads may answer "x86 pc 0" for an unmappable
+//       pc.  See Thread.h for the out-parameter contract.
+//
+//   instruction_extents_for_arm_address (0x7478)  decodes the exact guest pc
+//       from a translated fragment's offset map.
+void init_classify_arm_pc_objc_hook(const ThreadContextVTable* vtable,
+                                    uintptr_t abi_info_for_runtime_addr,
+                                    uintptr_t thread_entry_for_port_addr,
+                                    uintptr_t instruction_extents_for_arm_address_addr);
 
 // Installs the hook over the reference classify_arm_pc and records the bounds of
 // our own loaded library image.  Called from runtime_early_init.

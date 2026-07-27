@@ -72,8 +72,24 @@ void register_runtime_routine_offsets(intptr_t* runtime_routine_offsets, const c
     // it calls us (0x129DC) — and our _start runs before main(), where X18 is
     // still unset.  Nothing guest-side can reach the objc trap before this
     // point, so installing here is early enough.
-    if (const ThreadContext* ctx = current_thread_context())
-        init_classify_arm_pc_objc_hook(ctx->vtable);
+    //
+    // The three trailing arguments are the reference helpers the full
+    // replacement calls.  They are internal, non-exported functions in the
+    // RUNTIME image, so they rebase on kOffsets.runtime_base — not on
+    // runtime_library_base above, which is libRosettaRuntime's.  A zero RVA
+    // (pattern no longer matches) makes init fall back to the pre-filter hook.
+    if (const ThreadContext* ctx = current_thread_context()) {
+        const uintptr_t runtime_base = kOffsets.runtime_base;
+        init_classify_arm_pc_objc_hook(
+            ctx->vtable,
+            kOffsets.abi_info_for_runtime_rva ? runtime_base + kOffsets.abi_info_for_runtime_rva
+                                              : 0,
+            kOffsets.thread_entry_for_port_rva ? runtime_base + kOffsets.thread_entry_for_port_rva
+                                               : 0,
+            kOffsets.instruction_extents_for_arm_address_rva
+                ? runtime_base + kOffsets.instruction_extents_for_arm_address_rva
+                : 0);
+    }
 
     orig_register_runtime_routine_offsets(runtime_routine_offsets, runtime_routine_names, count);
 }

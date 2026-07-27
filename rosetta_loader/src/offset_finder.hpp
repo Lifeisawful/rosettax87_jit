@@ -18,6 +18,12 @@ struct OffsetFinder {
     uint64_t offsetTraceWriteMappingRecord_{};
     uint64_t offsetBindLibraryStubs_{};
 
+    // The three helpers our full classify_arm_pc_objc replacement calls. All are
+    // internal (non-exported) runtime functions — see TranslationCacheAbi.h.
+    uint64_t offsetAbiInfoForRuntime_{};
+    uint64_t offsetThreadEntryForPort_{};
+    uint64_t offsetInstructionExtentsForArmAddress_{};
+
     uint64_t offsetTransactionResultSize_{};
     uint64_t offsetTranslateInsn_{};
     uint64_t offsetInitLibrary_{};

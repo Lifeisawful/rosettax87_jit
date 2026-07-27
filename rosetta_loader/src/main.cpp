@@ -928,12 +928,16 @@ int main(int argc, char* argv[]) {
     LOG("offset_svc_call_entry=%llx offset_svc_call_ret=%llx "
         "offset_classify_arm_pc=%llx offset_sys_csrctl=%llx "
         "offset_runtime_routines_for_address=%llx offset_allocate_chunk=%llx "
-        "offset_trace_write_mapping_record=%llx offset_bind_library_stubs=%llx\n",
+        "offset_trace_write_mapping_record=%llx offset_bind_library_stubs=%llx "
+        "offset_abi_info_for_runtime=%llx offset_thread_entry_for_port=%llx "
+        "offset_instruction_extents_for_arm_address=%llx\n",
         offsetFinder.offsetSvcCallEntry_,
         offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_,
         offsetFinder.offsetSysCsrctl_, offsetFinder.offsetRuntimeRoutinesForAddress_,
         offsetFinder.offsetAllocateChunk_, offsetFinder.offsetTraceWriteMappingRecord_,
-        offsetFinder.offsetBindLibraryStubs_);
+        offsetFinder.offsetBindLibraryStubs_, offsetFinder.offsetAbiInfoForRuntime_,
+        offsetFinder.offsetThreadEntryForPort_,
+        offsetFinder.offsetInstructionExtentsForArmAddress_);
 
     if (!offsetFinder.scanLibRosettaRuntime()) {
         fprintf(stderr, "Fatal: failed to scan libRosettaRuntime for offsets.\n");
@@ -1271,6 +1275,10 @@ int main(int argc, char* argv[]) {
         .allocate_chunk_rva = offsetFinder.offsetAllocateChunk_,
         .trace_write_mapping_record_rva = offsetFinder.offsetTraceWriteMappingRecord_,
         .bind_library_stubs_rva = offsetFinder.offsetBindLibraryStubs_,
+        .abi_info_for_runtime_rva = offsetFinder.offsetAbiInfoForRuntime_,
+        .thread_entry_for_port_rva = offsetFinder.offsetThreadEntryForPort_,
+        .instruction_extents_for_arm_address_rva =
+            offsetFinder.offsetInstructionExtentsForArmAddress_,
     };
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));

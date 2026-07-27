@@ -21,6 +21,14 @@ struct Offsets {
     uint64_t trace_write_mapping_record_rva;  // trace_write_mapping_record, offset within the
                                               // runtime image
     uint64_t bind_library_stubs_rva;  // bind_library_stubs, offset within the runtime image
+
+    // The three helpers the full classify_arm_pc_objc replacement calls. All are
+    // internal (non-exported) functions in the RUNTIME image, so these are
+    // offsets from runtime_base — not from the libRosettaRuntime base that
+    // init_library_rva is relative to. See TranslationCacheAbi.h.
+    uint64_t abi_info_for_runtime_rva;
+    uint64_t thread_entry_for_port_rva;
+    uint64_t instruction_extents_for_arm_address_rva;
 };
 
-static_assert(sizeof(Offsets) == 0x60, "Invalid size for Offsets");
+static_assert(sizeof(Offsets) == 0x78, "Invalid size for Offsets");
