@@ -1008,15 +1008,34 @@ L\name\()_ktan_done:
 .endm
 
 // By-value huge/Inf/NaN fallback for the _stub_*_val entries (OPT-TI): save
-// everything an AAPCS call can clobber and the JIT may have live — guest
-// GPRs x0-x15, x16/x17, x30, NZCV, guest vectors q0-q15 (FULL width — AAPCS
-// only preserves the low halves of v8-v15), and q16-q31 (live IR pool
-// values).  x18 is the reserved platform register on Apple targets — no
-// compiled C touches it.  Result returns via x29 so the q16 restore cannot
-// clobber it; ends at the entry's L\name\()_ret.
+// what the C fallback actually clobbers and the JIT may have live — guest
+// GPRs x0-x15, x16/x17, x30, NZCV, guest xmm0-7 in q0-q7, and the live IR
+// pool q17-q23 (q18-q23 for fsincos; the excluded arg/result regs are dead).
+// x18 is the reserved platform register on Apple targets — no compiled C
+// touches it.  Result returns via x29 so the vector restores cannot clobber
+// it; ends at the entry's L\name\()_ret.
+//
+// Two measured constraints (2026-07-27, bench_fcos huge/out_of_range — the
+// original "save q0-q31 + GPRs with STP pairs" version was 2x SLOWER than the
+// classic memory-state stub, ~90ns/op of pure save/restore):
+//
+// 1. SINGLE str/ldr Q only, never STP/LDP Q-pairs.  In guest (TSO) context a
+//    Q-pair save+restore costs ~17 cycles (~5ns) VS ~0.5ns as two singles —
+//    a ~10x per-pair penalty that scales linearly with pair count (native
+//    arm64 runs the identical pair sequence at full speed).  GPR X-pairs are
+//    fine.  Do not "clean this up" back into pairs.
+//
+// 2. The vector save set is the C fallbacks' ACTUAL clobber set, not the
+//    AAPCS worst case.  x87_trig_{cos,sin,tan,sincos}_value are self-contained
+//    (openlibm fully inlined, no outgoing calls) and touch only v0-v7 and
+//    v16-v23.  v8-v15 (guest xmm8-15 — AAPCS only preserves the LOW halves)
+//    and v24-v31 (live IR pool) are never saved here, so the build-time audit
+//    scripts/audit_trig_value_clobbers.sh FAILS the build if a compiler
+//    change makes the fallbacks touch them.  If that ever fires, either
+//    restore the missing str/ldr q slots or fix the codegen.
 .macro TRIG_VAL_HUGE name, fnptr
 L\name\()_huge:
-    sub  sp, sp, #0x2A0
+    sub  sp, sp, #0x190
     stp  x0,  x1,  [sp]
     stp  x2,  x3,  [sp, #0x10]
     stp  x4,  x5,  [sp, #0x20]
@@ -1028,42 +1047,40 @@ L\name\()_huge:
     stp  x16, x17, [sp, #0x80]
     mrs  x29, nzcv
     stp  x29, x30, [sp, #0x90]
-    stp  q0,  q1,  [sp, #0xA0]
-    stp  q2,  q3,  [sp, #0xC0]
-    stp  q4,  q5,  [sp, #0xE0]
-    stp  q6,  q7,  [sp, #0x100]
-    stp  q8,  q9,  [sp, #0x120]
-    stp  q10, q11, [sp, #0x140]
-    stp  q12, q13, [sp, #0x160]
-    stp  q14, q15, [sp, #0x180]
-    stp  q16, q17, [sp, #0x1A0]
-    stp  q18, q19, [sp, #0x1C0]
-    stp  q20, q21, [sp, #0x1E0]
-    stp  q22, q23, [sp, #0x200]
-    stp  q24, q25, [sp, #0x220]
-    stp  q26, q27, [sp, #0x240]
-    stp  q28, q29, [sp, #0x260]
-    stp  q30, q31, [sp, #0x280]
+    str  q0,  [sp, #0xA0]
+    str  q1,  [sp, #0xB0]
+    str  q2,  [sp, #0xC0]
+    str  q3,  [sp, #0xD0]
+    str  q4,  [sp, #0xE0]
+    str  q5,  [sp, #0xF0]
+    str  q6,  [sp, #0x100]
+    str  q7,  [sp, #0x110]
+    str  q17, [sp, #0x120]
+    str  q18, [sp, #0x130]
+    str  q19, [sp, #0x140]
+    str  q20, [sp, #0x150]
+    str  q21, [sp, #0x160]
+    str  q22, [sp, #0x170]
+    str  q23, [sp, #0x180]
     ldr  x29, \fnptr
     fmov d0, d16
     blr  x29
     fmov x29, d0                     // result survives the vector restores
-    ldp  q30, q31, [sp, #0x280]
-    ldp  q28, q29, [sp, #0x260]
-    ldp  q26, q27, [sp, #0x240]
-    ldp  q24, q25, [sp, #0x220]
-    ldp  q22, q23, [sp, #0x200]
-    ldp  q20, q21, [sp, #0x1E0]
-    ldp  q18, q19, [sp, #0x1C0]
-    ldp  q16, q17, [sp, #0x1A0]
-    ldp  q14, q15, [sp, #0x180]
-    ldp  q12, q13, [sp, #0x160]
-    ldp  q10, q11, [sp, #0x140]
-    ldp  q8,  q9,  [sp, #0x120]
-    ldp  q6,  q7,  [sp, #0x100]
-    ldp  q4,  q5,  [sp, #0xE0]
-    ldp  q2,  q3,  [sp, #0xC0]
-    ldp  q0,  q1,  [sp, #0xA0]
+    ldr  q23, [sp, #0x180]
+    ldr  q22, [sp, #0x170]
+    ldr  q21, [sp, #0x160]
+    ldr  q20, [sp, #0x150]
+    ldr  q19, [sp, #0x140]
+    ldr  q18, [sp, #0x130]
+    ldr  q17, [sp, #0x120]
+    ldr  q7,  [sp, #0x110]
+    ldr  q6,  [sp, #0x100]
+    ldr  q5,  [sp, #0xF0]
+    ldr  q4,  [sp, #0xE0]
+    ldr  q3,  [sp, #0xD0]
+    ldr  q2,  [sp, #0xC0]
+    ldr  q1,  [sp, #0xB0]
+    ldr  q0,  [sp, #0xA0]
     ldp  x27, x30, [sp, #0x90]       // x27 = saved NZCV (outer frame restores x27)
     msr  nzcv, x27
     ldp  x16, x17, [sp, #0x80]
@@ -1075,20 +1092,23 @@ L\name\()_huge:
     ldp  x4,  x5,  [sp, #0x20]
     ldp  x2,  x3,  [sp, #0x10]
     ldp  x0,  x1,  [sp]
-    add  sp, sp, #0x2A0
+    add  sp, sp, #0x190
     fmov d16, x29
     b    L\name\()_ret
 .endm
 
 // Two-result variant of TRIG_VAL_HUGE for _stub_fsincos_val: the C fallback
-// returns {sin, cos} in d0/d1 (HFA), which are stored into the saved-q16/q17
-// stack slots so the ordinary vector restores deliver them in d16/d17 — no
-// GPR juggling across the restores at all.  (The slots' high halves restore
-// the entry values; runs containing the call exclude v16 AND v17 from the
-// pool, so those are dead anyway.)
+// returns {sin, cos} in d0/d1 (HFA), stashed in two scratch slots across the
+// vector restores and delivered as d16/d17 at the end (the d-writes zero the
+// upper halves — runs containing the call exclude v16 AND v17 from the pool,
+// so those are dead).  Same single-str/ldr + actual-clobber-set rules as
+// TRIG_VAL_HUGE above, EXCEPT for the save set: x87_trig_sincos_value's
+// inlined dual kernel uses callee-saved d8-d15 (AAPCS covers only the LOW
+// halves) and is SLP-vectorized into v24+, so everything except the dead
+// v16/v17 is saved here at full q width (still as singles).
 .macro TRIG_VAL_HUGE2 name, fnptr
 L\name\()_huge:
-    sub  sp, sp, #0x2A0
+    sub  sp, sp, #0x290
     stp  x0,  x1,  [sp]
     stp  x2,  x3,  [sp, #0x10]
     stp  x4,  x5,  [sp, #0x20]
@@ -1100,43 +1120,71 @@ L\name\()_huge:
     stp  x16, x17, [sp, #0x80]
     mrs  x29, nzcv
     stp  x29, x30, [sp, #0x90]
-    stp  q0,  q1,  [sp, #0xA0]
-    stp  q2,  q3,  [sp, #0xC0]
-    stp  q4,  q5,  [sp, #0xE0]
-    stp  q6,  q7,  [sp, #0x100]
-    stp  q8,  q9,  [sp, #0x120]
-    stp  q10, q11, [sp, #0x140]
-    stp  q12, q13, [sp, #0x160]
-    stp  q14, q15, [sp, #0x180]
-    stp  q16, q17, [sp, #0x1A0]
-    stp  q18, q19, [sp, #0x1C0]
-    stp  q20, q21, [sp, #0x1E0]
-    stp  q22, q23, [sp, #0x200]
-    stp  q24, q25, [sp, #0x220]
-    stp  q26, q27, [sp, #0x240]
-    stp  q28, q29, [sp, #0x260]
-    stp  q30, q31, [sp, #0x280]
+    str  q0,  [sp, #0xA0]
+    str  q1,  [sp, #0xB0]
+    str  q2,  [sp, #0xC0]
+    str  q3,  [sp, #0xD0]
+    str  q4,  [sp, #0xE0]
+    str  q5,  [sp, #0xF0]
+    str  q6,  [sp, #0x100]
+    str  q7,  [sp, #0x110]
+    str  q8,  [sp, #0x120]
+    str  q9,  [sp, #0x130]
+    str  q10, [sp, #0x140]
+    str  q11, [sp, #0x150]
+    str  q12, [sp, #0x160]
+    str  q13, [sp, #0x170]
+    str  q14, [sp, #0x180]
+    str  q15, [sp, #0x190]
+    str  q18, [sp, #0x1A0]
+    str  q19, [sp, #0x1B0]
+    str  q20, [sp, #0x1C0]
+    str  q21, [sp, #0x1D0]
+    str  q22, [sp, #0x1E0]
+    str  q23, [sp, #0x1F0]
+    str  q24, [sp, #0x200]
+    str  q25, [sp, #0x210]
+    str  q26, [sp, #0x220]
+    str  q27, [sp, #0x230]
+    str  q28, [sp, #0x240]
+    str  q29, [sp, #0x250]
+    str  q30, [sp, #0x260]
+    str  q31, [sp, #0x270]
     ldr  x29, \fnptr
     fmov d0, d16
     blr  x29
-    str  d0, [sp, #0x1A0]            // sin -> saved-q16 low half
-    str  d1, [sp, #0x1B0]            // cos -> saved-q17 low half
-    ldp  q30, q31, [sp, #0x280]
-    ldp  q28, q29, [sp, #0x260]
-    ldp  q26, q27, [sp, #0x240]
-    ldp  q24, q25, [sp, #0x220]
-    ldp  q22, q23, [sp, #0x200]
-    ldp  q20, q21, [sp, #0x1E0]
-    ldp  q18, q19, [sp, #0x1C0]
-    ldp  q16, q17, [sp, #0x1A0]      // d16 = sin, d17 = cos
-    ldp  q14, q15, [sp, #0x180]
-    ldp  q12, q13, [sp, #0x160]
-    ldp  q10, q11, [sp, #0x140]
-    ldp  q8,  q9,  [sp, #0x120]
-    ldp  q6,  q7,  [sp, #0x100]
-    ldp  q4,  q5,  [sp, #0xE0]
-    ldp  q2,  q3,  [sp, #0xC0]
-    ldp  q0,  q1,  [sp, #0xA0]
+    str  d0, [sp, #0x280]            // sin
+    str  d1, [sp, #0x288]            // cos
+    ldr  q31, [sp, #0x270]
+    ldr  q30, [sp, #0x260]
+    ldr  q29, [sp, #0x250]
+    ldr  q28, [sp, #0x240]
+    ldr  q27, [sp, #0x230]
+    ldr  q26, [sp, #0x220]
+    ldr  q25, [sp, #0x210]
+    ldr  q24, [sp, #0x200]
+    ldr  q23, [sp, #0x1F0]
+    ldr  q22, [sp, #0x1E0]
+    ldr  q21, [sp, #0x1D0]
+    ldr  q20, [sp, #0x1C0]
+    ldr  q19, [sp, #0x1B0]
+    ldr  q18, [sp, #0x1A0]
+    ldr  q15, [sp, #0x190]
+    ldr  q14, [sp, #0x180]
+    ldr  q13, [sp, #0x170]
+    ldr  q12, [sp, #0x160]
+    ldr  q11, [sp, #0x150]
+    ldr  q10, [sp, #0x140]
+    ldr  q9,  [sp, #0x130]
+    ldr  q8,  [sp, #0x120]
+    ldr  q7,  [sp, #0x110]
+    ldr  q6,  [sp, #0x100]
+    ldr  q5,  [sp, #0xF0]
+    ldr  q4,  [sp, #0xE0]
+    ldr  q3,  [sp, #0xD0]
+    ldr  q2,  [sp, #0xC0]
+    ldr  q1,  [sp, #0xB0]
+    ldr  q0,  [sp, #0xA0]
     ldp  x27, x30, [sp, #0x90]       // x27 = saved NZCV (outer frame restores x27)
     msr  nzcv, x27
     ldp  x16, x17, [sp, #0x80]
@@ -1148,7 +1196,9 @@ L\name\()_huge:
     ldp  x4,  x5,  [sp, #0x20]
     ldp  x2,  x3,  [sp, #0x10]
     ldp  x0,  x1,  [sp]
-    add  sp, sp, #0x2A0
+    ldr  d16, [sp, #0x280]           // sin
+    ldr  d17, [sp, #0x288]           // cos
+    add  sp, sp, #0x290
     b    L\name\()_ret
 .endm
 

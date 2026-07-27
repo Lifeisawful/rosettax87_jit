@@ -107,3 +107,12 @@ target_compile_definitions(libRuntimeRosettax87 PRIVATE
 
 target_link_libraries(libRuntimeRosettax87 PRIVATE rosetta_core_runtime rosetta_shared)
 add_dependencies(libRuntimeRosettax87 rosetta_core_runtime)
+
+# TRIG_VAL_HUGE* saves only the trig-value fallbacks' actual clobber set
+# (v0-v7/v16-v23); fail the build if codegen drift widens it.
+add_custom_command(TARGET libRuntimeRosettax87 POST_BUILD
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/audit_trig_value_clobbers.sh
+            $<TARGET_FILE:libRuntimeRosettax87>
+    COMMENT "Auditing trig value-fallback register clobbers"
+    VERBATIM
+)
