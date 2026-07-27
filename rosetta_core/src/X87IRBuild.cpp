@@ -237,6 +237,32 @@ static int16_t const_node_for_bits(Context& ctx, uint64_t bits) {
     return build_const(ctx, bits);
 }
 
+// f32 → f64 widening in pure integer arithmetic (exact; every f32 is
+// representable). Translation-time code runs on the guest thread with the
+// guest's live XMM state in v0-v15, so it must not execute FP instructions:
+// a compiler-emitted FCVT here deposits the promoted constant's value into a
+// live guest register (this was a real, layout-sensitive corruption bug —
+// research/const_promote_isinf_bug/).
+static uint64_t widen_f32_to_f64_bits(uint32_t fb) {
+    const uint64_t sign = static_cast<uint64_t>(fb >> 31) << 63;
+    const uint32_t exp = (fb >> 23) & 0xFF;
+    const uint64_t frac = fb & 0x7FFFFF;
+
+    if (exp == 0xFF) {  // Inf / NaN — quiet the NaN like hardware FCVT does
+        uint64_t f = frac << 29;
+        if (frac != 0) f |= 0x0008000000000000ULL;
+        return sign | 0x7FF0000000000000ULL | f;
+    }
+    if (exp == 0) {
+        if (frac == 0) return sign;  // ±0
+        // Denormal: value = frac * 2^-149; normalize into f64 (always normal).
+        const int n = 31 - __builtin_clz(static_cast<unsigned>(frac));  // MSB pos
+        const uint64_t mant = (frac << (52 - n)) & 0x000FFFFFFFFFFFFFULL;
+        return sign | (static_cast<uint64_t>(n - 149 + 1023) << 52) | mant;
+    }
+    return sign | (static_cast<uint64_t>(exp - 127 + 1023) << 52) | (frac << 29);
+}
+
 // Promote an fp load from a read-only absolute address to a constant node.
 // Returns the node ID, or -1 if not promotable.
 static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) {
@@ -248,10 +274,9 @@ static int16_t try_const_promote(Context& ctx, const IROperand* op, Op load_op) 
 
     uint64_t bits;
     if (load_op == Op::LoadF32Raw) {
-        float f;
-        memcpy(&f, reinterpret_cast<const void*>(addr), 4);
-        const double d = static_cast<double>(f);  // exact widening
-        memcpy(&bits, &d, 8);
+        uint32_t fb;
+        memcpy(&fb, reinterpret_cast<const void*>(addr), 4);
+        bits = widen_f32_to_f64_bits(fb);  // integer-only: no FP insns here
     } else {
         memcpy(&bits, reinterpret_cast<const void*>(addr), 8);
     }

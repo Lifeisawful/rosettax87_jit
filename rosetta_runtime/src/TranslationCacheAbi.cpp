@@ -121,9 +121,12 @@ struct ExitRegion {
 
 // Replacement for abi_info_for_runtime_routines_address (0xB230).  Takes an
 // offset into our blob rather than a rebased file address — the rebasing at
-// 0xB88C is exactly what we are removing.  File-local: only classify_arm_pc
-// (below) calls it.
-void abi_info_for_runtime_routines_address(AbiInfo* result, uintptr_t o) {
+// 0xB88C is exactly what we are removing.  File-local: only the
+// SIMDGuardFull-protected classify functions call it, and all of them inline
+// it — `inline` lets the compiler drop the otherwise-unreferenced
+// out-of-line copy, whose AbiInfo stores contain unguarded SIMD that
+// scripts/check_simd_guards.py would (rightly) flag.
+inline void abi_info_for_runtime_routines_address(AbiInfo* result, uintptr_t o) {
     // Mirrors 0xB230's ladder, but keyed on offsets into OUR blob.  Ordered by
     // address, matching the reference's descending if-chain.
 
@@ -295,6 +298,13 @@ bool runtime_routines_offset_for(uintptr_t arm_pc, uint32_t lock_owner, uintptr_
 // InvalidRuntimeRoutines) and our own library image — and forwards everything
 // else to the original.  File-local: installed by hook, never called by name.
 void classify_arm_pc(AbiInfo* result, uint32_t thread_port, uintptr_t arm_pc) {
+    // Same guest-live-XMM situation as classify_arm_pc_objc_prefilter below:
+    // the AbiInfo stores in abi_info_for_runtime_routines_address compile to
+    // `movi.2d v0` + `stur q0`, and this can be reached with guest vector
+    // state in the caller-saved v registers. scripts/check_simd_guards.py
+    // verifies the transitive clobber set stays within the guard's q0-q7.
+    SIMDGuardFull simdGuard;
+
     // Checked first, before taking any lock: this is a two-compare range test,
     // and our own library image is where the X87 handlers live — the hottest
     // place for a signal to land after a stub has dispatched.  The two regions

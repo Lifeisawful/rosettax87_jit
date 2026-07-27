@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 
 #include "MachIPC.h"
+#include "SIMDGuard.h"
 #include "ThreadSelfRestrict.h"
 #include "rosetta_core/hook.h"
 
@@ -275,6 +276,13 @@ runtime_routines_for_address_t g_original_runtime_routines_for_address = nullptr
 // (X0 = heap, then the declared arguments).  hook_install needs a plain function
 // pointer, which a pointer-to-member is not.
 FreeBlock* hook_allocate_chunk(ExecutableHeap* heap, uint32_t lock_owner) {
+    // allocate_chunk runs during translation on the guest thread, with guest
+    // XMM state live in the caller-saved v registers — and the reference
+    // implementation we displace is FP-free by construction. Our C++ version
+    // is not: the compiler vectorizes struct zeroing (`movi.2d v0`) and
+    // constant stores (`ldr d0`). scripts/check_simd_guards.py verifies the
+    // transitive clobber set stays within the guard's q0-q7.
+    SIMDGuardFull simdGuard;
     return heap->allocate_chunk(lock_owner);
 }
 

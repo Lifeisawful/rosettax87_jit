@@ -1,6 +1,7 @@
 #include "Library.h"
 
 #include "Export.h"
+#include "SIMDGuard.h"
 #include "rosetta_core/hook.h"
 
 #ifdef ROSETTA_RUNTIME
@@ -15,6 +16,12 @@ bind_library_stubs_t g_original_bind_library_stubs = nullptr;
 
 void bind_library_stubs(Export* target, uint64_t target_count, const Export* source,
                         uint32_t source_count) {
+    // Runs at Rosetta startup (library export binding), almost certainly
+    // before any guest FP state exists — but the memcpys below vectorize to
+    // q-register loads/stores and this is called about twice ever, so the
+    // guard is cheaper than depending on that timing assumption.
+    // scripts/check_simd_guards.py verifies clobbers stay within q0-q7.
+    SIMDGuardFull simdGuard;
     if (target_count == 3) {
         kImports.runtimeExports = source;
         kImports.runtimeExportCount = source_count;

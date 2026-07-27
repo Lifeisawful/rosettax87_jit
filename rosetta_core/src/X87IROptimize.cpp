@@ -4,6 +4,7 @@
 
 #include "rosetta_config/Config.h"
 #include "rosetta_core/CoreConfig.h"
+#include "rosetta_core/HookSafeFP.h"
 
 namespace X87IR {
 
@@ -141,12 +142,11 @@ static void pass_const_arith(Context& ctx) {
                        exp >= 1 && exp <= 2046) {
                 // Opt-in: any normal divisor whose reciprocal is also normal.
                 // x * (1/d) differs from x / d by at most 1 ulp — the classic
-                // fast-division fidelity trade.
-                double d, r;
-                memcpy(&d, &b, 8);
-                r = 1.0 / d;
-                uint64_t rb;
-                memcpy(&rb, &r, 8);
+                // fast-division fidelity trade. hook_safe: a plain 1.0/d here
+                // compiled to fdiv d0,d1,d0 — clobbering live guest XMM0/1 in
+                // the translation hook (same bug class as the const-promote
+                // FCVT corruption).
+                const uint64_t rb = hook_safe_recip_bits(b);
                 const uint64_t rexp = (rb >> 52) & 0x7FF;
                 if (rexp >= 1 && rexp <= 2046) {
                     cn.imm_bits = rb;

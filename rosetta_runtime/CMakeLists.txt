@@ -116,3 +116,15 @@ add_custom_command(TARGET libRuntimeRosettax87 POST_BUILD
     COMMENT "Auditing trig value-fallback register clobbers"
     VERBATIM
 )
+
+# Translation-path code runs on the guest thread with live guest XMM state in
+# v0-v15 — compiler-emitted SIMD there silently corrupts guest data (the
+# const-promote FCVT bug, research/const_promote_isinf_bug/). Fail the build
+# if codegen drift reintroduces any, or if a SIMDGuard'ed routine outgrows
+# its guard's save set.
+add_custom_command(TARGET libRuntimeRosettax87 POST_BUILD
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/check_simd_guards.py
+            $<TARGET_FILE:libRuntimeRosettax87>
+    COMMENT "Auditing SIMD guards and translation-path SIMD freedom"
+    VERBATIM
+)
