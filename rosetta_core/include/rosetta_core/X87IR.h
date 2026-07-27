@@ -57,6 +57,13 @@ enum class Op : uint8_t {
     FCosCall,
     FSinCall,
     FPtanCall,
+    FSinCosCall,    // sin(inputs[0]) via _stub_fsincos_val (d16=sin, d17=cos);
+                    // node value = the sine, the cosine is read by the
+                    // adjacent FSinCosProjCos projection
+    FSinCosProjCos, // the d17 (cosine) result of inputs[0], an FSinCosCall;
+                    // build() emits it IMMEDIATELY after its call node and
+                    // lowering relies on that adjacency (d17 must not be
+                    // clobbered in between)
 
     // Conditional select (FCMOV): inputs[0]=ST(0) false arm, inputs[1]=ST(i) true arm
     // imm_bits[3:0] = AArch64 condition code

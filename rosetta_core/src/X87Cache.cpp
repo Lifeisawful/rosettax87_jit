@@ -364,6 +364,8 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
                 return true;
             if (op == kOpcodeName_fptan && trig_ir_fptan_enabled(*g_rosetta_config))
                 return true;
+            if (op == kOpcodeName_fsincos && trig_ir_fsincos_enabled(*g_rosetta_config))
+                return true;
         }
         if (is_handled_x87(op))
             return !op_disabled_for_run(op, disabled_ops_mask);

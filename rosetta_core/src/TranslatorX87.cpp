@@ -2850,4 +2850,45 @@ auto translate_fptan(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     free_gpr(*a1, Wd_tmp);
 }
 
+// FSINCOS (OPT-TI Phase C): ST(0) = sin(x), then push cos(x) — ONE BL to
+// _stub_fsincos_val (d16 = sin, d17 = cos out; the kRuntimeRoutine_fsincos
+// table entry is rerouted there under the same trig_ir_fsincos_enabled
+// predicate).  d17 is written raw for the same reason as d16 (see the FCOS
+// block comment above): at an instruction boundary no pool FPR holds a live
+// value.  Store sin, clear C1|C2, push, store cos — translate_fptan's shape
+// with the constant replaced by the second result.
+auto translate_fsincos(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
+
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                                /*Dd=*/16, Xst_base);
+
+    Fixup fixup;
+    fixup.kind = FixupKind::Branch26;
+    fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
+    fixup.target = kRuntimeRoutine_fsincos;
+    a1->_fixups.push_back(fixup);
+    a1->insn_buf.emit(0x94000000u);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);  // sin -> old ST(0)
+
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/21, /*imms=*/29, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+
+    x87_push(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+    emit_store_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, /*Dd=*/17, Xst_base);
+
+    free_gpr(*a1, Wd_tmp2);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
 };  // namespace TranslatorX87

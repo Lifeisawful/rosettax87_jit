@@ -150,6 +150,17 @@ inline bool trig_ir_fptan_enabled(const RosettaConfig& cfg) {
     return cfg.trig_ir != 0 && cfg.disable_fptan_fast == 0 &&
            !op_is_disabled(cfg, OpcodeId::fptan);
 }
+// FSINCOS (OPT-TI Phase C): one value call returning both results
+// (_stub_fsincos_val: d16 = sin, d17 = cos) — the kRuntimeRoutine_fsincos
+// table entry is rerouted under exactly this predicate, same
+// single-predicate discipline as fcos above.  Requires the fsin/fcos gates
+// because the IR may still emit their value calls in the same runs.  It has
+// no OpcodeId (never a translated op; the enum is at 64 = uint64_t
+// capacity), so the per-op lever is ROSETTA_X87_DISABLE_FSINCOS_FAST.
+inline bool trig_ir_fsincos_enabled(const RosettaConfig& cfg) {
+    return trig_ir_fsin_enabled(cfg) && trig_ir_fcos_enabled(cfg) &&
+           cfg.disable_fsincos_fast == 0;
+}
 
 // Parse configuration from environment variables.
 // Only call from normal executables (aotinvoke, runtime_loader).

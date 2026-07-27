@@ -115,6 +115,51 @@ static clock_t bench_cos_wave(void) {
     return clock() - start;
 }
 
+/* Both fsincos results consumed: r = sin(x)*w1 + cos(x)*w2 — the rotation/
+ * oscillator idiom the game-site clusters use. */
+static clock_t bench_sincos_wave(void) {
+    clock_t start = clock();
+    volatile double x = 0.7, w1 = 0.6, w2 = 0.4;
+    volatile double r;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile(
+            "fldl %1\n\t"     /* x                    */
+            "fsincos\n\t"     /* cos sin              */
+            "fldl %3\n\t"     /* w2  cos sin          */
+            "fmulp\n\t"       /* cos*w2 sin           */
+            "fxch\n\t"        /* sin cos*w2           */
+            "fldl %2\n\t"     /* w1  sin cos*w2       */
+            "fmulp\n\t"       /* sin*w1 cos*w2        */
+            "faddp\n\t"       /* sin*w1+cos*w2        */
+            "fstpl %0\n"
+            : "=m"(r) : "m"(x), "m"(w1), "m"(w2));
+    return clock() - start;
+}
+
+/* fsincos buried mid-run — cos_deep's shape with the fcos replaced by
+ * fsincos + faddp (both results folded into the running expression). */
+static clock_t bench_sincos_deep(void) {
+    clock_t start = clock();
+    volatile double a = 0.75, b = 1.25, c = 0.5;
+    volatile double r;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile(
+            "fldl %1\n\t"
+            "fldl %2\n\t"
+            "fmul %%st(1), %%st(0)\n\t"
+            "fldl %3\n\t"
+            "faddp\n\t"
+            "fsincos\n\t"
+            "faddp\n\t"
+            "fmul %%st(1), %%st(0)\n\t"
+            "faddp\n\t"
+            "fldl %2\n\t"
+            "fmulp\n\t"
+            "fstpl %0\n"
+            : "=m"(r) : "m"(a), "m"(b), "m"(c));
+    return clock() - start;
+}
+
 /* fcos buried mid-run: 6 arithmetic ops before, 3 after. */
 static clock_t bench_cos_deep(void) {
     clock_t start = clock();
@@ -144,6 +189,8 @@ int main(void) {
         {"cos_poly",   bench_cos_poly},
         {"cos_wave",   bench_cos_wave},
         {"cos_deep",   bench_cos_deep},
+        {"sincos_wave", bench_sincos_wave},
+        {"sincos_deep", bench_sincos_deep},
     };
     int n = (int)(sizeof(benches) / sizeof(benches[0]));
     for (int i = 0; i < n; i++) {

@@ -1080,6 +1080,78 @@ L\name\()_huge:
     b    L\name\()_ret
 .endm
 
+// Two-result variant of TRIG_VAL_HUGE for _stub_fsincos_val: the C fallback
+// returns {sin, cos} in d0/d1 (HFA), which are stored into the saved-q16/q17
+// stack slots so the ordinary vector restores deliver them in d16/d17 — no
+// GPR juggling across the restores at all.  (The slots' high halves restore
+// the entry values; runs containing the call exclude v16 AND v17 from the
+// pool, so those are dead anyway.)
+.macro TRIG_VAL_HUGE2 name, fnptr
+L\name\()_huge:
+    sub  sp, sp, #0x2A0
+    stp  x0,  x1,  [sp]
+    stp  x2,  x3,  [sp, #0x10]
+    stp  x4,  x5,  [sp, #0x20]
+    stp  x6,  x7,  [sp, #0x30]
+    stp  x8,  x9,  [sp, #0x40]
+    stp  x10, x11, [sp, #0x50]
+    stp  x12, x13, [sp, #0x60]
+    stp  x14, x15, [sp, #0x70]
+    stp  x16, x17, [sp, #0x80]
+    mrs  x29, nzcv
+    stp  x29, x30, [sp, #0x90]
+    stp  q0,  q1,  [sp, #0xA0]
+    stp  q2,  q3,  [sp, #0xC0]
+    stp  q4,  q5,  [sp, #0xE0]
+    stp  q6,  q7,  [sp, #0x100]
+    stp  q8,  q9,  [sp, #0x120]
+    stp  q10, q11, [sp, #0x140]
+    stp  q12, q13, [sp, #0x160]
+    stp  q14, q15, [sp, #0x180]
+    stp  q16, q17, [sp, #0x1A0]
+    stp  q18, q19, [sp, #0x1C0]
+    stp  q20, q21, [sp, #0x1E0]
+    stp  q22, q23, [sp, #0x200]
+    stp  q24, q25, [sp, #0x220]
+    stp  q26, q27, [sp, #0x240]
+    stp  q28, q29, [sp, #0x260]
+    stp  q30, q31, [sp, #0x280]
+    ldr  x29, \fnptr
+    fmov d0, d16
+    blr  x29
+    str  d0, [sp, #0x1A0]            // sin -> saved-q16 low half
+    str  d1, [sp, #0x1B0]            // cos -> saved-q17 low half
+    ldp  q30, q31, [sp, #0x280]
+    ldp  q28, q29, [sp, #0x260]
+    ldp  q26, q27, [sp, #0x240]
+    ldp  q24, q25, [sp, #0x220]
+    ldp  q22, q23, [sp, #0x200]
+    ldp  q20, q21, [sp, #0x1E0]
+    ldp  q18, q19, [sp, #0x1C0]
+    ldp  q16, q17, [sp, #0x1A0]      // d16 = sin, d17 = cos
+    ldp  q14, q15, [sp, #0x180]
+    ldp  q12, q13, [sp, #0x160]
+    ldp  q10, q11, [sp, #0x140]
+    ldp  q8,  q9,  [sp, #0x120]
+    ldp  q6,  q7,  [sp, #0x100]
+    ldp  q4,  q5,  [sp, #0xE0]
+    ldp  q2,  q3,  [sp, #0xC0]
+    ldp  q0,  q1,  [sp, #0xA0]
+    ldp  x27, x30, [sp, #0x90]       // x27 = saved NZCV (outer frame restores x27)
+    msr  nzcv, x27
+    ldp  x16, x17, [sp, #0x80]
+    ldp  x14, x15, [sp, #0x70]
+    ldp  x12, x13, [sp, #0x60]
+    ldp  x10, x11, [sp, #0x50]
+    ldp  x8,  x9,  [sp, #0x40]
+    ldp  x6,  x7,  [sp, #0x30]
+    ldp  x4,  x5,  [sp, #0x20]
+    ldp  x2,  x3,  [sp, #0x10]
+    ldp  x0,  x1,  [sp]
+    add  sp, sp, #0x2A0
+    b    L\name\()_ret
+.endm
+
 // Store an in-place result (FCOS/FSIN): ST(TOP) = d16, tag -> kValid,
 // statusWord &= ~(C1|C2), TOP unchanged.  Then restore and return.
 .macro TRIG_STORE_INPLACE
@@ -1354,6 +1426,75 @@ TRIG_VAL_HUGE fptanv, Lfptanv_fnptr
 .p2align 3
 Lfptanv_fnptr:
     .quad _x87_trig_tan_value
+
+// -----------------------------------------------------------------------------
+// FSINCOS value call (OPT-TI Phase C): d16 = sin(d16), d17 = cos(d16).  ONE
+// reduction feeds both kernels — the two-BL decomposition (fsin_val +
+// fcos_val) measured fully serialized at ~2x a single call, so the pair
+// shares one BL.  Preserves everything except d16/d17 (x27/x29 saved,
+// d18-d24 saved — the kernels' scratch; d17 is an output, macros may scribble
+// it freely before the final write).  Quadrant map as _stub_fsincos_fast:
+//   n&3 = 0: sin=+s cos=+c    1: sin=+c cos=-s
+//         2: sin=-s cos=-c    3: sin=-c cos=+s
+// Huge/Inf/NaN: TRIG_VAL_HUGE2 mega-save fallback -> x87_trig_sincos_value
+// ({sin, cos} in d0/d1), results re-enter through the saved q16/q17 slots.
+// -----------------------------------------------------------------------------
+.globl _stub_fsincos_val
+_stub_fsincos_val:
+    sub  sp, sp, #0x80
+    stp  x27, x29, [sp, #0x70]
+    fmov x29, d16
+    ubfx x27, x29, #32, #31          // hi31
+    mov  w29, #0x21fb
+    movk w29, #0x4139, lsl #16
+    sub  w29, w27, w29
+    tbz  w29, #31, Lfsincosv_huge    // >= 2^20*(pi/2), Inf, NaN
+    stp  q18, q19, [sp]
+    stp  q20, q21, [sp, #0x20]
+    stp  q22, q23, [sp, #0x40]
+    str  q24, [sp, #0x60]
+    mov  w29, #0x21fc
+    movk w29, #0x3fe9, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsincosv_small
+    TRIG_REDUCE fsincosv
+    b    Lfsincosv_kernels
+Lfsincosv_small:
+    fmov d22, d16
+    fmov d23, xzr
+    mov  w27, wzr
+Lfsincosv_kernels:
+    TRIG_KCOS d24                    // c (d22/d23 stay live)
+    TRIG_KSIN d16                    // s
+    tbz  w27, #0, Lfsincosv_even
+    fmov d17, d16                    // odd n: swap s <-> c
+    fmov d16, d24
+    fmov d24, d17
+    tbnz w27, #1, Lfsincosv_n3
+    fneg d24, d24                    // n=1: sin=+c cos=-s
+    b    Lfsincosv_done
+Lfsincosv_n3:
+    fneg d16, d16                    // n=3: sin=-c cos=+s
+    b    Lfsincosv_done
+Lfsincosv_even:
+    tbz  w27, #1, Lfsincosv_done
+    fneg d16, d16                    // n=2: both negated
+    fneg d24, d24
+Lfsincosv_done:
+    fmov d17, d24                    // cos out
+    ldp  q18, q19, [sp]
+    ldp  q20, q21, [sp, #0x20]
+    ldp  q22, q23, [sp, #0x40]
+    ldr  q24, [sp, #0x60]
+Lfsincosv_ret:
+    ldp  x27, x29, [sp, #0x70]
+    add  sp, sp, #0x80
+    ret
+TRIG_VAL_HUGE2 fsincosv, Lfsincosv_fnptr
+
+.p2align 3
+Lfsincosv_fnptr:
+    .quad _x87_trig_sincos_value
 
 // -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.

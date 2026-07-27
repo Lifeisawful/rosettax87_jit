@@ -347,6 +347,74 @@ int main(void) {
     }
     check_true("EFLAGS survive fsin(1e18) fallback", flags_survive(0.5));
 
+    /* ================= FSINCOS (Phase C) ================= */
+    {
+        /* both results consumed in-run: sin(x)*w1 + cos(x)*w2, with a deep
+         * guard live across the single call */
+        volatile double x = 0.7, w1 = 0.6, w2 = 0.4, guard = 42.5;
+        double r, g;
+        __asm__ volatile(
+            "fldl %5\n\t"  /* guard                       */
+            "fldl %2\n\t"  /* x     guard                 */
+            "fsincos\n\t"  /* cos   sin   guard           */
+            "fldl %4\n\t"  /* w2    cos   sin   guard     */
+            "fmulp\n\t"    /* cosw2 sin   guard           */
+            "fxch\n\t"     /* sin   cosw2 guard           */
+            "fldl %3\n\t"  /* w1    sin   cosw2 guard     */
+            "fmulp\n\t"    /* sinw1 cosw2 guard           */
+            "faddp\n\t"    /* sum   guard                 */
+            "fstpl %0\n\t"
+            "fstpl %1\n"
+            : "=m"(r), "=m"(g)
+            : "m"(x), "m"(w1), "m"(w2), "m"(guard));
+        check_tol("fsincos run: sin*w1+cos*w2", r, sin(0.7) * 0.6 + cos(0.7) * 0.4);
+        check_tol("fsincos run: deep guard intact", g, 42.5);
+    }
+    {
+        /* quadrant args exercise the swap/negate paths of the value stub */
+        static const double qs[] = { 0.5, 2.0, 3.5, 5.0, -2.0 };
+        for (int i = 0; i < 5; i++) {
+            volatile double x = qs[i];
+            double s, c;
+            __asm__ volatile(
+                "fldl %2\n\t fsincos\n\t fstpl %1\n\t fstpl %0\n"
+                : "=m"(s), "=m"(c) : "m"(x));
+            check_tol("fsincos quadrant sin", s, sin(qs[i]));
+            check_tol("fsincos quadrant cos", c, cos(qs[i]));
+        }
+    }
+    {
+        volatile double nz = -0.0;
+        double s, c;
+        __asm__ volatile(
+            "fldl %2\n\t fsincos\n\t fstpl %1\n\t fstpl %0\n"
+            : "=m"(s), "=m"(c) : "m"(nz));
+        check_bits("fsincos(-0): sin == -0", s, -0.0);
+        check_bits("fsincos(-0): cos == 1.0", c, 1.0);
+    }
+    {
+        /* huge fsincos with live values across the TRIG_VAL_HUGE2 mega-save:
+         * both results come back through the saved q16/q17 stack slots */
+        volatile double a = 3.0, b = 7.0, huge = 1e18;
+        double r, s, c;
+        __asm__ volatile(
+            "fldl %3\n\t"                /* a                        */
+            "fldl %4\n\t"                /* b     a                  */
+            "fmul %%st(1), %%st(0)\n\t"  /* a*b   a                  */
+            "fldl %5\n\t"                /* huge  a*b   a            */
+            "fsincos\n\t"                /* cosH  sinH  a*b  a       */
+            "fstpl %2\n\t"               /* sinH  a*b   a            */
+            "fstpl %1\n\t"               /* a*b   a                  */
+            "fmulp\n\t"                  /* (a*b)*a                  */
+            "fstpl %0\n"
+            : "=m"(r), "=m"(s), "=m"(c)
+            : "m"(a), "m"(b), "m"(huge));
+        check_bits("fsincos huge in run: (3*7)*3 == 63 bit-exact", r, 63.0);
+        check_near("fsincos huge: sin(1e18) quadrant-level", s, sin(1e18), 1e-1);
+        check_near("fsincos huge: cos(1e18) quadrant-level", c, cos(1e18), 1e-1);
+    }
+    check_true("GPRs + XMM survive huge fcos (post-fsincos)", regs_survive_huge());
+
     printf("================================\n");
     if (failures == 0) {
         printf("test_trig_ir: ALL PASS\n");

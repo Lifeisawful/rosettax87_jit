@@ -447,6 +447,12 @@ extern "C" __attribute__((used)) double x87_trig_sin_value(double x) {
 extern "C" __attribute__((used)) double x87_trig_tan_value(double x) {
     return openlibm_tan(x);
 }
+// HFA of two doubles: AAPCS64 returns it in d0 (sin) / d1 (cos), which
+// TRIG_VAL_HUGE2 stores into the saved q16/q17 slots.
+struct X87TrigSinCos { double sinv; double cosv; };
+extern "C" __attribute__((used)) X87TrigSinCos x87_trig_sincos_value(double x) {
+    return { openlibm_sin(x), openlibm_cos(x) };
+}
 
 void x87_fcos(X87State* state) {
     SIMDGuardFullAndX0X7 simdGuard;

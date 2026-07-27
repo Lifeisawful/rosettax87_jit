@@ -300,6 +300,9 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         } else if (opcode == Opcode::kOpcodeName_fptan && g_rosetta_config &&
                    trig_ir_fptan_enabled(*g_rosetta_config)) {
             TranslatorX87::translate_fptan(translation_result, cur_instr);
+        } else if (opcode == Opcode::kOpcodeName_fsincos && g_rosetta_config &&
+                   trig_ir_fsincos_enabled(*g_rosetta_config)) {
+            TranslatorX87::translate_fsincos(translation_result, cur_instr);
         } else
         switch (opcode) {
             case Opcode::kOpcodeName_fldz:

@@ -1078,6 +1078,30 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ctx.push(one);
                 break;
             }
+            case kOpcodeName_fsincos: {
+                // OPT-TI Phase C, option (a): ONE value call returning both
+                // results (d16=sin, d17=cos) plus a projection node for the
+                // cosine — the two-call decomposition (option b) measured
+                // fully serialized, ~2x a single call.  ST(0) becomes the
+                // sine, the cosine is pushed.  The projection is added
+                // IMMEDIATELY after the call (lowering adjacency contract).
+                // All failable add_node calls before any slot_val/push
+                // mutation (fptan's rule); stray nodes on the failure path
+                // are pure and DSE-able.
+                if (!(g_rosetta_config && trig_ir_fsincos_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto call = ctx.add_node(Op::FSinCosCall, st0);
+                if (call < 0) { ok = false; break; }
+                auto proj = ctx.add_node(Op::FSinCosProjCos, call);
+                if (proj < 0) { ok = false; break; }
+                ctx.slot_val[0] = call;
+                ctx.push(proj);
+                break;
+            }
             case kOpcodeName_frndint: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }

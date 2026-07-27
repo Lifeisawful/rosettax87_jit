@@ -60,6 +60,7 @@ extern char stub_fcos_val[];
 extern char stub_fsin_fast[];
 extern char stub_fsin_val[];
 extern char stub_fsincos_fast[];
+extern char stub_fsincos_val[];
 extern char stub_fptan_fast[];
 extern char stub_fptan_val[];
 extern char stub_fdecstp[];
@@ -294,7 +295,9 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
           kConfig.disable_fcos_fast);
     route(kRuntimeRoutine_fsin, fsin_val ? stub_fsin_val : stub_fsin_fast,
           kConfig.disable_fsin_fast);
-    route(kRuntimeRoutine_fsincos, stub_fsincos_fast, kConfig.disable_fsincos_fast);
+    const bool fsincos_val = trig_ir_fsincos_enabled(kConfig);
+    route(kRuntimeRoutine_fsincos, fsincos_val ? stub_fsincos_val : stub_fsincos_fast,
+          kConfig.disable_fsincos_fast);
     route(kRuntimeRoutine_fptan, fptan_val ? stub_fptan_val : stub_fptan_fast,
           kConfig.disable_fptan_fast);
 
@@ -303,6 +306,6 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
              n, count,
              fcos_val ? "val" : (kConfig.disable_fcos_fast ? "classic" : "fast"),
              fsin_val ? "val" : (kConfig.disable_fsin_fast ? "classic" : "fast"),
-             kConfig.disable_fsincos_fast ? "classic" : "fast",
+             fsincos_val ? "val" : (kConfig.disable_fsincos_fast ? "classic" : "fast"),
              fptan_val ? "val" : (kConfig.disable_fptan_fast ? "classic" : "fast"));
 }

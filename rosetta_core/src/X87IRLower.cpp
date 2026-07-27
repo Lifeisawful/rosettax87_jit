@@ -1048,7 +1048,8 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── OPT-TI: trig value calls ────────────────────────────────────
         case Op::FCosCall:
         case Op::FSinCall:
-        case Op::FPtanCall: {
+        case Op::FPtanCall:
+        case Op::FSinCosCall: {
             int Dn = fprs.get(n.inputs[0]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
@@ -1060,9 +1061,10 @@ void lower(Context& ctx, TranslationResult* result) {
             Fixup fixup;
             fixup.kind = FixupKind::Branch26;
             fixup.insn_offset = static_cast<uint32_t>(buf.end);
-            fixup.target = (n.op == Op::FCosCall)   ? kRuntimeRoutine_fcos
-                           : (n.op == Op::FSinCall) ? kRuntimeRoutine_fsin
-                                                    : kRuntimeRoutine_fptan;
+            fixup.target = (n.op == Op::FCosCall)      ? kRuntimeRoutine_fcos
+                           : (n.op == Op::FSinCall)    ? kRuntimeRoutine_fsin
+                           : (n.op == Op::FPtanCall)   ? kRuntimeRoutine_fptan
+                                                       : kRuntimeRoutine_fsincos;
             result->_fixups.push_back(fixup);       // routed to _stub_*_val
             buf.emit(0x94000000u);
             if (Dd != 16)
@@ -1081,6 +1083,19 @@ void lower(Context& ctx, TranslationResult* result) {
                                  kX87StatusWordImm12, Xbase, Wd);
                 free_gpr(*result, Wd);
             }
+            break;
+        }
+
+        // ── OPT-TI Phase C: the cosine (d17) output of the immediately-
+        // preceding FSinCosCall.  Nothing executes between that BL and this
+        // FMOV (build() emits the pair adjacently and dead nodes emit
+        // nothing); v17 is excluded from the pool for runs containing the
+        // call, so no pool value can be resident in it.
+        case Op::FSinCosProjCos: {
+            int Dd = fprs.try_reuse_input(ctx, i);
+            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, Dd, /*Dn=*/17);
             break;
         }
 
@@ -1825,7 +1840,9 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             break;
 
         // OPT-TI trig calls: 1 transient GPR for the C1|C2 status RMW
+        // (FSinCosProjCos is a bare FMOV — no GPR)
         case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+        case Op::FSinCosCall:
             transient = 1;
             break;
 
@@ -1996,6 +2013,7 @@ int peak_live_fprs(const Context& ctx) {
             case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
             case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
             case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+            case Op::FSinCosCall: case Op::FSinCosProjCos:
             case Op::FCSel:
             case Op::CvtF32ToF64: case Op::CvtF64ToF32:
                 produces_fpr = true;
@@ -2093,17 +2111,20 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     // so the gate and the allocator agree on the available count.  Restored
     // after lower().
     bool has_fcos_call = false;
+    bool has_sincos_call = false;   // additionally excludes v17 (cos output)
     for (int ni = 0; ni < ctx.num_nodes; ni++) {
         const auto op = ctx.nodes[ni].op;
-        if (!(ctx.nodes[ni].flags & kDead) &&
-            (op == Op::FCosCall || op == Op::FSinCall || op == Op::FPtanCall)) {
+        if (ctx.nodes[ni].flags & kDead) continue;
+        if (op == Op::FCosCall || op == Op::FSinCall || op == Op::FPtanCall)
             has_fcos_call = true;
-            break;
-        }
+        else if (op == Op::FSinCosCall)
+            has_fcos_call = has_sincos_call = true;
     }
     const uint32_t fpr_mask_before_v16_excl = result->free_fpr_mask;
     if (has_fcos_call)
         result->free_fpr_mask &= ~(1u << 16);
+    if (has_sincos_call)
+        result->free_fpr_mask &= ~(1u << 17);
     // Restore on EVERY exit from here on (fail() paths included).
     struct V16Restore {
         TranslationResult* r;
