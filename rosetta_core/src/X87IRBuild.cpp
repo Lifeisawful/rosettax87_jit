@@ -1102,6 +1102,36 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ctx.push(proj);
                 break;
             }
+            case kOpcodeName_f2xm1: {
+                // OPT-TI pow-trio value call: ST(0) = 2^ST(0) - 1, no
+                // status-word effect (the classic helper touches none).
+                if (!(g_rosetta_config && trig_ir_f2xm1_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto id = ctx.add_node(Op::F2XM1Call, st0);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[0] = id;
+                break;
+            }
+            case kOpcodeName_fscale: {
+                // OPT-TI pow-trio value call: ST(0) = fscale(ST(0), ST(1));
+                // ST(1) is read but unchanged, no push/pop.
+                if (!(g_rosetta_config && trig_ir_fscale_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto st1 = ctx.resolve(1);
+                if (st1 < 0) { ok = false; break; }
+                auto id = ctx.add_node(Op::FScaleCall, st0, st1);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[0] = id;
+                break;
+            }
             case kOpcodeName_frndint: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }

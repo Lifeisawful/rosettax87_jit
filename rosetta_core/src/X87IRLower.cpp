@@ -1045,17 +1045,25 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
 
-        // ── OPT-TI: trig value calls ────────────────────────────────────
+        // ── OPT-TI: trig / pow-trio value calls ─────────────────────────
         case Op::FCosCall:
         case Op::FSinCall:
         case Op::FPtanCall:
-        case Op::FSinCosCall: {
+        case Op::FSinCosCall:
+        case Op::F2XM1Call:
+        case Op::FScaleCall: {
             int Dn = fprs.get(n.inputs[0]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             // v16 is excluded from the pool for runs containing these nodes
             // (compile_run), so Dn/Dd are never d16 and the moves are real.
+            // FScaleCall also excludes v17 and passes ST(1) there.
+            if (n.op == Op::FScaleCall) {
+                int Dm = fprs.get(n.inputs[1]);
+                if (Dm != 17)
+                    emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, /*Dd=*/17, Dm);
+            }
             if (Dn != 16)
                 emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, /*Dd=*/16, Dn);
             Fixup fixup;
@@ -1064,21 +1072,26 @@ void lower(Context& ctx, TranslationResult* result) {
             fixup.target = (n.op == Op::FCosCall)      ? kRuntimeRoutine_fcos
                            : (n.op == Op::FSinCall)    ? kRuntimeRoutine_fsin
                            : (n.op == Op::FPtanCall)   ? kRuntimeRoutine_fptan
+                           : (n.op == Op::F2XM1Call)   ? kRuntimeRoutine_f2xm1
+                           : (n.op == Op::FScaleCall)  ? kRuntimeRoutine_fscale
                                                        : kRuntimeRoutine_fsincos;
             result->_fixups.push_back(fixup);       // routed to _stub_*_val
             buf.emit(0x94000000u);
             if (Dd != 16)
                 emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, Dd, /*Dn=*/16);
-            // status_word &= ~(C1|C2) at the node's program position, so a
-            // later FStsw in the same run observes it and an earlier
-            // FCmp/FTst's C2 is legitimately overwritten (hardware order).
-            // ~0x600 as a 32-bit logical immediate: immr=21, imms=29.
-            {
+            // Status-word effect at the node's program position, so a later
+            // FStsw in the same run observes it and an earlier FCmp/FTst's
+            // bits are legitimately overwritten (hardware order).  Trig
+            // clears C1|C2 (~0x600: immr=21, imms=29); FScale clears C1
+            // (~0x200: immr=22, imms=30); F2XM1 clears nothing (classic
+            // helper parity).
+            if (n.op != Op::F2XM1Call) {
+                const int immr = (n.op == Op::FScaleCall) ? 22 : 21;
+                const int imms = (n.op == Op::FScaleCall) ? 30 : 29;
                 int Wd = alloc_free_gpr(*result);
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
                                  kX87StatusWordImm12, Xbase, Wd);
-                emit_and_imm(buf, /*is_64bit=*/0, Wd, /*N=*/0, /*immr=*/21,
-                             /*imms=*/29, Wd);
+                emit_and_imm(buf, /*is_64bit=*/0, Wd, /*N=*/0, immr, imms, Wd);
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
                                  kX87StatusWordImm12, Xbase, Wd);
                 free_gpr(*result, Wd);
@@ -1839,10 +1852,11 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             if (!rc_cache) transient = 1;
             break;
 
-        // OPT-TI trig calls: 1 transient GPR for the C1|C2 status RMW
-        // (FSinCosProjCos is a bare FMOV — no GPR)
+        // OPT-TI trig/pow calls: 1 transient GPR for the status RMW
+        // (FSinCosProjCos is a bare FMOV — no GPR; F2XM1Call has no
+        // status effect but keep the estimate uniform and safe)
         case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
-        case Op::FSinCosCall:
+        case Op::FSinCosCall: case Op::F2XM1Call: case Op::FScaleCall:
             transient = 1;
             break;
 
@@ -2014,6 +2028,7 @@ int peak_live_fprs(const Context& ctx) {
             case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
             case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
             case Op::FSinCosCall: case Op::FSinCosProjCos:
+            case Op::F2XM1Call: case Op::FScaleCall:
             case Op::FCSel:
             case Op::CvtF32ToF64: case Op::CvtF64ToF32:
                 produces_fpr = true;
@@ -2111,13 +2126,15 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     // so the gate and the allocator agree on the available count.  Restored
     // after lower().
     bool has_fcos_call = false;
-    bool has_sincos_call = false;   // additionally excludes v17 (cos output)
+    bool has_sincos_call = false;   // additionally excludes v17 (cos output /
+                                    // FScaleCall's ST(1) argument register)
     for (int ni = 0; ni < ctx.num_nodes; ni++) {
         const auto op = ctx.nodes[ni].op;
         if (ctx.nodes[ni].flags & kDead) continue;
-        if (op == Op::FCosCall || op == Op::FSinCall || op == Op::FPtanCall)
+        if (op == Op::FCosCall || op == Op::FSinCall || op == Op::FPtanCall ||
+            op == Op::F2XM1Call)
             has_fcos_call = true;
-        else if (op == Op::FSinCosCall)
+        else if (op == Op::FSinCosCall || op == Op::FScaleCall)
             has_fcos_call = has_sincos_call = true;
     }
     const uint32_t fpr_mask_before_v16_excl = result->free_fpr_mask;

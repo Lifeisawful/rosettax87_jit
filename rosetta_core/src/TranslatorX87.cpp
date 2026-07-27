@@ -2891,4 +2891,68 @@ auto translate_fsincos(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     free_gpr(*a1, Wd_tmp);
 }
 
+// F2XM1 (OPT-TI pow-trio): ST(0) = 2^ST(0) - 1 via _stub_f2xm1_val (d16
+// in/out, whole domain handled in the stub's assembly, no C fallback).  The
+// classic x87_f2xm1 helper performs NO status-word update, so unlike the
+// trig forms there is no C1|C2 clear here.
+auto translate_f2xm1(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                                /*Dd=*/16, Xst_base);
+
+    Fixup fixup;
+    fixup.kind = FixupKind::Branch26;
+    fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
+    fixup.target = kRuntimeRoutine_f2xm1;
+    a1->_fixups.push_back(fixup);
+    a1->insn_buf.emit(0x94000000u);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+// FSCALE (OPT-TI pow-trio): ST(0) = fscale(ST(0), ST(1)) via
+// _stub_fscale_val — d16 = ST(0) in/out, d17 = ST(1) in (consumed by the
+// stub; at an instruction boundary no pool FPR holds a live value, same raw
+// d16/d17 rationale as the FCOS block comment above).  ST(1) is unchanged,
+// no push/pop; the classic helper clears C1 (~0x200: immr=22, imms=30).
+auto translate_fscale(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 1), Wd_tmp,
+                 /*Dd=*/17, Xst_base);
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                                /*Dd=*/16, Xst_base);
+
+    Fixup fixup;
+    fixup.kind = FixupKind::Branch26;
+    fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
+    fixup.target = kRuntimeRoutine_fscale;
+    a1->_fixups.push_back(fixup);
+    a1->insn_buf.emit(0x94000000u);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);
+
+    // status_word &= ~C1
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/22, /*imms=*/30, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
 };  // namespace TranslatorX87

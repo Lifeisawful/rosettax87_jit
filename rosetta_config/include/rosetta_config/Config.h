@@ -115,6 +115,8 @@ struct RosettaConfig {
     uint8_t  disable_fsincos_fast;   // ROSETTA_X87_DISABLE_FSINCOS_FAST=1 — same for FSINCOS
     uint8_t  disable_fptan_fast;     // ROSETTA_X87_DISABLE_FPTAN_FAST=1 — same for FPTAN
     uint8_t  trig_ir;                // ROSETTA_X87_TRIG_IR=1 — translate FCOS as a value call (_stub_fcos_val): IR node inside runs, ldr/BL/str singular form outside (opt-in)
+    uint8_t  disable_f2xm1_val;      // ROSETTA_X87_DISABLE_F2XM1_VAL=1 — keep F2XM1 on the classic prologue/vtable stub even under TRIG_IR
+    uint8_t  disable_fscale_val;     // ROSETTA_X87_DISABLE_FSCALE_VAL=1 — same for FSCALE
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
@@ -160,6 +162,19 @@ inline bool trig_ir_fptan_enabled(const RosettaConfig& cfg) {
 inline bool trig_ir_fsincos_enabled(const RosettaConfig& cfg) {
     return trig_ir_fsin_enabled(cfg) && trig_ir_fcos_enabled(cfg) &&
            cfg.disable_fsincos_fast == 0;
+}
+// F2XM1 / FSCALE (OPT-TI pow-trio phase): value calls whose ENTIRE math runs
+// in the val stub's assembly (runtime_entry.S) — no classic-C fallback path,
+// so unlike the trig ops there is no *_fast stub and no huge/mega-save leg.
+// Same single-predicate discipline (translator dispatch, lookahead
+// membership, build(), and the offset-table routing must all agree).  Like
+// fsincos they have no OpcodeId (the enum is full at 64), so the per-op
+// levers are the ROSETTA_X87_DISABLE_{F2XM1,FSCALE}_VAL env flags.
+inline bool trig_ir_f2xm1_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_f2xm1_val == 0;
+}
+inline bool trig_ir_fscale_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_fscale_val == 0;
 }
 
 // Parse configuration from environment variables.

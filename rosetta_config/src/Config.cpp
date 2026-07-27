@@ -198,6 +198,13 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_TRIG_IR"))
         cfg.trig_ir = (*v == '1') ? 1 : 0;
 
+    // Pow-trio value calls (f2xm1/fscale) ride the TRIG_IR master gate;
+    // these are the per-op kill switches (no OpcodeId — the enum is full).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_F2XM1_VAL"))
+        cfg.disable_f2xm1_val = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FSCALE_VAL"))
+        cfg.disable_fscale_val = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')
             cfg.disabled_ops_mask = ~0ULL;

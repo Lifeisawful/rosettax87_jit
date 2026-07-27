@@ -454,6 +454,12 @@ extern "C" __attribute__((used)) X87TrigSinCos x87_trig_sincos_value(double x) {
     return { openlibm_sin(x), openlibm_cos(x) };
 }
 
+// _stub_f2xm1_val (runtime_entry.S) reads openlibm_exp2's accurate table
+// through this dyld-rebased pointer instead of duplicating 4 KB of constants
+// in the blob — both the asm and the classic C path see identical table bits.
+// (`tbl` is the TU-local static from openlibm/s_exp2.h.)
+extern "C" __attribute__((used)) const double* const x87_exp2_tbl = tbl;
+
 void x87_fcos(X87State* state) {
     SIMDGuardFullAndX0X7 simdGuard;
 

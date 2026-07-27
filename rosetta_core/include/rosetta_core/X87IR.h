@@ -65,6 +65,17 @@ enum class Op : uint8_t {
                     // lowering relies on that adjacency (d17 must not be
                     // clobbered in between)
 
+    // OPT-TI pow-trio: value calls whose entire math lives in the val stub's
+    // assembly (no C fallback leg).  F2XM1Call = 2^inputs[0] - 1 via
+    // `BL _stub_f2xm1_val` (d16 in/out; no status-word effect — the classic
+    // helper touches none).  FScaleCall = scalbn-style
+    // fscale(inputs[0], inputs[1]) via `BL _stub_fscale_val` (d16 = ST(0)
+    // in/out, d17 = ST(1) in, consumed); lowering additionally clears C1.
+    // Runs containing F2XM1Call exclude v16 from the pool; FScaleCall
+    // excludes v16 AND v17 (see compile_run).
+    F2XM1Call,
+    FScaleCall,
+
     // Conditional select (FCMOV): inputs[0]=ST(0) false arm, inputs[1]=ST(i) true arm
     // imm_bits[3:0] = AArch64 condition code
     FCSel,

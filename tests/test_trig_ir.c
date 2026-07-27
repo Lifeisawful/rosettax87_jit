@@ -132,6 +132,29 @@ int regs_survive_huge(void) {
            x0 == 1.5 && x1 == -2.5 && x2 == 3.25 && x3 == 1e300;
 }
 
+/* Guest GPRs and XMM registers must survive the pow-trio value stubs
+ * (f2xm1 saves q17-q20 + GPRs itself; fscale saves GPRs only). */
+int regs_survive_powtrio(void) {
+    volatile double x = 0.6, n = 5.0;
+    double sink;
+    uint64_t g0 = 0x1122334455667788ULL, g1 = 0x99AABBCCDDEEFF00ULL;
+    uint64_t g2 = 0xDEADBEEFCAFEBABEULL, g3 = 0x0123456789ABCDEFULL;
+    double x0 = 1.5, x1 = -2.5, x2 = 3.25, x3 = 1e300;
+    __asm__ volatile(
+        "fldl %9\n\t"
+        "fldl %8\n\t"
+        "f2xm1\n\t"
+        "fscale\n\t"
+        "fstpl %10\n\t"
+        "fstp %%st(0)\n"
+        : "+r"(g0), "+r"(g1), "+r"(g2), "+r"(g3),
+          "+x"(x0), "+x"(x1), "+x"(x2), "+x"(x3)
+        : "m"(x), "m"(n), "m"(sink));
+    return g0 == 0x1122334455667788ULL && g1 == 0x99AABBCCDDEEFF00ULL &&
+           g2 == 0xDEADBEEFCAFEBABEULL && g3 == 0x0123456789ABCDEFULL &&
+           x0 == 1.5 && x1 == -2.5 && x2 == 3.25 && x3 == 1e300;
+}
+
 /* EFLAGS must survive fcos (both the fast path and the huge fallback). */
 int flags_survive(double arg) {
     int ok;
@@ -414,6 +437,214 @@ int main(void) {
         check_near("fsincos huge: cos(1e18) quadrant-level", c, cos(1e18), 1e-1);
     }
     check_true("GPRs + XMM survive huge fcos (post-fsincos)", regs_survive_huge());
+
+    /* ================= F2XM1 (pow-trio) ================= */
+    {
+        /* defined domain [-1, 1], including both endpoints */
+        static const double xs[] = { 0.5, -0.5, 1.0, -1.0, 0.25, -0.99, 0.99 };
+        for (int i = 0; i < 7; i++) {
+            volatile double x = xs[i];
+            double t;
+            __asm__ volatile("fldl %1\n\t f2xm1\n\t fstpl %0\n" : "=m"(t) : "m"(x));
+            check_tol("f2xm1 in-range", t, exp2(xs[i]) - 1.0);
+        }
+    }
+    {
+        /* in-run with live values: (2^x - 1) * c1 + c0, guard live across */
+        volatile double x = 0.75, c0 = 3.5, c1 = 2.0;
+        double r;
+        __asm__ volatile(
+            "fldl %3\n\t"  /* c1              */
+            "fldl %1\n\t"  /* x     c1        */
+            "f2xm1\n\t"    /* 2^x-1 c1        */
+            "fmulp\n\t"    /* (2^x-1)*c1      */
+            "fldl %2\n\t"  /* c0    ...       */
+            "faddp\n\t"
+            "fstpl %0\n"
+            : "=m"(r)
+            : "m"(x), "m"(c0), "m"(c1));
+        check_tol("f2xm1 run: (2^x-1)*c1+c0", r, (exp2(0.75) - 1.0) * 2.0 + 3.5);
+    }
+    {
+        /* out-of-range is architecturally undefined, and implementations
+         * disagree (our helper: +0.0; native Rosetta: computed for 1.5,
+         * clamped-to-(-1) -0.5 for -2, 0 for 100).  Only require a finite
+         * result and a coherent stack — the guard proves the latter. */
+        static const double xs[] = { 1.5, -2.0, 100.0 };
+        for (int i = 0; i < 3; i++) {
+            volatile double x = xs[i], guard = 17.25;
+            double t, g;
+            __asm__ volatile(
+                "fldl %3\n\t fldl %2\n\t f2xm1\n\t fstpl %0\n\t fstpl %1\n"
+                : "=m"(t), "=m"(g) : "m"(x), "m"(guard));
+            check_true("f2xm1 out-of-range: finite",
+                       (as_u64(t) & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL);
+            check_bits("f2xm1 out-of-range: stack coherent", g, 17.25);
+        }
+    }
+    {
+        volatile double x = __builtin_nan("");
+        double t;
+        __asm__ volatile("fldl %1\n\t f2xm1\n\t fstpl %0\n" : "=m"(t) : "m"(x));
+        check_true("f2xm1(NaN) is NaN", isnan(t));
+    }
+    {
+        /* tiny x: openlibm's (1+x)-1 path gives 0; hardware gives ~x*ln2 */
+        volatile double x = 0x1p-60;
+        double t;
+        __asm__ volatile("fldl %1\n\t f2xm1\n\t fstpl %0\n" : "=m"(t) : "m"(x));
+        check_true("f2xm1(2^-60): 0 or ~x*ln2",
+                   t == 0.0 || fabs(t - 0x1p-60 * M_LN2) < 0x1p-110);
+    }
+
+    /* ================= FSCALE (pow-trio) ================= */
+    {
+        /* exact scaling and truncation-toward-zero of ST(1) */
+        static const struct { double x, n, want; } cs[] = {
+            { 1.5,   3.0,   12.0      },
+            { 10.0, -2.0,   2.5       },
+            { 1.5,   3.7,   12.0      },   /* trunc(3.7) = 3   */
+            { 10.0, -2.9,   2.5       },   /* trunc(-2.9) = -2 */
+            { 7.25,  0.0,   7.25      },
+            { -3.0,  2.0,  -12.0      },
+        };
+        for (int i = 0; i < 6; i++) {
+            volatile double x = cs[i].x, n = cs[i].n;
+            double r, n_out;
+            __asm__ volatile(
+                "fldl %3\n\t"   /* n            */
+                "fldl %2\n\t"   /* x     n      */
+                "fscale\n\t"    /* x*2^t n      */
+                "fstpl %0\n\t"
+                "fstpl %1\n"
+                : "=m"(r), "=m"(n_out)
+                : "m"(x), "m"(n));
+            check_bits("fscale exact", r, cs[i].want);
+            check_bits("fscale: ST(1) preserved", n_out, cs[i].n);
+        }
+    }
+    {
+        /* signed zero passes through untouched */
+        volatile double nz = -0.0, pz = 0.0, n = 100.0;
+        double r;
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(nz), "m"(n));
+        check_bits("fscale(-0, 100) == -0", r, -0.0);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(pz), "m"(n));
+        check_bits("fscale(+0, 100) == +0", r, 0.0);
+    }
+    {
+        /* denormal round trips: 2^-1074 * 2^1074 == 1.0 exactly, and back */
+        volatile double dmin = 0x1p-1074, up = 1074.0;
+        volatile double one = 1.0, down = -1074.0;
+        double r;
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(dmin), "m"(up));
+        check_bits("fscale(2^-1074, 1074) == 1.0", r, 1.0);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(one), "m"(down));
+        check_bits("fscale(1.0, -1074) == 2^-1074", r, 0x1p-1074);
+    }
+    {
+        /* double-range overflow/underflow (fp80 hardware widens, but the
+         * fstpl narrows back, so the stored double agrees) */
+        volatile double big = 1e300, up = 1000.0, neg = -1e300;
+        volatile double small = 1e-300, down = -1000.0, nsmall = -1e-300;
+        double r;
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(big), "m"(up));
+        check_bits("fscale(1e300, 1000) == +Inf", r, INFINITY);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(neg), "m"(up));
+        check_bits("fscale(-1e300, 1000) == -Inf", r, -INFINITY);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(small), "m"(down));
+        check_bits("fscale(1e-300, -1000) == +0", r, 0.0);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(nsmall), "m"(down));
+        check_bits("fscale(-1e-300, -1000) == -0", r, -0.0);
+    }
+    {
+        /* enormous ST(1): clamps at ±100000 → saturates like ±Inf scale */
+        volatile double x = 2.0, nbig = 1e30, nneg = -1e30, inf = INFINITY;
+        double r;
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(x), "m"(nbig));
+        check_bits("fscale(2, 1e30) == +Inf", r, INFINITY);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(x), "m"(nneg));
+        check_bits("fscale(2, -1e30) == +0", r, 0.0);
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(x), "m"(inf));
+        check_bits("fscale(2, +Inf) == +Inf", r, INFINITY);
+    }
+    {
+        /* NaN operands */
+        volatile double nan_ = __builtin_nan(""), x = 2.0, n = 3.0;
+        double r;
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(x), "m"(nan_));
+        check_true("fscale(2, NaN) is NaN", isnan(r));
+        __asm__ volatile(
+            "fldl %2\n\t fldl %1\n\t fscale\n\t fstpl %0\n\t fstp %%st(0)\n"
+            : "=m"(r) : "m"(nan_), "m"(n));
+        check_true("fscale(NaN, 3) is NaN", isnan(r));
+    }
+    {
+        /* fscale in a run with live values and a deep guard */
+        volatile double x = 1.5, n = 4.0, c = 0.5, guard = 42.5;
+        double r, g;
+        __asm__ volatile(
+            "fldl %5\n\t"   /* guard                 */
+            "fldl %3\n\t"   /* n     guard           */
+            "fldl %2\n\t"   /* x     n     guard     */
+            "fscale\n\t"    /* 24    n     guard     */
+            "fldl %4\n\t"   /* c     24    n   guard */
+            "fmulp\n\t"     /* 12    n     guard     */
+            "fstpl %0\n\t"
+            "fstp %%st(0)\n\t"
+            "fstpl %1\n"
+            : "=m"(r), "=m"(g)
+            : "m"(x), "m"(n), "m"(c), "m"(guard));
+        check_bits("fscale run: (1.5*2^4)*0.5 == 12", r, 12.0);
+        check_bits("fscale run: deep guard intact", g, 42.5);
+    }
+    {
+        /* the inlined-pow idiom the game census found: 2^y for y = 3.3 via
+         * f2xm1 on the fraction and fscale by the integer part, both value
+         * calls in one x87 neighborhood */
+        volatile double y = 3.3;
+        double r;
+        __asm__ volatile(
+            "fldl %1\n\t"          /* y                        */
+            "fld %%st(0)\n\t"      /* y     y                  */
+            "frndint\n\t"          /* i     y   (RC=nearest)   */
+            "fxch\n\t"             /* y     i                  */
+            "fsub %%st(1), %%st(0)\n\t" /* f  i   (|f| <= 0.5) */
+            "f2xm1\n\t"            /* 2^f-1 i                  */
+            "fld1\n\t"             /* 1     2^f-1  i           */
+            "faddp\n\t"            /* 2^f   i                  */
+            "fscale\n\t"           /* 2^y   i                  */
+            "fstpl %0\n\t"
+            "fstp %%st(0)\n"
+            : "=m"(r) : "m"(y));
+        check_tol("pow idiom: 2^3.3 via f2xm1+fscale", r, pow(2.0, 3.3));
+    }
+    check_true("GPRs + XMM survive f2xm1+fscale", regs_survive_powtrio());
+
 
     printf("================================\n");
     if (failures == 0) {

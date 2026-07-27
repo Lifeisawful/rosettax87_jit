@@ -1547,6 +1547,238 @@ Lfsincosv_fnptr:
     .quad _x87_trig_sincos_value
 
 // -----------------------------------------------------------------------------
+// F2XM1 value call (OPT-TI pow-trio): d16 = 2^d16 - 1.  Preserves everything
+// else — q17-q20 and x26/x27/x29 are saved here, NZCV is never written
+// (sub + tbz/tbnz/cbz only).  Unlike the trig val stubs there is NO C
+// fallback leg: the entire domain is handled in this assembly, replicating
+// the classic x87_f2xm1 helper exactly:
+//   |x| > 1.0  -> +0.0            (the helper's out-of-range result)
+//   NaN        -> quieted x       (falls through the helper's range check)
+//   |x| < 2^-54-> (1.0 + x) - 1.0 (openlibm_exp2's tiny path, minus 1)
+//   else       -> openlibm_exp2's accurate-tables method (Gal-Bachelis),
+//                 8-bit table indexed via the x + 0x1.8p44 low-word trick,
+//                 degree-5 minimax poly, scale by 2^k (k in {-1,0,+1}),
+//                 then subtract 1.0.
+// The 256x2-double table is NOT duplicated: _x87_exp2_tbl (X87.cpp) is a
+// dyld-rebased pointer to the same static table the classic C path uses, so
+// both paths read identical table bits.  Loaded through the in-blob literal
+// (works through both remap and memmove blob copies).
+// -----------------------------------------------------------------------------
+.globl _stub_f2xm1_val
+_stub_f2xm1_val:
+    sub  sp, sp, #0x60
+    str  q17, [sp]
+    str  q18, [sp, #0x10]
+    str  q19, [sp, #0x20]
+    str  q20, [sp, #0x30]
+    stp  x26, x27, [sp, #0x40]
+    str  x29, [sp, #0x50]
+    fmov x29, d16
+    and  x27, x29, #0x7FFFFFFFFFFFFFFF
+    mov  x29, #0x3FF0000000000000
+    sub  x29, x29, x27               // < 0 iff |x| > 1.0 or NaN
+    tbnz x29, #63, Lf2xm1v_oor
+    mov  x29, #0x3C90000000000000
+    sub  x29, x27, x29               // < 0 iff |x| < 2^-54
+    tbnz x29, #63, Lf2xm1v_tiny
+    // reduce: t = x + redux; i = low word of t; k = (i+128)>>8 (wrapped)
+    ldr  d17, Lf2xm1v_redux
+    fadd d18, d16, d17               // t
+    fmov w27, s18                    // GET_LOW_WORD(t)
+    add  w27, w27, #128              // i0
+    lsr  w26, w27, #8
+    lsl  w26, w26, #20               // k (uint32 wrap semantics = C)
+    mov  w29, #0x3FF00000
+    add  w26, w26, w29               // high word of 2^k
+    lsl  x26, x26, #32               // full 2^k bit pattern
+    and  w27, w27, #0xFF             // table index
+    fsub d18, d18, d17               // t -= redux
+    fsub d19, d16, d18               // z = x - t
+    ldr  x29, Lf2xm1v_tblptr
+    ldr  x29, [x29]                  // &tbl[0]
+    add  x29, x29, w27, uxtw #4      // &tbl[2*i0]: 16-byte interleaved pairs
+    ldr  d18, [x29]                  // exp2t[i0]
+    ldr  d17, [x29, #8]              // eps[i0]
+    fsub d19, d19, d17               // z -= eps
+    ldr  d17, Lf2xm1v_P5
+    ldr  d20, Lf2xm1v_P4
+    fmadd d17, d19, d17, d20
+    ldr  d20, Lf2xm1v_P3
+    fmadd d17, d19, d17, d20
+    ldr  d20, Lf2xm1v_P2
+    fmadd d17, d19, d17, d20
+    ldr  d20, Lf2xm1v_P1
+    fmadd d17, d19, d17, d20         // p(z)
+    fmul d19, d18, d19               // t*z
+    fmadd d16, d19, d17, d18         // r = t + t*z*p(z) = 2^x / 2^k
+    fmov d17, x26
+    fmul d16, d16, d17               // 2^x
+    fmov d17, #1.0
+    fsub d16, d16, d17               // 2^x - 1
+    b    Lf2xm1v_ret
+Lf2xm1v_tiny:
+    fmov d17, #1.0
+    fadd d18, d16, d17               // 1 + x (tiny rounds away — classic parity)
+    fsub d16, d18, d17
+    b    Lf2xm1v_ret
+Lf2xm1v_oor:
+    mov  x29, #0x7FF0000000000000
+    sub  x29, x29, x27               // < 0 iff NaN
+    tbnz x29, #63, Lf2xm1v_nan
+    fmov d16, xzr                    // |x| > 1: classic helper stores +0.0
+    b    Lf2xm1v_ret
+Lf2xm1v_nan:
+    fadd d16, d16, d16               // quiet it, keep NaN-ness
+Lf2xm1v_ret:
+    ldr  x29, [sp, #0x50]
+    ldp  x26, x27, [sp, #0x40]
+    ldr  q20, [sp, #0x30]
+    ldr  q19, [sp, #0x20]
+    ldr  q18, [sp, #0x10]
+    ldr  q17, [sp]
+    add  sp, sp, #0x60
+    ret
+
+.p2align 3
+Lf2xm1v_tblptr:
+    .quad _x87_exp2_tbl              // dyld-rebased; -> the C path's table
+Lf2xm1v_redux:
+    .quad 0x42B8000000000000         // 0x1.8p52/256
+Lf2xm1v_P1:
+    .quad 0x3FE62E42FEFA39EF
+Lf2xm1v_P2:
+    .quad 0x3FCEBFBDFF82C575
+Lf2xm1v_P3:
+    .quad 0x3FAC6B08D704A0A6
+Lf2xm1v_P4:
+    .quad 0x3F83B2AB88F70400
+Lf2xm1v_P5:
+    .quad 0x3F55D88003875C74
+
+// -----------------------------------------------------------------------------
+// FSCALE value call (OPT-TI pow-trio): d16 = ST(0), d17 = ST(1);
+// d16 = scalbn(ST(0), clamp(trunc(ST(1)), ±100000)) — the classic
+// x87_fscale + openlibm_scalbn logic, ported bit-for-bit (pure exponent
+// manipulation; the only FP arithmetic is the same two54/twom54/huge/tiny
+// multiplies the C performs, so over/underflow FPSR effects match).
+// NaN ST(1) -> default qNaN (classic helper).  d17 is consumed (runs
+// containing the node exclude v16 AND v17 from the pool); everything else is
+// preserved and NZCV is never written.  No C fallback leg.
+// -----------------------------------------------------------------------------
+.globl _stub_fscale_val
+_stub_fscale_val:
+    sub  sp, sp, #0x20
+    stp  x27, x29, [sp]
+    stp  x25, x26, [sp, #0x10]
+    fmov x29, d17
+    and  x29, x29, #0x7FFFFFFFFFFFFFFF
+    mov  x27, #0x7FF0000000000000
+    sub  x27, x27, x29               // < 0 iff ST(1) is NaN
+    tbnz x27, #63, Lfscalev_nan1
+    // n = clamp(trunc(st1), ±100000); fcvtzs saturates, sxtw keeps it exact
+    fcvtzs w29, d17
+    sxtw x29, w29
+    mov  w27, #0x86A0
+    movk w27, #1, lsl #16            // x27 = 100000
+    sub  x26, x27, x29               // < 0 iff n > 100000
+    tbnz x26, #63, Lfscalev_clampp
+    add  x26, x29, x27               // < 0 iff n < -100000
+    tbnz x26, #63, Lfscalev_clampn
+Lfscalev_n:                          // x29 = n
+    fmov x27, d16                    // x27 = bits(x) from here on
+    ubfx x26, x27, #52, #11          // k = biased exponent
+    cbz  x26, Lfscalev_zsub
+Lfscalev_kchk:
+    sub  x25, x26, #0x7FF
+    cbz  x25, Lfscalev_xinfnan       // x NaN/Inf: x + x
+Lfscalev_addn:
+    add  x26, x26, x29               // k += n (|k|,|n| small — no wrap)
+    mov  x25, #0x7FE
+    sub  x25, x25, x26               // < 0 iff k > 0x7FE
+    tbnz x25, #63, Lfscalev_over
+    sub  x25, xzr, x26               // < 0 iff k > 0
+    tbnz x25, #63, Lfscalev_norm
+    add  x25, x26, #53               // < 0 iff k <= -54
+    tbnz x25, #63, Lfscalev_undover
+    add  x26, x26, #54               // subnormal result
+    and  x27, x27, #0x800FFFFFFFFFFFFF
+    orr  x27, x27, x26, lsl #52
+    fmov d16, x27
+    ldr  d17, Lfscalev_twom54
+    fmul d16, d16, d17
+    b    Lfscalev_ret
+Lfscalev_norm:
+    and  x27, x27, #0x800FFFFFFFFFFFFF
+    orr  x27, x27, x26, lsl #52
+    fmov d16, x27
+    b    Lfscalev_ret
+Lfscalev_zsub:                       // exponent 0: ±0 or subnormal x
+    lsl  x25, x27, #1
+    cbz  x25, Lfscalev_ret           // ±0 unchanged
+    ldr  d17, Lfscalev_two54
+    fmul d16, d16, d17               // normalize
+    fmov x27, d16
+    ubfx x26, x27, #52, #11
+    sub  x26, x26, #54               // k
+    mov  w25, #0xC350                // 50000
+    add  x25, x29, x25               // < 0 iff n < -50000
+    tbnz x25, #63, Lfscalev_tinyx
+    b    Lfscalev_addn
+Lfscalev_tinyx:
+    ldr  d17, Lfscalev_tiny
+    fmul d16, d17, d16               // tiny * x: ±0 + underflow, sign via x
+    b    Lfscalev_ret
+Lfscalev_clampp:
+    mov  x29, x27                    // n = +100000
+    b    Lfscalev_n
+Lfscalev_clampn:
+    sub  x29, xzr, x27               // n = -100000
+    b    Lfscalev_n
+Lfscalev_xinfnan:
+    fadd d16, d16, d16
+    b    Lfscalev_ret
+Lfscalev_undover:                    // k <= -54: n > 50000 ? over : underflow
+    mov  w25, #0xC350                // 50000
+    sub  x25, x25, x29               // < 0 iff n > 50000
+    tbnz x25, #63, Lfscalev_over
+    and  x27, x27, #0x8000000000000000
+    ldr  d17, Lfscalev_tiny
+    fmov x26, d17
+    orr  x26, x26, x27
+    fmov d16, x26                    // copysign(tiny, x)
+    ldr  d17, Lfscalev_tiny
+    fmul d16, d16, d17               // -> ±0 + underflow flag
+    b    Lfscalev_ret
+Lfscalev_over:
+    and  x27, x27, #0x8000000000000000
+    ldr  d17, Lfscalev_huge
+    fmov x26, d17
+    orr  x26, x26, x27
+    fmov d16, x26                    // copysign(huge, x)
+    ldr  d17, Lfscalev_huge
+    fmul d16, d16, d17               // -> ±Inf + overflow flag
+    b    Lfscalev_ret
+Lfscalev_nan1:
+    ldr  d16, Lfscalev_qnan
+Lfscalev_ret:
+    ldp  x25, x26, [sp, #0x10]
+    ldp  x27, x29, [sp]
+    add  sp, sp, #0x20
+    ret
+
+.p2align 3
+Lfscalev_two54:
+    .quad 0x4350000000000000         // 2^54
+Lfscalev_twom54:
+    .quad 0x3C90000000000000         // 2^-54
+Lfscalev_huge:
+    .quad 0x7E37E43C8800759C         // 1e300
+Lfscalev_tiny:
+    .quad 0x01A56E1FC2F8F359         // 1e-300
+Lfscalev_qnan:
+    .quad 0x7FF8000000000000
+
+// -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
 // -----------------------------------------------------------------------------
 TRIG_ENTRY fsin

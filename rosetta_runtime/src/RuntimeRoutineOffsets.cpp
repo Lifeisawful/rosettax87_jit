@@ -57,6 +57,8 @@ extern char stub_fcos[];
 // rewrite_runtime_routine_offsets).
 extern char stub_fcos_fast[];
 extern char stub_fcos_val[];
+extern char stub_f2xm1_val[];
+extern char stub_fscale_val[];
 extern char stub_fsin_fast[];
 extern char stub_fsin_val[];
 extern char stub_fsincos_fast[];
@@ -300,12 +302,22 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
           kConfig.disable_fsincos_fast);
     route(kRuntimeRoutine_fptan, fptan_val ? stub_fptan_val : stub_fptan_fast,
           kConfig.disable_fptan_fast);
+    // Pow-trio value calls (no *_fast stubs exist — gate-off means the
+    // classic slot the kStubs table already installed).
+    const bool f2xm1_val = trig_ir_f2xm1_enabled(kConfig);
+    const bool fscale_val = trig_ir_fscale_enabled(kConfig);
+    if (f2xm1_val)
+        route(kRuntimeRoutine_f2xm1, stub_f2xm1_val, /*disabled=*/0);
+    if (fscale_val)
+        route(kRuntimeRoutine_fscale, stub_fscale_val, /*disabled=*/0);
 
     CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
-             "(fcos=%s fsin=%s fsincos=%s fptan=%s)",
+             "(fcos=%s fsin=%s fsincos=%s fptan=%s f2xm1=%s fscale=%s)",
              n, count,
              fcos_val ? "val" : (kConfig.disable_fcos_fast ? "classic" : "fast"),
              fsin_val ? "val" : (kConfig.disable_fsin_fast ? "classic" : "fast"),
              fsincos_val ? "val" : (kConfig.disable_fsincos_fast ? "classic" : "fast"),
-             fptan_val ? "val" : (kConfig.disable_fptan_fast ? "classic" : "fast"));
+             fptan_val ? "val" : (kConfig.disable_fptan_fast ? "classic" : "fast"),
+             f2xm1_val ? "val" : "classic",
+             fscale_val ? "val" : "classic");
 }
