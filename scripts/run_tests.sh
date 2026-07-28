@@ -73,6 +73,7 @@ ALL_TESTS=(
     test_fstpt_gs
     test_ir_deferred
     test_mem_cse
+    test_fstsw_topdelta
     test_ir_algebra
     test_addr_fold
     test_const_promote

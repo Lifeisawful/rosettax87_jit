@@ -218,6 +218,8 @@ struct Node {
     //   GuestLoad:   bits[3:0] dst guest reg, bit[4] sign-extend
     //   GuestStoreR: bits[3:0] src guest reg
     //   GuestStoreI: bits[31:0] immediate (truncated to the access width)
+    //   FStsw:       bits[3:0] dst guest reg (0 = AX), bits[31:16] top_delta
+    //                snapshot at the fnstsw (int16, for TOP patching)
     uint64_t aux;
 };
 static_assert(sizeof(Node) == 24, "X87IR::Node should be 24 bytes");

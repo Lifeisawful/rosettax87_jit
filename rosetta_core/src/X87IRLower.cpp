@@ -1591,7 +1591,8 @@ void lower(Context& ctx, TranslationResult* result) {
             {
                 // Patch TOP if pops occurred before this FSTSW, or if the
                 // in-memory TOP was already stale on entry (carried top_dirty).
-                int16_t td = n.inputs[2];  // top_delta snapshot
+                const int16_t td =
+                    static_cast<int16_t>(n.aux >> 16);  // top_delta snapshot
                 if (td != 0) {
                     if (top_known >= 0) {
                         const int k = (top_known + td) & 7;
@@ -1626,7 +1627,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 }
 
                 // BFI W_ax, Wd_sw, #0, #16 — write status_word into x86 AX
-                int W_ax = n.inputs[1];  // destination register index (usually 0 = W0)
+                const int W_ax =
+                    static_cast<int>(n.aux & 0xF);  // dest reg (usually 0 = W0)
                 emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/0, /*imms=*/15,
                               Wd_sw, W_ax);
                 free_gpr(*result, Wd_sw);

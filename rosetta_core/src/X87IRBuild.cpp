@@ -1293,13 +1293,16 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 }
                 auto id = ctx.add_node(Op::FStsw);
                 if (id < 0) { ok = false; break; }
-                // inputs[0] = prior FCmp/FTst node (for fusion detection)
+                // inputs[0] = prior FCmp/FTst node (for fusion detection).
+                // The register index and top_delta snapshot are metadata, not
+                // node references — they live in aux (see Node), or the
+                // optimizer's input-rewrite/use-count loops would treat them
+                // as uses of nodes 0..2 (and fold_to could rewrite them).
                 ctx.nodes[id].inputs[0] = ctx.last_fcmp;
-                // inputs[1] = destination register index (0 = AX → W0)
-                ctx.nodes[id].inputs[1] = static_cast<int16_t>(
-                    instr->operands[0].reg.reg.index());
-                // inputs[2] = top_delta snapshot (for TOP patching in lowering)
-                ctx.nodes[id].inputs[2] = ctx.top_delta;
+                ctx.nodes[id].aux =
+                    static_cast<uint64_t>(instr->operands[0].reg.reg.index()) |
+                    (static_cast<uint64_t>(
+                         static_cast<uint16_t>(ctx.top_delta)) << 16);
                 // The AX write may change a cached operand's address — evict
                 // only entries whose address uses RAX/EAX as base/index;
                 // entries through other registers (and AbsMem) stay valid.
