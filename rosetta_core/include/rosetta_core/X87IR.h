@@ -139,7 +139,18 @@ enum class Op : uint8_t {
     GuestLoad,      // load [mem] into guest GPR (zero- or sign-extended)
     GuestStoreR,    // store guest GPR (low `size` bits) to [mem]
     GuestStoreI,    // store immediate to [mem]
+
+    // Flag-writing ALU forms (opt-in ROSETTA_X87_TRANSPARENT_FLAGS), consumed
+    // only when Rosetta's flag-liveness analysis proves the written EFLAGS
+    // dead (IRInstr::flag_liveness == 0). Lowerings are flag-free A64.
+    GuestAluRI,     // add/sub/and/or/xor r32/r64, imm; shl/shr/sar r32/r64, imm
+                    // (payload in imm_bits, GuestAlu selector in aux)
+    GuestRmwR,      // {add,sub,and,or,xor} [m32/m64], r — load/ALU/store
+                    // (mem_operand + aux: bits[3:0] src reg, bits[6:4] GuestAlu)
 };
+
+// ALU sub-op selector for GuestAluRI (whole aux) and GuestRmwR (aux[6:4]).
+enum class GuestAlu : uint8_t { Add = 0, Sub, And, Or, Xor, Shl, Shr, Sar };
 
 enum NodeFlags : uint8_t {
     kNone         = 0,
@@ -219,6 +230,8 @@ struct Node {
     //   GuestLoad:   bits[3:0] dst guest reg, bit[4] sign-extend
     //   GuestStoreR: bits[3:0] src guest reg
     //   GuestStoreI: bits[31:0] immediate (truncated to the access width)
+    //   GuestAluRI:  GuestAlu selector (payload itself is in imm_bits)
+    //   GuestRmwR:   bits[3:0] src guest reg, bits[6:4] GuestAlu selector
     //   FStsw:       bits[3:0] dst guest reg (0 = AX), bits[31:16] top_delta
     //                snapshot at the fnstsw (int16, for TOP patching)
     uint64_t aux;

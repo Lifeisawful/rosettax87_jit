@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "rosetta_config/Config.h"
+#include "rosetta_core/AssemblerHelpers.hpp"
 #include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/IROperand.h"
@@ -639,8 +640,25 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
 // carries the pinned GPRs across it and the IR re-enters mid-run after.
 //
 // ROSETTA_X87_TRANSPARENT_FLAGS=1 (implies TRANSPARENT_INT) extends the set
-// with the xor r,r zero idiom, gated on Rosetta's flag-liveness analysis
-// proving the written flags dead (see the xor block in build_guest_int).
+// with flag-writing ALU forms — the xor r,r zero idiom, reg-imm
+// add/sub/and/or/xor/shl/shr/sar, and {add,sub,and,or,xor} [m],r — gated on
+// Rosetta's flag-liveness analysis proving the written flags dead (see
+// build_guest_alu).
+
+// GuestAlu selector for a flag-writing ALU opcode; -1 for anything else.
+static int guest_alu_of(uint16_t op) {
+    switch (op) {
+        case kOpcodeName_add: return static_cast<int>(GuestAlu::Add);
+        case kOpcodeName_sub: return static_cast<int>(GuestAlu::Sub);
+        case kOpcodeName_and: return static_cast<int>(GuestAlu::And);
+        case kOpcodeName_or:  return static_cast<int>(GuestAlu::Or);
+        case kOpcodeName_xor: return static_cast<int>(GuestAlu::Xor);
+        case kOpcodeName_shl: return static_cast<int>(GuestAlu::Shl);
+        case kOpcodeName_shr: return static_cast<int>(GuestAlu::Shr);
+        case kOpcodeName_sar: return static_cast<int>(GuestAlu::Sar);
+        default: return -1;
+    }
+}
 
 // Memory operand admissible for a Guest load/store: no segment override
 // (compute_operand_address's GS/TLS fallback fixed-allocates pool slot 7 and
@@ -670,33 +688,37 @@ static IROperandSize guest_mem_size(const IROperand& m) {
     return m.kind == IROperandKind::AbsMem ? m.abs_mem.size : m.mem.size;
 }
 
-static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
-    if (!(g_rosetta_config && g_rosetta_config->transparent_int)) return false;
-    // nop consumes nothing; fwait checks pending FP exceptions, which this
-    // JIT does not model anywhere — Rosetta itself translates `wait` to
-    // nothing at all (translate_insn default case, binary-verified).
-    if (op == kOpcodeName_nop || op == kOpcodeName_wait) return true;
-
+// ── Flag-writing ALU forms (opt-in TRANSPARENT_FLAGS) ───────────────────────
+//
+// add/sub/and/or/xor r,imm — shl/shr/sar r,imm — {add,sub,and,or,xor} [m],r —
+// and the xor r,r zero idiom.  Every one of these defines EFLAGS, so all are
+// gated on Rosetta's backward flag-liveness analysis proving the results
+// dead: flag_liveness holds the flags live OUT of this instruction
+// (block-fixpoint, conservative all-live at unknown targets), so 0 means
+// nothing this instruction writes is ever read.  Every lowering is flag-free
+// on the host (MOVZ / ADD / SUB / AND / ORR / EOR / UBFM / SBFM / LDR / STR),
+// so the Guest-node NZCV contract is unchanged.
+//
+// Form restrictions (everything else declines, ending IR consumption there):
+//   - 8/16-bit operands → decline (partial-register / partial-width RMW)
+//   - shift by CL, reg-reg ALU (except self-xor), mem-dest shifts → decline
+//   - LOCK'd RMW (rep_prefix != 0 selects the exclusive-loop path) → decline
+//   - logical immediates must be AArch64-bitmask-encodable; for r64 the
+//     imm32 is sign-extended first (x86 semantics), add/sub take any imm32
+//   - shift counts are pre-masked (& 31 / & 63); a masked count of 0 is a
+//     pure no-op and is consumed without emitting a node
+static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
+    if (instr->flag_liveness != 0) return false;
     if (instr->num_operands < 2) return false;
     const IROperand& dst = instr->operands[0];
     const IROperand& src = instr->operands[1];
+    const int alu = guest_alu_of(op);
 
-    // ── xor r,r zero idiom (opt-in TRANSPARENT_FLAGS) ──────────────────
-    // xor defines all six arithmetic flags, so it is only transparent when
-    // Rosetta's backward flag-liveness analysis proves its flag results
-    // dead: flag_liveness holds the flags live OUT of this instruction
-    // (block-fixpoint, conservative all-live at unknown targets), so 0
-    // means nothing the xor writes is ever read.  Lowered as the existing
-    // GuestMovRI 0 — a plain MOVZ Wd, #0: flag-free on the host (the
-    // Guest-node NZCV contract is unchanged), and the W-write zero-extends,
-    // covering the r64 form.  Non-self forms and 8/16-bit destinations
-    // (partial-register merge) decline as usual.
-    if (op == kOpcodeName_xor) {
-        if (!g_rosetta_config->transparent_flags) return false;
-        if (instr->flag_liveness != 0) return false;
-        if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr() ||
-            src.kind != IROperandKind::Register || !src.reg.reg.is_gpr())
-            return false;
+    // xor r,r zero idiom → GuestMovRI 0 (the W-write zero-extend covers r64).
+    if (op == kOpcodeName_xor && dst.kind == IROperandKind::Register &&
+        src.kind == IROperandKind::Register) {
+        if (!dst.reg.reg.is_gpr() || !src.reg.reg.is_gpr()) return false;
         if (dst.reg.size != IROperandSize::S32 &&
             dst.reg.size != IROperandSize::S64)
             return false;
@@ -712,6 +734,84 @@ static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
         mem_cse_evict_reg(ctx, p.dst);
         return true;
     }
+
+    // Memory-destination RMW: {add,sub,and,or,xor} [m32/m64], r.
+    if (dst.kind == IROperandKind::MemRef || dst.kind == IROperandKind::AbsMem) {
+        if (alu > static_cast<int>(GuestAlu::Xor)) return false;  // no mem shifts
+        if (instr->rep_prefix != 0) return false;  // LOCK → exclusive path
+        if (src.kind != IROperandKind::Register || !src.reg.reg.is_gpr())
+            return false;
+        const IROperandSize msz = guest_mem_size(dst);
+        if (msz != IROperandSize::S32 && msz != IROperandSize::S64) return false;
+        if (src.reg.size != msz) return false;
+        if (!guest_mem_operand_ok(dst, /*allow64=*/msz == IROperandSize::S64))
+            return false;
+        auto id = ctx.add_node(Op::GuestRmwR);
+        if (id < 0) return false;
+        ctx.nodes[id].mem_operand = &instr->operands[0];
+        ctx.nodes[id].aux = static_cast<uint64_t>(src.reg.reg.index()) |
+                            (static_cast<uint64_t>(alu) << 4);
+        // Reads then writes [m]: cached loads it may alias are stale.
+        mem_cse_evict_may_alias(ctx, &instr->operands[0]);
+        return true;
+    }
+
+    // Register-destination immediate forms.
+    if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr()) return false;
+    const bool is64 = dst.reg.size == IROperandSize::S64;
+    if (!is64 && dst.reg.size != IROperandSize::S32) return false;
+    if (src.kind == IROperandKind::Register || src.kind == IROperandKind::MemRef ||
+        src.kind == IROperandKind::AbsMem)
+        return false;  // shift-by-CL / reg-reg ALU / mem source
+    if (src.kind == IROperandKind::Immediate && src.imm.mem_flags != 0)
+        return false;  // fixup: the payload is the target, not the literal
+    uint32_t imm = static_cast<uint32_t>(src.imm.value);
+
+    switch (static_cast<GuestAlu>(alu)) {
+        case GuestAlu::Shl:
+        case GuestAlu::Shr:
+        case GuestAlu::Sar:
+            imm &= is64 ? 63 : 31;
+            if (imm == 0) return true;  // masked count 0: architectural no-op
+            break;
+        case GuestAlu::And:
+        case GuestAlu::Or:
+        case GuestAlu::Xor: {
+            const uint64_t v =
+                is64 ? static_cast<uint64_t>(static_cast<int64_t>(
+                           static_cast<int32_t>(imm)))
+                     : imm;
+            LogicalImmEncoding enc;
+            if (!is_bitmask_immediate(is64, v, enc)) return false;
+            break;
+        }
+        default:
+            break;  // Add/Sub: emit_guest_add_disp covers any imm32
+    }
+
+    GuestPayload p = {};
+    p.dst = dst.reg.reg.index();
+    p.is64 = is64;
+    p.imm = imm;
+    auto id = ctx.add_node(Op::GuestAluRI);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    ctx.nodes[id].aux = static_cast<uint64_t>(alu);
+    ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+    mem_cse_evict_reg(ctx, p.dst);
+    return true;
+}
+
+static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_int)) return false;
+    // nop consumes nothing; fwait checks pending FP exceptions, which this
+    // JIT does not model anywhere — Rosetta itself translates `wait` to
+    // nothing at all (translate_insn default case, binary-verified).
+    if (op == kOpcodeName_nop || op == kOpcodeName_wait) return true;
+
+    if (instr->num_operands < 2) return false;
+    const IROperand& dst = instr->operands[0];
+    const IROperand& src = instr->operands[1];
 
     // ── Memory-destination forms: mov m←r / mov m←i ────────────────────
     if (op == kOpcodeName_mov && (dst.kind == IROperandKind::MemRef ||
@@ -1377,8 +1477,19 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_lea:
             case kOpcodeName_nop:
             case kOpcodeName_wait:
-            case kOpcodeName_xor:
                 ok = build_guest_int(ctx, instr, op);
+                break;
+
+            // ── Flag-writing ALU forms (opt-in TRANSPARENT_FLAGS) ───────
+            case kOpcodeName_add:
+            case kOpcodeName_sub:
+            case kOpcodeName_and:
+            case kOpcodeName_or:
+            case kOpcodeName_xor:
+            case kOpcodeName_shl:
+            case kOpcodeName_shr:
+            case kOpcodeName_sar:
+                ok = build_guest_alu(ctx, instr, op);
                 break;
 
             // ── Bail on everything else ─────────────────────────────────

@@ -487,9 +487,10 @@ static bool pair_node_skippable(Op op, bool lead_is_load) {
         // excludes every base/index register these nodes write — so a paired
         // access's address and value are unaffected by crossing one.
         // (GuestLoad above writes a register too — same argument — but reads
-        // memory; GuestStoreR/GuestStoreI write memory and fall to default.)
+        // memory; GuestStoreR/GuestStoreI write memory and fall to default,
+        // as does GuestRmwR which both reads and writes it.)
         case Op::GuestMovRR: case Op::GuestMovRI:
-        case Op::GuestLea: case Op::GuestExt:
+        case Op::GuestLea: case Op::GuestExt: case Op::GuestAluRI:
             return true;
         default:
             return false;
@@ -598,6 +599,7 @@ static int plan_addr_cache(Context& ctx) {
                 foldable = addr_disp_foldable(n.mem_operand, /*is_f64=*/false);
                 break;
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
+            case Op::GuestRmwR:
                 // Width varies (8/16/32/64) — classify at the exact size so a
                 // counted access is one the cached path can actually emit.
                 foldable = n.mem_operand->kind == IROperandKind::MemRef &&
@@ -709,6 +711,65 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                 const int sf = p.is64 ? 1 : 0;
                 emit_bitfield(buf, sf, /*SBFM*/0, sf, static_cast<int8_t>(lsb),
                               static_cast<int8_t>(lsb + width - 1), p.src, p.dst);
+            }
+            break;
+        }
+        case Op::GuestAluRI: {
+            // Flag-free in-place ALU on a guest GPR (TRANSPARENT_FLAGS).
+            // Build pre-validated: logical imms are bitmask-encodable, shift
+            // counts are masked and nonzero, add/sub imms fit via
+            // emit_guest_add_disp (temp GPR on the hard path, as for lea).
+            const int is64 = p.is64 ? 1 : 0;
+            const int bits = is64 ? 64 : 32;
+            switch (static_cast<GuestAlu>(n.aux)) {
+                case GuestAlu::Add:
+                    emit_guest_add_disp(result, buf, is64, p.dst, p.dst,
+                                        static_cast<int32_t>(p.imm));
+                    break;
+                case GuestAlu::Sub:
+                    emit_guest_add_disp(result, buf, is64, p.dst, p.dst,
+                                        -static_cast<int64_t>(
+                                            static_cast<int32_t>(p.imm)));
+                    break;
+                case GuestAlu::And:
+                case GuestAlu::Or:
+                case GuestAlu::Xor: {
+                    // r64 forms sign-extend the imm32 (x86 semantics).
+                    const uint64_t v =
+                        is64 ? static_cast<uint64_t>(static_cast<int64_t>(
+                                   static_cast<int32_t>(p.imm)))
+                             : p.imm;
+                    LogicalImmEncoding enc;
+                    is_bitmask_immediate(is64 != 0, v, enc);
+                    const auto a = static_cast<GuestAlu>(n.aux);
+                    const int opc = (a == GuestAlu::And) ? 0
+                                    : (a == GuestAlu::Or) ? 1
+                                                          : 2;  // EOR
+                    emit_logical_imm(buf, is64, opc, enc.N ? 1 : 0,
+                                     static_cast<int8_t>(enc.immr),
+                                     static_cast<int8_t>(enc.imms),
+                                     p.dst, p.dst);
+                    break;
+                }
+                case GuestAlu::Shl: {
+                    // LSL #c == UBFM Rd, Rn, #(bits-c), #(bits-1-c)
+                    const int c = static_cast<int>(p.imm);
+                    emit_bitfield(buf, is64, /*UBFM*/2, is64,
+                                  static_cast<int8_t>((bits - c) & (bits - 1)),
+                                  static_cast<int8_t>(bits - 1 - c),
+                                  p.dst, p.dst);
+                    break;
+                }
+                case GuestAlu::Shr:
+                case GuestAlu::Sar: {
+                    // LSR/ASR #c == UBFM/SBFM Rd, Rn, #c, #(bits-1)
+                    const int c = static_cast<int>(p.imm);
+                    const int opc =
+                        (static_cast<GuestAlu>(n.aux) == GuestAlu::Shr) ? 2 : 0;
+                    emit_bitfield(buf, is64, opc, is64, static_cast<int8_t>(c),
+                                  static_cast<int8_t>(bits - 1), p.dst, p.dst);
+                    break;
+                }
             }
             break;
         }
@@ -1523,8 +1584,41 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::GuestMovRI:
         case Op::GuestLea:
         case Op::GuestExt:
+        case Op::GuestAluRI:
             emit_guest_node(*result, buf, n);
             break;
+
+        // ── Guest memory RMW (TRANSPARENT_FLAGS): {add,sub,and,or,xor} [m],r ─
+        case Op::GuestRmwR: {
+            const int Rs = static_cast<int>(n.aux & 0xF);
+            const auto alu = static_cast<GuestAlu>((n.aux >> 4) & 0x7);
+            const int sz = guest_mem_size_log2(n.mem_operand);  // 2 or 3
+            const int is64 = (sz == 3) ? 1 : 0;
+            int Wt = alloc_free_gpr(*result);
+            if (!emit_cached_gpr_access(n, sz, /*is_load=*/1, Wt))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand, sz,
+                                    /*is_load=*/1, Wt);
+            switch (alu) {
+                case GuestAlu::Add:
+                case GuestAlu::Sub:
+                    emit_add_sub_shifted_reg(buf, is64,
+                                             alu == GuestAlu::Sub ? 1 : 0, 0,
+                                             /*LSL*/0, Rs, 0, Wt, Wt);
+                    break;
+                default:
+                    // AND=0 / ORR=1 / EOR=2 share the logical encoding.
+                    emit_logical_shifted_reg(
+                        buf, is64,
+                        alu == GuestAlu::And ? 0 : alu == GuestAlu::Or ? 1 : 2,
+                        0, /*LSL*/0, Rs, 0, Wt, Wt);
+                    break;
+            }
+            if (!emit_cached_gpr_access(n, sz, /*is_load=*/0, Wt))
+                emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand, sz,
+                                    /*is_load=*/0, Wt);
+            free_gpr(*result, Wt);
+            break;
+        }
 
         // ── Inlined guest memory movs (Phase 3) ────────────────────────
         case Op::GuestLoad: {
@@ -2075,22 +2169,23 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             transient = 2;
             break;
 
-        // Inlined guest integers write guest GPRs directly; only a lea with
-        // a disp fitting neither imm12 form allocates a temp — charge 1
-        // conservatively for every lea.
+        // Inlined guest integers write guest GPRs directly; only a lea (or
+        // an AluRI add/sub) with a disp fitting neither imm12 form allocates
+        // a temp — charge 1 conservatively for every lea/AluRI.
         case Op::GuestMovRR: case Op::GuestMovRI: case Op::GuestExt:
             break;
-        case Op::GuestLea:
+        case Op::GuestLea: case Op::GuestAluRI:
             transient = 1;
             break;
 
         // Guest memory movs: data register is the guest GPR (loads/reg
         // stores) — only the uncached address computation allocates, so 1.
-        // Imm stores also materialize the value into a scratch: 2.
+        // Imm stores also materialize the value into a scratch: 2. RMW
+        // holds its value scratch across the uncached address computation: 2.
         case Op::GuestLoad: case Op::GuestStoreR:
             transient = 1;
             break;
-        case Op::GuestStoreI:
+        case Op::GuestStoreI: case Op::GuestRmwR:
             transient = 2;
             break;
         }

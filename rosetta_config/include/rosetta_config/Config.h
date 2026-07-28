@@ -108,7 +108,7 @@ struct RosettaConfig {
     uint8_t  log_run_breaks;         // ROSETTA_X87_LOG_RUN_BREAKS=1 — log length + breaking opcode + gap-to-next-x87 for every x87 run
     uint8_t  run_bridge;             // ROSETTA_X87_RUN_BRIDGE=1 — keep an active run's pinned cache GPRs across run-transparent integer instrs (mov/lea/…; opt-in)
     uint8_t  transparent_int;        // ROSETTA_X87_TRANSPARENT_INT=1 — inline simple reg-form mov/lea/movzx/movsx into IR runs (requires RUN_BRIDGE; opt-in)
-    uint8_t  transparent_flags;      // ROSETTA_X87_TRANSPARENT_FLAGS=1 — also inline flag-writing zero idioms (xor r,r) when Rosetta's flag-liveness analysis proves the flags dead (implies TRANSPARENT_INT; opt-in)
+    uint8_t  transparent_flags;      // ROSETTA_X87_TRANSPARENT_FLAGS=1 — also inline flag-writing ALU forms (xor r,r; add/sub/and/or/xor/shl/shr/sar r,imm; {add,sub,and,or,xor} [m],r) when Rosetta's flag-liveness analysis proves the flags dead (implies TRANSPARENT_INT; opt-in)
     uint8_t  bridge_carry;           // ROSETTA_X87_BRIDGE_CARRY=1 — carry base-address-cache + RC GPRs across bridged gaps (implies RUN_BRIDGE; opt-in)
     uint8_t  runtime_keepalive;      // ROSETTA_X87_RUNTIME_KEEPALIVE=1 — keep the pinned cache alive across runtime-routine transcendentals (fsin/fcos/…; opt-in)
     uint8_t  disable_fcos_fast;      // ROSETTA_X87_DISABLE_FCOS_FAST=1 — route FCOS through the classic prologue/vtable stub instead of the in-blob fast path
