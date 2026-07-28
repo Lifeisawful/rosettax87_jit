@@ -728,6 +728,12 @@ _stub_cpuid:
 //   preserved:  x0-x15, x17, x19-x26, x28, x30, sp, NZCV, FPCR, v0-v15
 //   q16-q24 are used as scratch but saved/restored on the native stack —
 //   stricter than the classic path, which clobbers v16-v31 outright.
+//   ALL vector saves here are SINGLE str/ldr q, never STP/LDP Q-pairs: the
+//   guest-mode (TSO) Q-pair penalty (see the TRIG_VAL_HUGE comment below)
+//   applies to these fast-path frames too — converting the q16-q24
+//   save/restore from pairs to singles measured ~2x on every small/medium
+//   trig bench (2026-07-28, bench_trig/bench_fcos interleaved A/B).  Do not
+//   "clean this up" back into pairs.
 // NZCV is never written: all control flow is cbz/tbz/tbnz on integer values.
 //
 // X87State layout at x18+0xA0 (x87_state_offset, verified against the JIT's
@@ -763,10 +769,14 @@ _stub_\name\()_fast:
     movk w29, #0x4139, lsl #16
     sub  w29, w27, w29
     tbz  w29, #31, L\name\()_bail
-    stp  q16, q17, [sp]
-    stp  q18, q19, [sp, #0x20]
-    stp  q20, q21, [sp, #0x40]
-    stp  q22, q23, [sp, #0x60]
+    str  q16, [sp]
+    str  q17, [sp, #0x10]
+    str  q18, [sp, #0x20]
+    str  q19, [sp, #0x30]
+    str  q20, [sp, #0x40]
+    str  q21, [sp, #0x50]
+    str  q22, [sp, #0x60]
+    str  q23, [sp, #0x70]
     ldr  d16, [x25, #8]              // x = ST(0)
 .endm
 
@@ -838,7 +848,11 @@ L\name\()_red_done:
 //   z = x*x; w = z*z; r = z*(C1+z*(C2+z*C3)) + w*w*(C4+z*(C5+z*C6))
 //   hz = 0.5*z; w' = 1-hz;  cos = w' + (((1-w') - hz) + (z*r - x*y))
 // The 1-hz / (1-w')-hz cancellation steps stay unfused to match the C.
-.macro TRIG_KCOS dst
+// iy=0 (small paths, y = +0): the x*y multiply and the z*r - x*y subtract
+// are elided — bit-exact, because x*(+0) = ±0 and z*r ∈ {+0} ∪ (0, inf)
+// (z >= 0 and r > 0 for all nonzero kernel inputs), so z*r - (±0) == z*r
+// under RN in every case; d23 is never read.
+.macro TRIG_KCOS dst, iy=1
     fmul d17, d22, d22               // z
     fmul d18, d17, d17               // w = z*z
     ldr  d20, Ltrig_C3
@@ -861,8 +875,10 @@ L\name\()_red_done:
     fsub d21, d21, d18               // 1 - w'
     fsub d21, d21, d20               // (1-w') - hz
     fmul d19, d17, d19               // z*r
+.if \iy == 1
     fmul d17, d22, d23               // x*y
     fsub d19, d19, d17               // z*r - x*y
+.endif
     fadd d21, d21, d19
     fadd \dst, d18, d21              // result
 .endm
@@ -906,7 +922,11 @@ L\name\()_red_done:
 // TOP there).  Clobbers d16-d21, d24, x27, x29.
 // Three shapes: |x| >= 0.6744 (pi/4 substitution + rational fixup), plain
 // polynomial (n even), accurate -1/(x+r) via split high parts (n odd).
-.macro TRIG_KTAN name
+// yzero=1 (small paths, y = +0): every read of d23 is elided — the two
+// "+ y" adds and the pio4lo - y subtract are identities (+0 added to /
+// subtracted from provably nonzero values), so the result is bit-exact
+// with the y=0.0 kernel the C small path runs; d23 is never read.
+.macro TRIG_KTAN name, yzero=0
     and  w27, w27, #1
     orr  w26, w26, w27, lsl #3
     fmov x27, d22
@@ -921,14 +941,22 @@ L\name\()_red_done:
     orr  w26, w26, #0x20
     tbz  w26, #4, L\name\()_ktan_bigpos
     fneg d22, d22
+.if \yzero == 0
     fneg d23, d23
+.endif
 L\name\()_ktan_bigpos:
     ldr  d20, Ltrig_pio4
     fsub d17, d20, d22               // z = pio4 - x
+.if \yzero == 0
     ldr  d20, Ltrig_pio4lo
     fsub d18, d20, d23               // w = pio4lo - y
+.else
+    ldr  d18, Ltrig_pio4lo           // w = pio4lo - (+0) = pio4lo
+.endif
     fadd d22, d17, d18               // x = z + w
+.if \yzero == 0
     fmov d23, xzr                    // y = 0
+.endif
 L\name\()_ktan_notbig:
     // polynomial: r = T1+w(T3+w(T5+w(T7+w(T9+wT11)))),
     //             v = z*(T2+w(T4+w(T6+w(T8+w(T10+wT12)))))
@@ -960,9 +988,13 @@ L\name\()_ktan_notbig:
     fmul d21, d17, d22               // s = z*x
     fadd d19, d19, d20               // r + v
     fmul d19, d21, d19               // s*(r+v)
+.if \yzero == 0
     fadd d19, d19, d23               // s*(r+v) + y
+.endif
     fmul d19, d17, d19               // z*(...)
+.if \yzero == 0
     fadd d19, d19, d23               // r' = y + z*(s*(r+v)+y)
+.endif
     ldr  d24, Ltrig_T0
     fmadd d19, d24, d21, d19         // r += T0*s
     fadd d18, d22, d19               // w = x + r
@@ -1249,10 +1281,14 @@ L\name\()_huge:
 .if \q24
     ldr  q24, [sp, #0x80]
 .endif
-    ldp  q16, q17, [sp]
-    ldp  q18, q19, [sp, #0x20]
-    ldp  q20, q21, [sp, #0x40]
-    ldp  q22, q23, [sp, #0x60]
+    ldr  q16, [sp]
+    ldr  q17, [sp, #0x10]
+    ldr  q18, [sp, #0x20]
+    ldr  q19, [sp, #0x30]
+    ldr  q20, [sp, #0x40]
+    ldr  q21, [sp, #0x50]
+    ldr  q22, [sp, #0x60]
+    ldr  q23, [sp, #0x70]
     ldp  x25, x26, [sp, #0x90]
     add  sp, sp, #0xA0
     ret
@@ -1288,9 +1324,8 @@ Lfcos_small:
     sub  w29, w27, w29
     tbnz w29, #31, Lfcos_one
     fmov d22, d16                    // y0 = x
-    fmov d23, xzr                    // y1 = 0
-    mov  w27, wzr                    // n = 0: +cos, no negate
-    b    Lfcos_kcos
+    TRIG_KCOS d16, 0                 // y known zero — skips the x*y leg
+    b    Lfcos_store
 Lfcos_one:
     fmov d16, #1.0
     b    Lfcos_store
@@ -1320,9 +1355,12 @@ _stub_fcos_val:
     movk w29, #0x4139, lsl #16
     sub  w29, w27, w29
     tbz  w29, #31, Lfcosv_huge       // >= 2^20*(pi/2), Inf, NaN
-    stp  q17, q18, [sp]
-    stp  q19, q20, [sp, #0x20]
-    stp  q21, q22, [sp, #0x40]
+    str  q17, [sp]
+    str  q18, [sp, #0x10]
+    str  q19, [sp, #0x20]
+    str  q20, [sp, #0x30]
+    str  q21, [sp, #0x40]
+    str  q22, [sp, #0x50]
     str  q23, [sp, #0x60]
     mov  w29, #0x21fc
     movk w29, #0x3fe9, lsl #16
@@ -1339,9 +1377,12 @@ Lfcosv_negmaybe:
     tbz  w29, #0, Lfcosv_done
     fneg d16, d16
 Lfcosv_done:
-    ldp  q17, q18, [sp]
-    ldp  q19, q20, [sp, #0x20]
-    ldp  q21, q22, [sp, #0x40]
+    ldr  q17, [sp]
+    ldr  q18, [sp, #0x10]
+    ldr  q19, [sp, #0x20]
+    ldr  q20, [sp, #0x30]
+    ldr  q21, [sp, #0x40]
+    ldr  q22, [sp, #0x50]
     ldr  q23, [sp, #0x60]
 Lfcosv_ret:
     ldp  x27, x29, [sp, #0x70]
@@ -1353,9 +1394,8 @@ Lfcosv_small:
     sub  w29, w27, w29
     tbnz w29, #31, Lfcosv_one
     fmov d22, d16
-    fmov d23, xzr
-    mov  w27, wzr
-    b    Lfcosv_kcos
+    TRIG_KCOS d16, 0                 // y known zero — skips the x*y leg
+    b    Lfcosv_done
 Lfcosv_one:
     fmov d16, #1.0
     b    Lfcosv_done
@@ -1381,9 +1421,12 @@ _stub_fsin_val:
     movk w29, #0x4139, lsl #16
     sub  w29, w27, w29
     tbz  w29, #31, Lfsinv_huge
-    stp  q17, q18, [sp]
-    stp  q19, q20, [sp, #0x20]
-    stp  q21, q22, [sp, #0x40]
+    str  q17, [sp]
+    str  q18, [sp, #0x10]
+    str  q19, [sp, #0x20]
+    str  q20, [sp, #0x30]
+    str  q21, [sp, #0x40]
+    str  q22, [sp, #0x50]
     str  q23, [sp, #0x60]
     mov  w29, #0x21fc
     movk w29, #0x3fe9, lsl #16
@@ -1399,9 +1442,12 @@ Lfsinv_negmaybe:
     tbz  w27, #1, Lfsinv_done        // negate for quadrants 2 and 3
     fneg d16, d16
 Lfsinv_done:
-    ldp  q17, q18, [sp]
-    ldp  q19, q20, [sp, #0x20]
-    ldp  q21, q22, [sp, #0x40]
+    ldr  q17, [sp]
+    ldr  q18, [sp, #0x10]
+    ldr  q19, [sp, #0x20]
+    ldr  q20, [sp, #0x30]
+    ldr  q21, [sp, #0x40]
+    ldr  q22, [sp, #0x50]
     ldr  q23, [sp, #0x60]
 Lfsinv_ret:
     ldp  x27, x29, [sp, #0x70]
@@ -1441,31 +1487,39 @@ _stub_fptan_val:
     movk w29, #0x4139, lsl #16
     sub  w29, w27, w29
     tbz  w29, #31, Lfptanv_huge
-    stp  q17, q18, [sp]
-    stp  q19, q20, [sp, #0x20]
-    stp  q21, q22, [sp, #0x40]
-    stp  q23, q24, [sp, #0x60]
+    str  q17, [sp]
+    str  q18, [sp, #0x10]
+    str  q19, [sp, #0x20]
+    str  q20, [sp, #0x30]
+    str  q21, [sp, #0x40]
+    str  q22, [sp, #0x50]
+    str  q23, [sp, #0x60]
+    str  q24, [sp, #0x70]
     mov  w29, #0x21fc
     movk w29, #0x3fe9, lsl #16
     sub  w29, w27, w29
     tbnz w29, #31, Lfptanv_small
     TRIG_REDUCE fptanv
-    b    Lfptanv_kernel
+    mov  w26, wzr                    // flag storage for TRIG_KTAN (x26 saved)
+    TRIG_KTAN fptanv
+    b    Lfptanv_done
 Lfptanv_small:
     mov  w29, #0x3e400000
     sub  w29, w27, w29
     tbnz w29, #31, Lfptanv_done      // tiny: tan(x) = x, d16 unchanged
     fmov d22, d16
-    fmov d23, xzr
-    mov  w27, wzr
-Lfptanv_kernel:
+    mov  w27, wzr                    // n = 0
     mov  w26, wzr                    // flag storage for TRIG_KTAN (x26 saved)
-    TRIG_KTAN fptanv
+    TRIG_KTAN fptanvs, 1             // y known zero — d23 never read
 Lfptanv_done:
-    ldp  q17, q18, [sp]
-    ldp  q19, q20, [sp, #0x20]
-    ldp  q21, q22, [sp, #0x40]
-    ldp  q23, q24, [sp, #0x60]
+    ldr  q17, [sp]
+    ldr  q18, [sp, #0x10]
+    ldr  q19, [sp, #0x20]
+    ldr  q20, [sp, #0x30]
+    ldr  q21, [sp, #0x40]
+    ldr  q22, [sp, #0x50]
+    ldr  q23, [sp, #0x60]
+    ldr  q24, [sp, #0x70]
 Lfptanv_ret:
     ldr  x26, [sp, #0x88]
     ldp  x27, x29, [sp, #0x90]
@@ -1499,42 +1553,68 @@ _stub_fsincos_val:
     movk w29, #0x4139, lsl #16
     sub  w29, w27, w29
     tbz  w29, #31, Lfsincosv_huge    // >= 2^20*(pi/2), Inf, NaN
-    stp  q18, q19, [sp]
-    stp  q20, q21, [sp, #0x20]
-    stp  q22, q23, [sp, #0x40]
+    str  q18, [sp]
+    str  q19, [sp, #0x10]
+    str  q20, [sp, #0x20]
+    str  q21, [sp, #0x30]
+    str  q22, [sp, #0x40]
+    str  q23, [sp, #0x50]
     str  q24, [sp, #0x60]
     mov  w29, #0x21fc
     movk w29, #0x3fe9, lsl #16
     sub  w29, w27, w29
     tbnz w29, #31, Lfsincosv_small
     TRIG_REDUCE fsincosv
-    b    Lfsincosv_kernels
-Lfsincosv_small:
-    fmov d22, d16
-    fmov d23, xzr
-    mov  w27, wzr
-Lfsincosv_kernels:
     TRIG_KCOS d24                    // c (d22/d23 stay live)
     TRIG_KSIN d16                    // s
+    // Quadrant select, depth-1 from the kernel outputs (no serial swap):
+    //   n&3 = 0: sin=+s cos=+c    1: sin=+c cos=-s
+    //         2: sin=-s cos=-c    3: sin=-c cos=+s
     tbz  w27, #0, Lfsincosv_even
-    fmov d17, d16                    // odd n: swap s <-> c
-    fmov d16, d24
-    fmov d24, d17
     tbnz w27, #1, Lfsincosv_n3
-    fneg d24, d24                    // n=1: sin=+c cos=-s
+    fneg d17, d16                    // n=1: cos = -s (reads s before...)
+    fmov d16, d24                    //      sin = +c (...d16 is overwritten)
     b    Lfsincosv_done
 Lfsincosv_n3:
-    fneg d16, d16                    // n=3: sin=-c cos=+s
+    fmov d17, d16                    // n=3: cos = +s
+    fneg d16, d24                    //      sin = -c
     b    Lfsincosv_done
 Lfsincosv_even:
-    tbz  w27, #1, Lfsincosv_done
-    fneg d16, d16                    // n=2: both negated
-    fneg d24, d24
+    tbnz w27, #1, Lfsincosv_n2
+    fmov d17, d24                    // n=0: cos = +c
+    b    Lfsincosv_done
+Lfsincosv_n2:
+    fneg d16, d16                    // n=2: sin = -s
+    fneg d17, d24                    //      cos = -c
+    b    Lfsincosv_done
+Lfsincosv_small:
+    // |x| < pi/4: openlibm composition — sin has a 2^-26 short-circuit
+    // (returns x, preserving -0), cos a 2^-27*sqrt(2) one (returns 1.0);
+    // both kernels take y = 0 (iy=0 forms), matching the C handler's
+    // openlibm_sin/openlibm_cos small paths bit for bit.
+    fmov d22, d16
+    mov  w29, #0x3e500000            // 2^-26
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsincosv_tiny
+    TRIG_KSIN d16, 0                 // s (d22 stays live)
+    TRIG_KCOS d17, 0                 // c
+    b    Lfsincosv_done
+Lfsincosv_tiny:                      // sin = x (d16 unchanged)
+    mov  w29, #0xa09e
+    movk w29, #0x3e46, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsincosv_cos1
+    TRIG_KCOS d17, 0
+    b    Lfsincosv_done
+Lfsincosv_cos1:
+    fmov d17, #1.0                   // cos = 1.0
 Lfsincosv_done:
-    fmov d17, d24                    // cos out
-    ldp  q18, q19, [sp]
-    ldp  q20, q21, [sp, #0x20]
-    ldp  q22, q23, [sp, #0x40]
+    ldr  q18, [sp]
+    ldr  q19, [sp, #0x10]
+    ldr  q20, [sp, #0x20]
+    ldr  q21, [sp, #0x30]
+    ldr  q22, [sp, #0x40]
+    ldr  q23, [sp, #0x50]
     ldr  q24, [sp, #0x60]
 Lfsincosv_ret:
     ldp  x27, x29, [sp, #0x70]
@@ -2631,30 +2711,51 @@ TRIG_ENTRY fsincos
     sub  w29, w27, w29
     tbnz w29, #31, Lfsincos_small
     TRIG_REDUCE fsincos
-    b    Lfsincos_kernels
-Lfsincos_small:
-    fmov d22, d16
-    fmov d23, xzr
-    mov  w27, wzr
-Lfsincos_kernels:
     TRIG_KCOS d24                    // c (d22/d23 stay live)
     TRIG_KSIN d16                    // s
+    // Quadrant select, depth-1 from the kernel outputs (no serial swap):
+    //   n&3 = 0: sin=+s cos=+c    1: sin=+c cos=-s
+    //         2: sin=-s cos=-c    3: sin=-c cos=+s
     tbz  w27, #0, Lfsincos_even
-    fmov d17, d16                    // odd n: swap s <-> c ...
-    fmov d16, d24
-    fmov d24, d17
     tbnz w27, #1, Lfsincos_n3
-    fneg d24, d24                    // n=1: sin=+c cos=-s
+    fneg d17, d16                    // n=1: cos = -s (reads s before...)
+    fmov d16, d24                    //      sin = +c (...d16 is overwritten)
     b    Lfsincos_store
 Lfsincos_n3:
-    fneg d16, d16                    // n=3: sin=-c cos=+s
+    fmov d17, d16                    // n=3: cos = +s
+    fneg d16, d24                    //      sin = -c
     b    Lfsincos_store
 Lfsincos_even:
-    tbz  w27, #1, Lfsincos_store
-    fneg d16, d16                    // n=2: both negated
-    fneg d24, d24
+    tbnz w27, #1, Lfsincos_n2
+    fmov d17, d24                    // n=0: cos = +c
+    b    Lfsincos_store
+Lfsincos_n2:
+    fneg d16, d16                    // n=2: sin = -s
+    fneg d17, d24                    //      cos = -c
+    b    Lfsincos_store
+Lfsincos_small:
+    // |x| < pi/4: openlibm composition — sin has a 2^-26 short-circuit
+    // (returns x, preserving -0), cos a 2^-27*sqrt(2) one (returns 1.0);
+    // both kernels take y = 0 (iy=0 forms), matching the C handler's
+    // openlibm_sin/openlibm_cos small paths bit for bit.
+    fmov d22, d16
+    mov  w29, #0x3e500000            // 2^-26
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsincos_tiny
+    TRIG_KSIN d16, 0                 // s (d22 stays live)
+    TRIG_KCOS d17, 0                 // c
+    b    Lfsincos_store
+Lfsincos_tiny:                       // sin = x (d16 unchanged)
+    mov  w29, #0xa09e
+    movk w29, #0x3e46, lsl #16
+    sub  w29, w27, w29
+    tbnz w29, #31, Lfsincos_cos1
+    TRIG_KCOS d17, 0
+    b    Lfsincos_store
+Lfsincos_cos1:
+    fmov d17, #1.0                   // cos = 1.0
 Lfsincos_store:
-    TRIG_STORE_PUSH d24
+    TRIG_STORE_PUSH d17
     TRIG_EPILOGUE 1
 TRIG_BAIL fsincos
 
@@ -2683,7 +2784,10 @@ TRIG_ENTRY fptan
     sub  w29, w27, w29
     tbnz w29, #31, Lfptan_small
     TRIG_REDUCE fptan
-    b    Lfptan_kernel
+    // TRIG_KTAN packs (n&1, sign, big) into w26 bits 3..5, above the TOP the
+    // memory entry keeps in bits 0..2; the store unpacks with `and #7`.
+    TRIG_KTAN fptan
+    b    Lfptan_store
 Lfptan_small:
     // |x| < 2^-27: tan(x) = x — d16 already holds it (also preserves -0,
     // which the odd polynomial would not).
@@ -2691,12 +2795,8 @@ Lfptan_small:
     sub  w29, w27, w29
     tbnz w29, #31, Lfptan_store
     fmov d22, d16
-    fmov d23, xzr
-    mov  w27, wzr
-Lfptan_kernel:
-    // TRIG_KTAN packs (n&1, sign, big) into w26 bits 3..5, above the TOP the
-    // memory entry keeps in bits 0..2; the store unpacks with `and #7`.
-    TRIG_KTAN fptan
+    mov  w27, wzr                    // n = 0
+    TRIG_KTAN fptans, 1              // y known zero — d23 never read
 Lfptan_store:
     and  w26, w26, #7                // unpack TOP
     fmov d17, #1.0

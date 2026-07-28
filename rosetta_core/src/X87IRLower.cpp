@@ -51,10 +51,16 @@ static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;  // = 1
 struct FPRState {
     int8_t node_fpr[kMaxNodes];      // D register for each node, or -1
     int16_t last_use[kMaxNodes];     // last node index that uses each node, or -1
+    int8_t prefer_fpr[kMaxNodes];    // OPT-TI plan: pin this node's value to
+                                     // 16/17 (trig-call arg/result), or -1
+    uint32_t pinned_mask = 0;        // regs handed out by the plan — never
+                                     // pool-allocated, never pool-freed
 
     void compute_last_uses(const Context& ctx) {
         memset(last_use, -1, sizeof(last_use));
         memset(node_fpr, -1, sizeof(node_fpr));
+        memset(prefer_fpr, -1, sizeof(prefer_fpr));
+        pinned_mask = 0;
         for (int i = 0; i < ctx.num_nodes; i++) {
             auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
@@ -70,12 +76,15 @@ struct FPRState {
         }
     }
 
-    // Free FPRs whose last use was node `i`.
+    // Free FPRs whose last use was node `i`.  Plan-pinned regs (v16/v17 in
+    // trig runs) were never pool-allocated, so they are released by clearing
+    // the node binding only.
     void free_dead_inputs(TranslationResult& result, const Node& n, int i) {
         for (int j = 0; j < 3; j++) {
             int16_t in = n.inputs[j];
             if (in >= 0 && last_use[in] == i && node_fpr[in] >= 0) {
-                free_fpr(result, node_fpr[in]);
+                if (!(pinned_mask >> node_fpr[in] & 1u))
+                    free_fpr(result, node_fpr[in]);
                 node_fpr[in] = -1;
             }
         }
@@ -90,18 +99,169 @@ struct FPRState {
     // Returns the FPR register number, or -1 if no reuse is possible.
     // On success, sets node_fpr[input] = -1 so free_dead_inputs skips it.
     // Caller MUST capture input FPRs via get() BEFORE calling this.
+    // Plan-pinned regs are never reused: a value parked there would cross
+    // the trig call that owns the register.
     int try_reuse_input(const Context& ctx, int i) {
         const auto& n = ctx.nodes[i];
         // Prefer inputs[0] (Dn, natural accumulator position)
         for (int pref = 0; pref < 3; pref++) {
             int16_t in = n.inputs[pref];
-            if (in >= 0 && last_use[in] == i && node_fpr[in] >= 0) {
+            if (in >= 0 && last_use[in] == i && node_fpr[in] >= 0 &&
+                !(pinned_mask >> node_fpr[in] & 1u)) {
                 int fpr = node_fpr[in];
                 node_fpr[in] = -1;  // claimed — free_dead_inputs will skip
                 return fpr;
             }
         }
         return -1;
+    }
+
+    // Allocate the output FPR for node `i`: the plan target if one was
+    // pinned, else a dying input's register, else a fresh pool register.
+    int alloc_output(const Context& ctx, TranslationResult& result, int i) {
+        if (prefer_fpr[i] >= 0) return prefer_fpr[i];
+        int Dd = try_reuse_input(ctx, i);
+        if (Dd < 0) Dd = alloc_free_fpr(result);
+        return Dd;
+    }
+
+    // ── OPT-TI: v16/v17 residency plan ──────────────────────────────────────
+    // The trig/pow value calls take their argument in d16 (d17 for the
+    // two-arg family's ST(1)) and return in d16 (d17 = fsincos cosine).  The
+    // lowering already elides its FMOV bridges whenever Dn/Dd happen to BE
+    // 16/17 — this pre-pass makes that happen by pinning suitable values to
+    // those registers.  v16 (and v17 for sincos-family runs) are excluded
+    // from the pool (compile_run), so every 16/17 binding comes from this
+    // plan and the free paths above keep them out of the pool for good.
+    //
+    // Safety rules, per register:
+    //  - a pinned live range may never contain a value-call node in its
+    //    interior (the call clobbers the register);
+    //  - ranges are claimed left-to-right against a watermark, so two plans
+    //    never overlap;
+    //  - a range may END at a call: the call's own d16/d17 argument moves
+    //    read operand registers before writing them (input1's move is
+    //    emitted before input0's, and only the two-arg family writes d17
+    //    pre-BL), so equality cases are checked position-aware below.
+    void plan_trig_targets(const Context& ctx, const int16_t* pair_with) {
+        auto is_call = [](Op op) {
+            return op == Op::FCosCall || op == Op::FSinCall ||
+                   op == Op::FPtanCall || op == Op::FSinCosCall ||
+                   op == Op::F2XM1Call || op == Op::FScaleCall ||
+                   op == Op::FYl2xCall || op == Op::FYl2xp1Call ||
+                   op == Op::FPatanCall;
+        };
+        auto is_two_arg = [](Op op) {
+            return op == Op::FScaleCall || op == Op::FYl2xCall ||
+                   op == Op::FYl2xp1Call || op == Op::FPatanCall;
+        };
+
+        int16_t calls[kMaxNodes];
+        int ncalls = 0;
+        bool v17_excluded = false;  // mirrors compile_run's has_sincos_call
+        for (int i = 0; i < ctx.num_nodes; i++) {
+            const auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            if (is_call(n.op)) {
+                calls[ncalls++] = static_cast<int16_t>(i);
+                if (is_two_arg(n.op) || n.op == Op::FSinCosCall)
+                    v17_excluded = true;
+            }
+        }
+        if (ncalls == 0) return;
+
+        // Producers whose output allocation honors prefer_fpr (everything
+        // lowered through alloc_output; load-pair members are excluded —
+        // their two-register shape has its own allocation path).
+        auto producer_ok = [&](int16_t d) -> bool {
+            if (d < 0 || pair_with[d] >= 0) return false;
+            switch (ctx.nodes[d].op) {
+            case Op::ReadSt:
+            case Op::LoadF64: case Op::LoadF32Raw:
+            case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+            case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
+            case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+            case Op::FNMul:
+            case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
+            case Op::FNeg: case Op::FAbs: case Op::FSqrt: case Op::FRndInt:
+            case Op::FCSel:
+            case Op::CvtF32ToF64: case Op::CvtF64ToF32:
+                return true;
+            default:
+                return false;
+            }
+        };
+
+        int v16_free_from = 0;  // v16/v17 available from this node index on
+        int v17_free_from = 0;
+        for (int k = 0; k < ncalls; k++) {
+            const int c = calls[k];
+            const int prev = (k > 0) ? calls[k - 1] : -1;
+            const int next = (k + 1 < ncalls) ? calls[k + 1] : kMaxNodes + 1;
+            const auto& cn = ctx.nodes[c];
+
+            // Argument in d16: pin the producer when the value is born after
+            // the previous call, v16 is free, and it dies here.
+            const int16_t in0 = cn.inputs[0];
+            if (producer_ok(in0) && prefer_fpr[in0] < 0 &&
+                last_use[in0] == c && in0 > prev &&
+                in0 >= v16_free_from) {
+                prefer_fpr[in0] = 16;
+                pinned_mask |= 1u << 16;
+            }
+
+            // Result in d16: pin when no later call clobbers it first.
+            // Dying exactly AT the next call is fine — its argument moves
+            // read v16 before anything writes d16.
+            int lu = last_use[c];
+            if (lu < c) lu = c;  // side-effect-only call: dies immediately
+            if (lu <= next) {
+                prefer_fpr[c] = 16;
+                pinned_mask |= 1u << 16;
+                v16_free_from = lu;
+            } else {
+                v16_free_from = c + 1;  // result copied out; v16 dead after BL
+            }
+
+            if (!v17_excluded) continue;  // v17 belongs to the pool
+            // ST(1) argument in d17 (two-arg family).
+            if (is_two_arg(cn.op)) {
+                const int16_t in1 = cn.inputs[1];
+                if (producer_ok(in1) && prefer_fpr[in1] < 0 &&
+                    last_use[in1] == c && in1 > prev &&
+                    in1 >= v17_free_from && cn.inputs[0] != in1) {
+                    prefer_fpr[in1] = 17;
+                    pinned_mask |= 1u << 17;
+                }
+            }
+            v17_free_from = c + 1;
+            // fsincos cosine: pin the adjacent projection's output to d17.
+            // A range ending exactly AT the next call is only safe when that
+            // call reads it from d17 (its inputs[1]) or never writes d17
+            // before the BL (the one-arg family).
+            if (cn.op == Op::FSinCosCall) {
+                int p = c + 1;
+                while (p < ctx.num_nodes && (ctx.nodes[p].flags & kDead)) p++;
+                if (p < ctx.num_nodes &&
+                    ctx.nodes[p].op == Op::FSinCosProjCos &&
+                    ctx.nodes[p].inputs[0] == c) {
+                    int lup = last_use[p];
+                    if (lup < p) lup = p;
+                    const bool end_at_next_ok =
+                        lup < next ||
+                        (lup == next &&
+                         (!is_two_arg(ctx.nodes[next].op) ||
+                          ctx.nodes[next].inputs[1] == p));
+                    if (end_at_next_ok) {
+                        prefer_fpr[p] = 17;
+                        pinned_mask |= 1u << 17;
+                        v17_free_from = lup;
+                    } else {
+                        v17_free_from = p + 1;
+                    }
+                }
+            }
+        }
     }
 };
 
@@ -835,6 +995,10 @@ void lower(Context& ctx, TranslationResult* result) {
         if (in_s >= 0 && fprs.last_use[in_s] < e)
             fprs.last_use[in_s] = static_cast<int16_t>(e);
     }
+    // OPT-TI: pin trig-call arguments/results to v16/v17 so the d16/d17
+    // FMOV bridges vanish.  Runs on the FINAL last_use values (the pair
+    // extension above), so pinned live ranges cover sunk stores too.
+    fprs.plan_trig_targets(ctx, pair_with);
     bool rc_cache_valid = rc_entry_valid;  // OPT-BC: carried RC is pre-loaded
     int Wd_nzcv_saved = -1;
     const int final_top_known =
@@ -856,7 +1020,7 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // ── Value nodes ─────────────────────────────────────────────────
         case Op::ReadSt: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             if (top_known >= 0) {
                 // Static physical slot: LDR Dd, [Xbase, #st_off].
@@ -871,7 +1035,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadF64:
         case Op::LoadF32Raw: {
             const int size = (n.op == Op::LoadF64) ? 3 : 2;
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             const int j = pair_with[i];
             if (j >= 0) {
@@ -889,7 +1053,7 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::LoadI16: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             int Wd_val = alloc_free_gpr(*result);
             if (emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/1, Wd_val)) {
@@ -917,7 +1081,7 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::LoadI32: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             int Wd_val = alloc_free_gpr(*result);
             if (!emit_cached_gpr_access(n, /*size_log2=*/2, /*is_load=*/1, Wd_val))
@@ -929,7 +1093,7 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::LoadI64: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             // Load the int64 straight into the D register and convert in
             // place — no value GPR, no cross-domain GPR→FPR move.
@@ -941,19 +1105,19 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::ConstZero: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             emit_movi_d_zero(buf, Dd);
             break;
         }
         case Op::ConstOne: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             emit_fmov_d_one(buf, Dd);
             break;
         }
         case Op::ConstF64: {
-            int Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             uint8_t imm8;
             if (f64_fmov_imm8(n.imm_bits, &imm8))
@@ -972,8 +1136,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FNMul:
         case Op::FDiv: {
             int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             int opc;
             switch (n.op) {
@@ -996,8 +1159,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FNMSub: {
             int Dn = fprs.get(n.inputs[0]), Dm = fprs.get(n.inputs[1]);
             int Da = fprs.get(n.inputs[2]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             const int o1 = (n.op == Op::FNMSub) ? 1 : 0;
             const int o0 = (n.op == Op::FMAdd) ? 0 : 1;
@@ -1012,8 +1174,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FAbs:
         case Op::FSqrt: {
             int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             const int opc = (n.op == Op::FAbs) ? 1 : (n.op == Op::FNeg) ? 2 : 3;
             emit_fp_dp1(buf, /*type=*/(n.flags & kF32) ? 0 : 1, opc, Dd, Dn);
@@ -1021,8 +1182,7 @@ void lower(Context& ctx, TranslationResult* result) {
         }
         case Op::FRndInt: {
             int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
 
             if (g_rosetta_config && g_rosetta_config->fast_round) {
@@ -1056,13 +1216,12 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FYl2xp1Call:
         case Op::FPatanCall: {
             int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             // v16 is excluded from the pool for runs containing these nodes
-            // (compile_run), so Dn/Dd are never d16 and the moves are real.
-            // FScaleCall/FYl2xCall/FYl2xp1Call/FPatanCall also exclude v17
-            // and pass ST(1) there.
+            // (compile_run); plan_trig_targets pins suitable arguments and
+            // results there (and to v17 for the two-arg family / fsincos
+            // projection), so the moves below vanish whenever the plan hits.
             if (n.op == Op::FScaleCall || n.op == Op::FYl2xCall ||
                 n.op == Op::FYl2xp1Call || n.op == Op::FPatanCall) {
                 int Dm = fprs.get(n.inputs[1]);
@@ -1115,10 +1274,10 @@ void lower(Context& ctx, TranslationResult* result) {
         // nothing); v17 is excluded from the pool for runs containing the
         // call, so no pool value can be resident in it.
         case Op::FSinCosProjCos: {
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
-            emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, Dd, /*Dn=*/17);
+            if (Dd != 17)  // pinned by the plan: the value already IS d17
+                emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, Dd, /*Dn=*/17);
             break;
         }
 
@@ -1126,8 +1285,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FCSel: {
             int Dn = fprs.get(n.inputs[0]);   // ST(0) — false arm
             int Dm = fprs.get(n.inputs[1]);   // ST(i) — true arm
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             int cond = static_cast<int>(n.imm_bits & 0xF);
             // FCSEL Dd, Dn_true, Dm_false, cond → Dd = cond ? Dn : Dm
@@ -1138,16 +1296,14 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── f32 ↔ f64 conversion ────────────────────────────────────────
         case Op::CvtF32ToF64: {
             int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             emit_fcvt_s_to_d(buf, Dd, Dn);
             break;
         }
         case Op::CvtF64ToF32: {
             int Dn = fprs.get(n.inputs[0]);
-            int Dd = fprs.try_reuse_input(ctx, i);
-            if (Dd < 0) Dd = alloc_free_fpr(*result);
+            int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             emit_fcvt_d_to_s(buf, Dd, Dn);
             break;
@@ -1170,7 +1326,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 // last use — free_dead_inputs only covers this node's input.
                 if (in_s != n.inputs[0] && fprs.last_use[in_s] == i &&
                     fprs.node_fpr[in_s] >= 0) {
-                    free_fpr(*result, fprs.node_fpr[in_s]);
+                    if (!(fprs.pinned_mask >> fprs.node_fpr[in_s] & 1u))
+                        free_fpr(*result, fprs.node_fpr[in_s]);
                     fprs.node_fpr[in_s] = -1;
                 }
                 break;
@@ -1600,10 +1757,12 @@ void lower(Context& ctx, TranslationResult* result) {
         }
     }
 
-    // 5. Free all remaining FPRs held by node values.
+    // 5. Free all remaining FPRs held by node values (plan-pinned v16/v17
+    //    were never pool-allocated — clear the binding only).
     for (int i = 0; i < ctx.num_nodes; i++) {
         if (fprs.node_fpr[i] >= 0) {
-            free_fpr(*result, fprs.node_fpr[i]);
+            if (!(fprs.pinned_mask >> fprs.node_fpr[i] & 1u))
+                free_fpr(*result, fprs.node_fpr[i]);
             fprs.node_fpr[i] = -1;
         }
     }
