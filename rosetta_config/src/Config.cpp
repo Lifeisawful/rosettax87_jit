@@ -178,6 +178,16 @@ RosettaConfig parse_config_from_env() {
         }
     }
 
+    // push/pop are flag-neutral members of the transparent-int set; same
+    // implication chain as TRANSPARENT_INT itself.
+    if (const char* v = std::getenv("ROSETTA_X87_TRANSPARENT_PUSHPOP")) {
+        cfg.transparent_pushpop = (*v == '1') ? 1 : 0;
+        if (cfg.transparent_pushpop) {
+            cfg.transparent_int = 1;
+            cfg.run_bridge = 1;
+        }
+    }
+
     // Carrying pinned addr-cache/RC GPRs across gaps only means anything when
     // gaps are bridged. Setting it implies RUN_BRIDGE.
     if (const char* v = std::getenv("ROSETTA_X87_BRIDGE_CARRY")) {

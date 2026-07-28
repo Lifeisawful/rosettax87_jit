@@ -802,6 +802,75 @@ static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
     return true;
 }
 
+// ── push/pop transparency (opt-in TRANSPARENT_PUSHPOP) ──────────────────────
+//
+// push r / push imm / pop r consumed mid-run. Flag-neutral, so no liveness
+// gate; the lowering mirrors Rosetta's own translation exactly (STR pre-index
+// / LDR post-index writeback on guest RSP = x4, 64-bit address arithmetic).
+// Declines: RSP as the data register (x86 push esp stores the OLD value and
+// pop esp discards the increment — plus Rt==Rn writeback is CONSTRAINED
+// UNPREDICTABLE), 8/16-bit operand sizes (pushw/popw), memory forms, and
+// immediates carrying a fixup. The slot size for immediate pushes comes from
+// the opcode (push = 64-bit mode, pushd = 32-bit); register forms use the
+// register's own size.
+//
+// Memory model: a push writes [rsp-slot] with no decoder operand to prove
+// disjointness against, so it conservatively clears the whole mem-CSE table.
+// A pop reads memory (no eviction) but redefines its destination register.
+// Both redefine RSP, so both evict RSP-addressed CSE entries and set the
+// written mask (which also bars RSP-based operands from the base-address
+// cache and staleness-checks carried bases).
+static bool build_guest_pushpop(Context& ctx, IRInstr* instr, uint16_t op) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_pushpop))
+        return false;
+    if (instr->num_operands < 1) return false;
+    const IROperand& o = instr->operands[0];
+    const bool is_push = (op == kOpcodeName_push || op == kOpcodeName_pushd);
+
+    if (o.kind == IROperandKind::Register) {
+        if (!o.reg.reg.is_gpr()) return false;
+        const bool is64 = o.reg.size == IROperandSize::S64;
+        if (!is64 && o.reg.size != IROperandSize::S32) return false;
+        const int r = o.reg.reg.index();
+        if (r == 4) return false;  // RSP data register — see above
+        GuestPayload p = {};
+        p.dst = static_cast<uint8_t>(r);
+        p.is64 = is64;
+        auto id = ctx.add_node(is_push ? Op::GuestPushR : Op::GuestPop);
+        if (id < 0) return false;
+        ctx.nodes[id].imm_bits = guest_pack(p);
+        if (is_push) {
+            ctx.mem_cse_count = 0;  // writes [rsp-slot]: drop all cached loads
+            ctx.mem_cse_next = 0;
+        } else {
+            ctx.guest_written_mask |= static_cast<uint16_t>(1u << r);
+            mem_cse_evict_reg(ctx, r);
+        }
+        ctx.guest_written_mask |= static_cast<uint16_t>(1u << 4);
+        mem_cse_evict_reg(ctx, 4);
+        return true;
+    }
+
+    // Immediate-like push (kinds Immediate and BranchOffset share the value
+    // offset — the bridge-demand audit routes `push $imm` as BranchOffset).
+    if (!is_push) return false;  // pop m — decline
+    if (o.kind == IROperandKind::MemRef || o.kind == IROperandKind::AbsMem)
+        return false;  // push m — decline
+    if (o.kind == IROperandKind::Immediate && o.imm.mem_flags != 0)
+        return false;  // fixup: payload is the relocation target
+    GuestPayload p = {};
+    p.is64 = (op == kOpcodeName_push);  // 64-bit mode push: 8-byte slot
+    p.imm = static_cast<uint32_t>(o.imm.value);
+    auto id = ctx.add_node(Op::GuestPushI);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    ctx.mem_cse_count = 0;
+    ctx.mem_cse_next = 0;
+    ctx.guest_written_mask |= static_cast<uint16_t>(1u << 4);
+    mem_cse_evict_reg(ctx, 4);
+    return true;
+}
+
 static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
     if (!(g_rosetta_config && g_rosetta_config->transparent_int)) return false;
     // nop consumes nothing; fwait checks pending FP exceptions, which this
@@ -1492,6 +1561,13 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ok = build_guest_alu(ctx, instr, op);
                 break;
 
+            // ── push/pop (opt-in TRANSPARENT_PUSHPOP) ───────────────────
+            case kOpcodeName_push:
+            case kOpcodeName_pushd:
+            case kOpcodeName_pop:
+            case kOpcodeName_popd:
+                ok = build_guest_pushpop(ctx, instr, op);
+                break;
 
             // ── Bail on everything else ─────────────────────────────────
             default:

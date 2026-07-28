@@ -210,6 +210,7 @@ static void pass_dse(Context& ctx) {
             case Op::GuestLea: case Op::GuestExt:
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
             case Op::GuestAluRI: case Op::GuestRmwR:
+            case Op::GuestPushR: case Op::GuestPushI: case Op::GuestPop:
                 continue;
             default: break;
         }
@@ -237,6 +238,7 @@ static void pass_dse(Context& ctx) {
             case Op::GuestLea: case Op::GuestExt:
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
             case Op::GuestAluRI: case Op::GuestRmwR:
+            case Op::GuestPushR: case Op::GuestPushI: case Op::GuestPop:
                 continue;
             default: break;
         }

@@ -147,6 +147,17 @@ enum class Op : uint8_t {
                     // (payload in imm_bits, GuestAlu selector in aux)
     GuestRmwR,      // {add,sub,and,or,xor} [m32/m64], r — load/ALU/store
                     // (mem_operand + aux: bits[3:0] src reg, bits[6:4] GuestAlu)
+
+    // Stack pushes/pops (opt-in ROSETTA_X87_TRANSPARENT_PUSHPOP). Flag-neutral
+    // — no liveness gate. Lowered exactly like Rosetta's own translation:
+    // STR pre-index / LDR post-index with writeback on the guest RSP (x4),
+    // 64-bit address arithmetic (Rosetta parity; 32-bit esp wrap divergence
+    // is the same accepted class as the base-address cache). RSP itself as
+    // the pushed/popped register declines (old-value / discarded-increment
+    // semantics plus the Rt==Rn writeback hazard).
+    GuestPushR,     // push r32/r64: [rsp -= slot] = r  (payload in imm_bits)
+    GuestPushI,     // push imm: [rsp -= slot] = imm (sign-extended for 64-bit)
+    GuestPop,       // pop r32/r64: r = [rsp], rsp += slot
 };
 
 // ALU sub-op selector for GuestAluRI (whole aux) and GuestRmwR (aux[6:4]).

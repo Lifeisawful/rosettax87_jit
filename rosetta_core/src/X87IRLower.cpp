@@ -327,7 +327,11 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
             case kOpcodeName_movsxd:
             case kOpcodeName_lea:
             case kOpcodeName_push:
+            case kOpcodeName_pushd:
+            case kOpcodeName_pushw:
             case kOpcodeName_pop:
+            case kOpcodeName_popd:
+            case kOpcodeName_popw:
             case kOpcodeName_nop:
             case kOpcodeName_not:   // NOT writes no flags
             case kOpcodeName_xchg:
@@ -688,6 +692,35 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                 emit_bitfield(buf, sf, /*SBFM*/0, sf, static_cast<int8_t>(lsb),
                               static_cast<int8_t>(lsb + width - 1), p.src, p.dst);
             }
+            break;
+        }
+        // push/pop (TRANSPARENT_PUSHPOP): Rosetta-parity writeback forms on
+        // guest RSP (x4). Build declined RSP as the data register, so the
+        // Rt==Rn writeback hazard cannot occur.
+        case Op::GuestPushR: {
+            const int slot = p.is64 ? 8 : 4;
+            emit_ldr_str_imm_ext(buf, p.is64 ? 3 : 2, /*pre=*/1, /*STR*/0,
+                                 static_cast<int16_t>(-slot), /*Rn=RSP*/4, p.dst);
+            break;
+        }
+        case Op::GuestPushI: {
+            const int slot = p.is64 ? 8 : 4;
+            const uint64_t v =
+                p.is64 ? static_cast<uint64_t>(
+                             static_cast<int64_t>(static_cast<int32_t>(p.imm)))
+                       : p.imm;
+            // XZR hint: imm 0 comes back as WZR/XZR — STR ZR stores zero.
+            const int Rt = emit_load_immediate(result, p.is64 ? 1 : 0, v,
+                                               GPR::XZR);
+            emit_ldr_str_imm_ext(buf, p.is64 ? 3 : 2, /*pre=*/1, /*STR*/0,
+                                 static_cast<int16_t>(-slot), /*Rn=RSP*/4, Rt);
+            free_gpr(result, Rt);
+            break;
+        }
+        case Op::GuestPop: {
+            const int slot = p.is64 ? 8 : 4;
+            emit_ldr_str_imm_ext(buf, p.is64 ? 3 : 2, /*post=*/0, /*LDR*/1,
+                                 static_cast<int16_t>(slot), /*Rn=RSP*/4, p.dst);
             break;
         }
         case Op::GuestAluRI: {
@@ -1534,6 +1567,9 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::GuestLea:
         case Op::GuestExt:
         case Op::GuestAluRI:
+        case Op::GuestPushR:
+        case Op::GuestPushI:
+        case Op::GuestPop:
             emit_guest_node(*result, buf, n);
             break;
 
@@ -2138,6 +2174,13 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             transient = 2;
             break;
 
+        // push/pop: single writeback insn on x4 — no scratch; immediate
+        // pushes materialize the value into one scratch.
+        case Op::GuestPushR: case Op::GuestPop:
+            break;
+        case Op::GuestPushI:
+            transient = 1;
+            break;
         }
 
         int node_total = pinned + held + transient;
