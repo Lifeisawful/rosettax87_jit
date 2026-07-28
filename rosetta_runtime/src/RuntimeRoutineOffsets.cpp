@@ -64,6 +64,8 @@ extern char stub_fyl2xp1_val[];
 extern char stub_fpatan_val[];
 extern char stub_fxam_fast[];
 extern char stub_fxtract_fast[];
+extern char stub_fprem_fast[];
+extern char stub_fprem1_fast[];
 extern char stub_fsin_fast[];
 extern char stub_fsin_val[];
 extern char stub_fsincos_fast[];
@@ -328,6 +330,10 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
     // (memory-state stubs, no value-call ABI involved).
     route(kRuntimeRoutine_fxam, stub_fxam_fast, kConfig.disable_fxam_fast);
     route(kRuntimeRoutine_fxtract, stub_fxtract_fast, kConfig.disable_fxtract_fast);
+    // FPREM/FPREM1 in-blob fast paths: default-on, memory-state stubs like
+    // FXAM/FXTRACT (guest spin loops on C2 make the per-call saving multiply).
+    route(kRuntimeRoutine_fprem, stub_fprem_fast, kConfig.disable_fprem_fast);
+    route(kRuntimeRoutine_fprem1, stub_fprem1_fast, kConfig.disable_fprem1_fast);
 
     CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
              "(fcos=%s fsin=%s fsincos=%s fptan=%s f2xm1=%s fscale=%s fyl2x=%s "

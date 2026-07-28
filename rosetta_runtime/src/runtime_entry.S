@@ -2667,6 +2667,199 @@ Lfxtr_common:
     ret
 
 // -----------------------------------------------------------------------------
+// FPREM / FPREM1 in-blob fast paths (offset-table routed, default-on,
+// ROSETTA_X87_DISABLE_{FPREM,FPREM1}_FAST=1 reverts to the classic slots).
+// Memory-state stubs like FXAM/FXTRACT above; same register discipline:
+// x16/x27/x29 free, x25/x26 saved, q16-q19 saved as SINGLE str/ldr q (TSO
+// Q-pair penalty), NZCV never written (tbz/tbnz/cbz/cbnz only, no FCMP).
+//
+// Semantics reproduced = the current C++ handlers (x87_fprem / x87_fprem1),
+// bit for bit on the accepted input class.  Everything else bails to the
+// classic slot BEFORE any state is modified:
+//   - debug/single-step sessions            (flag byte at [x18, #0x1C8])
+//   - empty ST(0)/ST(1) tags                (getSt sets IE|SF + NaN leg)
+//   - x zero/subnormal/Inf/NaN              (special-case legs)
+//   - e1 < 53, i.e. |y| < 2^-970: keeps every representable remainder
+//     normal-or-zero, so no subnormal tag leg and no FZ-mode divergence
+//     (openlibm fmod is integer-exact; an FZ-flushed FNMSUB would not be)
+//   - y Inf/NaN                             (pass-through / #IA legs)
+//   - D = e0-e1 >= 52                       (C2 incomplete leg needs the
+//     bit-by-bit loop; also keeps the quotient < 2^53 so FDIV+FRINTZ+FMSUB
+//     is exact — see below)
+//
+// Exactness argument for the kernel (any rounding mode, a=|x|, b=|y|):
+//   q^ = FRINTZ(FDIV(a,b)) equals the true truncated quotient q or q+1,
+//   never q-1 (a correctly-rounded a/b can only cross an integer upward).
+//   With D <= 51, q+1 <= 2^52 is exactly representable, so
+//   FMSUB(q^, b, a) = a - q^*b rounds an exactly-representable value
+//   (the true remainder, or remainder-b) → exact.  The r<0 fixup adds b
+//   back (Sterbenz-exact) and decrements q.  A -0 FMSUB result (directed
+//   rounding modes) is normalized to +0.  fmod(a,b) is then exact and the
+//   quotient's low 3 bits drive C0/C1/C3 exactly as the C++ path's
+//   fmod(a,8b) reconstruction does.
+//
+// FPREM1 additionally mirrors s_remquo.h's fixup on the magnitude result:
+//   if (r > b/2 || (r == b/2 && (q & 1))) { q++; r -= b; }   [Sterbenz-exact]
+// b/2 is computed by integer exponent decrement (exact: e1 >= 53 > 1), and
+// the CC bits use remquo's *quo convention: sign(x^y) applied to q first,
+// then the low two's-complement bits — matching the C++ handler's (q & 4/1/2)
+// on the signed int, including the negative-quotient encoding.
+//
+// statusWord: C3|C2|C1|C0 cleared, C0←Q2 C1←Q0 C3←Q1, C2 stays 0 (complete
+// reduction is guaranteed by the D gate).  Result slot tag ← kZero/kValid
+// (setSt's classes; kSpecial impossible on this input class).
+//
+// Frame: [sp+0x00..0x3F] q16-q19 singles, [sp+0x40] x25,x26.
+// x27 packs TOP | sign(x)<<8 | sign(x^y)<<9 (fprem1 only).
+// -----------------------------------------------------------------------------
+
+// Shared entry: debug bail, frame, tag checks, exponent gate, |x|/|y| into
+// d16/d17, sign packing, and the truncating fmod kernel:
+//   d18 = q^ (float), x25 = q (integer, fixed up), d19 = r in [0, b).
+.macro PREM_ENTRY name
+.globl _stub_\name\()_fast
+_stub_\name\()_fast:
+    ldrb w29, [x18, #0x1C8]
+    cbnz w29, _stub_\name
+    sub  sp, sp, #0x50
+    stp  x25, x26, [sp, #0x40]
+    ldrh w25, [x18, #0xA2]           // statusWord
+    ubfx w27, w25, #11, #3           // TOP
+    ldrh w26, [x18, #0xA4]           // tagWord
+    lsl  w29, w27, #1
+    lsr  w29, w26, w29
+    and  w29, w29, #3
+    sub  w29, w29, #3
+    cbz  w29, L\name\()_bail         // ST(0) empty
+    add  w16, w27, #1
+    and  w16, w16, #7                // phys idx of ST(1)
+    lsl  w29, w16, #1
+    lsr  w29, w26, w29
+    and  w29, w29, #3
+    sub  w29, w29, #3
+    cbz  w29, L\name\()_bail         // ST(1) empty
+    add  x25, x18, #0xA8
+    ldr  x26, [x25, w16, uxtw #3]    // y bits
+    ldr  x16, [x25, w27, uxtw #3]    // x bits
+    // Exponent gate (biased fields; all-integer, no FP touched before bail)
+    ubfx x29, x16, #52, #11          // e0
+    sub  w29, w29, #1
+    tbnz w29, #31, L\name\()_bail    // e0 == 0: x zero/subnormal
+    ubfx x25, x26, #52, #11          // e1
+    sub  w25, w25, #53
+    tbnz w25, #31, L\name\()_bail    // e1 < 53: y zero/subnormal/tiny
+    sub  w29, w29, w25               // (e0-1) - (e1-53) = D + 52
+    sub  w29, w29, #104
+    tbz  w29, #31, L\name\()_bail    // D >= 52 (also catches Inf/NaN x vs small y)
+    mov  w29, #0x7CA
+    sub  w25, w25, w29
+    cbz  w25, L\name\()_bail         // e1 == 0x7FF: y Inf/NaN
+    ubfx x29, x16, #52, #11
+    mov  w25, #0x7FF
+    sub  w25, w29, w25
+    cbz  w25, L\name\()_bail         // e0 == 0x7FF: x Inf/NaN
+    // Eligible — FP setup (q16-q19 saved as singles, TSO rule)
+    str  q16, [sp]
+    str  q17, [sp, #0x10]
+    str  q18, [sp, #0x20]
+    str  q19, [sp, #0x30]
+    and  x29, x16, #0x7FFFFFFFFFFFFFFF
+    fmov d16, x29                    // a = |x|
+    and  x29, x26, #0x7FFFFFFFFFFFFFFF
+    fmov d17, x29                    // b = |y|
+    eor  x25, x16, x26
+    lsr  x25, x25, #63
+    orr  x27, x27, x25, lsl #9       // pack sign(x^y) at bit 9 (fprem1 CC)
+    lsr  x29, x16, #63
+    orr  x27, x27, x29, lsl #8       // pack sign(x) at bit 8
+    // Truncating fmod kernel
+    fdiv d18, d16, d17
+    frintz d18, d18                  // q^ = trunc(a/b), true q or q+1
+    fmsub d19, d18, d17, d16         // r = a - q^*b (exact)
+    fcvtzu x25, d18                  // q^ as integer (< 2^53)
+    fmov x29, d19
+    tbz  x29, #63, L\name\()_rok
+    lsl  x26, x29, #1
+    cbz  x26, L\name\()_negz         // r == -0 (directed rounding) → +0
+    fadd d19, d19, d17               // overshoot: r += b (Sterbenz-exact)
+    sub  x25, x25, #1                //            q -= 1
+    b    L\name\()_rok
+L\name\()_negz:
+    fmov d19, xzr
+L\name\()_rok:
+.endm
+
+// Shared tail: CC bits from x25's low 3 bits (C0←Q2, C1←Q0, C3←Q1, C2=0),
+// sign(x) applied to the magnitude result, store, kZero/kValid tag, return.
+.macro PREM_TAIL name
+    ldrh w26, [x18, #0xA2]
+    mov  w29, #0xB8FF
+    and  w26, w26, w29               // clear C3|C2|C1|C0
+    ubfx x29, x25, #2, #1
+    orr  w26, w26, w29, lsl #8       // C0 ← Q2
+    ubfx x29, x25, #0, #1
+    orr  w26, w26, w29, lsl #9       // C1 ← Q0
+    ubfx x29, x25, #1, #1
+    orr  w26, w26, w29, lsl #14      // C3 ← Q1
+    strh w26, [x18, #0xA2]
+    fmov x29, d19
+    ubfx x16, x27, #8, #1
+    eor  x29, x29, x16, lsl #63      // apply sign(x) (remquo: hx ^ sx)
+    add  x26, x18, #0xA8
+    and  w16, w27, #7
+    str  x29, [x26, w16, uxtw #3]    // st[TOP] = result
+    // tag ← result == ±0 ? kZero : kValid (subnormal impossible: e1 >= 53)
+    lsl  x25, x29, #1
+    ldrh w26, [x18, #0xA4]
+    lsl  w16, w16, #1
+    mov  w29, #3
+    lslv w29, w29, w16
+    bic  w26, w26, w29
+    cbnz x25, L\name\()_tagdone
+    mov  w29, #1
+    lslv w29, w29, w16
+    orr  w26, w26, w29
+L\name\()_tagdone:
+    strh w26, [x18, #0xA4]
+    ldr  q16, [sp]
+    ldr  q17, [sp, #0x10]
+    ldr  q18, [sp, #0x20]
+    ldr  q19, [sp, #0x30]
+    ldp  x25, x26, [sp, #0x40]
+    add  sp, sp, #0x50
+    ret
+// Bail: q16-q19 are saved only after the last bail site and never modified
+// before one, so only the GPR spill and the frame need undoing.
+L\name\()_bail:
+    ldp  x25, x26, [sp, #0x40]
+    add  sp, sp, #0x50
+    b    _stub_\name
+.endm
+
+PREM_ENTRY fprem
+    PREM_TAIL fprem
+
+PREM_ENTRY fprem1
+    // remquo fixup: round the quotient to nearest (ties to even q)
+    fmov x29, d19                    // r bits (non-negative)
+    fmov x16, d17
+    mov  x26, #0x0010000000000000
+    sub  x16, x16, x26               // b/2 bits (exact: e1 >= 53)
+    sub  x16, x29, x16               // r - b/2, IEEE order == integer order
+    tbnz x16, #63, Lfprem1_fixdone   // r < b/2
+    cbnz x16, Lfprem1_bump           // r > b/2
+    tbz  x25, #0, Lfprem1_fixdone    // r == b/2 tie, q even → keep
+Lfprem1_bump:
+    fsub d19, d19, d17               // r -= b (Sterbenz-exact)
+    add  x25, x25, #1
+Lfprem1_fixdone:
+    // *quo convention: signed quotient's two's-complement low bits
+    tbz  x27, #9, Lfprem1_qpos
+    neg  x25, x25
+Lfprem1_qpos:
+    PREM_TAIL fprem1
+
+// -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
 // -----------------------------------------------------------------------------
 TRIG_ENTRY fsin

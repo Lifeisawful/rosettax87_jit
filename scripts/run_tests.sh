@@ -50,6 +50,7 @@ ALL_TESTS=(
     test_x87_full
     test_fstpt
     test_fxam
+    test_fprem
     test_peephole7
     test_fcom_nzcv
     test_arithp_fstp
@@ -298,6 +299,7 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
               ROSETTA_X87_DISABLE_FCOS_FAST=1 ROSETTA_X87_DISABLE_FSIN_FAST=1 \
               ROSETTA_X87_DISABLE_FSINCOS_FAST=1 ROSETTA_X87_DISABLE_FPTAN_FAST=1 \
               ROSETTA_X87_DISABLE_FXAM_FAST=1 ROSETTA_X87_DISABLE_FXTRACT_FAST=1 \
+              ROSETTA_X87_DISABLE_FPREM_FAST=1 ROSETTA_X87_DISABLE_FPREM1_FAST=1 \
               "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
