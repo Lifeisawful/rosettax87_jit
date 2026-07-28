@@ -9,12 +9,19 @@
 #   3. runtime_loader with ROSETTA_X87_DISABLE_IR=1 (direct translator only)
 #   4. runtime_loader with ROSETTA_X87_DISABLE_IR=1 + ROSETTA_X87_DISABLE_ALL_FUSIONS=1
 #   5. runtime_loader with ROSETTA_X87_RUN_BRIDGE=1 + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
-#   6. runtime_loader with ROSETTA_X87_TRANSPARENT_INT=1 + ROSETTA_X87_BRIDGE_CARRY=1
-#      + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 + ROSETTA_X87_CONST_PROMOTE=1
-#      + ROSETTA_X87_F32_NARROW=1  (the full opt-in stack)
-#   7. runtime_loader with ROSETTA_X87_RUNTIME_KEEPALIVE=1 + the full opt-in stack
+#   6. runtime_loader with ROSETTA_X87_TRANSPARENT_INT=1 + ROSETTA_X87_TRANSPARENT_FLAGS=1
+#      + ROSETTA_X87_BRIDGE_CARRY=1 + ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
+#      + ROSETTA_X87_CONST_PROMOTE=1 + ROSETTA_X87_F32_NARROW=1  (the bit-exact opt-in stack)
+#   7. runtime_loader with ROSETTA_X87_RUNTIME_KEEPALIVE=1 + the bit-exact opt-in stack
 #   8. runtime_loader with ROSETTA_X87_DISABLE_ALL_OPS=1 + ROSETTA_X87_DISABLE_ALL_FUSIONS=1
 #      + ROSETTA_X87_DISABLE_IR=1  (runtime routines only — pure X87.cpp coverage)
+#   9. runtime_loader with ROSETTA_X87_TRIG_IR=1 + KEEPALIVE + EXTENDED_FPR_SCRATCH
+#      (focused OPT-TI value-call coverage, minimal interference)
+#  10. runtime_loader with the FULL GAME STACK — every perf opt-in flag the game
+#      launch command uses, including the accepted-fidelity ones
+#      (F32_ARITH: f32 chain intermediates; FAST_RECIP_DIV: ≤1 ulp divides).
+#      FAST_ROUND stays excluded everywhere: it is nearest-only by design and
+#      architecturally breaks the FLDCW rounding-mode tests.
 #
 # Usage:
 #   bash scripts/run_tests.sh                # build + test (all phases)
@@ -324,6 +331,36 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             continue
         fi
         OUT=$(ROSETTA_X87_TRIG_IR=1 ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        check_output "$t" "$OUT"
+    done
+fi
+
+# ── Phase 10: runtime_loader, full game stack ────────────────────────────────
+# Every performance opt-in the game launch command enables, together — the
+# exact production combination (TRIG_IR × transparent-int × carry × f32 was
+# previously never covered in one phase). Includes the accepted-fidelity
+# flags: F32_ARITH (f32 chain intermediates, not bit-exact vs f64) and
+# FAST_RECIP_DIV (≤1 ulp on constant divides). test_ir_gpr_pressure is
+# skipped here: its minimap check pins the bit-exact f64-intermediate result
+# by design, and F32_ARITH's documented 1-ulp trade legitimately diverges
+# (verified: the only deviation in the whole suite under this stack).
+if [[ $NATIVE_ONLY -eq 0 ]]; then
+    echo ""
+    echo -e "${BOLD}=== Phase 10: runtime_loader (full game stack, incl. F32_ARITH + FAST_RECIP_DIV) ===${NC}"
+
+    for t in "${TESTS[@]}"; do
+        if [[ "$t" == "test_ir_gpr_pressure" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (bit-exact expectation vs F32_ARITH's documented 1-ulp trade)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        BINARY="$BIN/$t"
+        if [[ ! -x "$BINARY" ]]; then
+            echo -e "${YELLOW}SKIP${NC}  $t  (binary not found)"
+            ERRORS=$((ERRORS + 1))
+            continue
+        fi
+        OUT=$(ROSETTA_X87_TRIG_IR=1 ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_TRANSPARENT_FLAGS=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 ROSETTA_X87_CONST_PROMOTE=1 ROSETTA_X87_F32_NARROW=1 ROSETTA_X87_F32_ARITH=1 ROSETTA_X87_FAST_RECIP_DIV=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi

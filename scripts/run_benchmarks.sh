@@ -5,11 +5,12 @@
 # Configurations:
 #   1. Native Rosetta    — binary run directly (baseline)
 #   2. Loader disabled   — runtime_loader + ROSETTA_X87_DISABLE_ALL_OPS=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1
-#   3. Loader optimized  — runtime_loader with default JIT optimizations plus the
-#                          opt-in perf flags: EXTENDED_FPR_SCRATCH, RUN_BRIDGE,
-#                          TRANSPARENT_INT, BRIDGE_CARRY, F32_ARITH (see
-#                          OPTIMIZED_FLAGS below). Lossy/unsafe flags (FAST_ROUND,
-#                          FAST_RECIP_DIV) are intentionally excluded.
+#   3. Loader optimized  — runtime_loader with default JIT optimizations plus
+#                          every opt-in perf flag from the game launch stack
+#                          (see OPTIMIZED_FLAGS below), including the
+#                          accepted-fidelity F32_ARITH and FAST_RECIP_DIV.
+#                          FAST_ROUND (nearest-only, unsafe under FLDCW) is
+#                          excluded here and measured in its own section.
 #
 # Usage:
 #   bash scripts/run_benchmarks.sh              # build + run
@@ -60,19 +61,24 @@ ALL_BENCHMARKS=(
     bench_const_promote
 )
 
-# Opt-in performance flags enabled for the "Loader optimized" (JIT) column.
-# Correctness-safe set plus F32_ARITH (game profile is f32-dominant). Lossy/unsafe
-# flags (FAST_ROUND, FAST_RECIP_DIV) are intentionally excluded;
-# FAST_ROUND has its own comparison section at the bottom of this script.
+# Opt-in performance flags enabled for the "Loader optimized" (JIT) column —
+# kept in lockstep with the game launch stack (and run_tests.sh phase 10):
+# the bit-exact set plus the accepted-fidelity F32_ARITH (f32 chain
+# intermediates; game profile is f32-dominant) and FAST_RECIP_DIV (≤1 ulp on
+# constant divides). FAST_ROUND (nearest-only, breaks FLDCW rounding modes)
+# is excluded; it has its own comparison section at the bottom of this script.
 OPTIMIZED_FLAGS=(
     ROSETTA_X87_EXTENDED_FPR_SCRATCH=1
     ROSETTA_X87_RUN_BRIDGE=1
+    ROSETTA_X87_TRANSPARENT_FLAGS=1
     ROSETTA_X87_TRANSPARENT_INT=1
     ROSETTA_X87_BRIDGE_CARRY=1
     ROSETTA_X87_F32_ARITH=1
     ROSETTA_X87_RUNTIME_KEEPALIVE=1
     ROSETTA_X87_CONST_PROMOTE=1
     ROSETTA_X87_F32_NARROW=1
+    ROSETTA_X87_TRIG_IR=1
+    ROSETTA_X87_FAST_RECIP_DIV=1
 )
 
 RED='\033[0;31m'
