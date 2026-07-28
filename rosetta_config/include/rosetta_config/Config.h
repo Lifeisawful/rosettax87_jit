@@ -108,6 +108,7 @@ struct RosettaConfig {
     uint8_t  log_run_breaks;         // ROSETTA_X87_LOG_RUN_BREAKS=1 — log length + breaking opcode + gap-to-next-x87 for every x87 run
     uint8_t  run_bridge;             // ROSETTA_X87_RUN_BRIDGE=1 — keep an active run's pinned cache GPRs across run-transparent integer instrs (mov/lea/…; opt-in)
     uint8_t  transparent_int;        // ROSETTA_X87_TRANSPARENT_INT=1 — inline simple reg-form mov/lea/movzx/movsx into IR runs (requires RUN_BRIDGE; opt-in)
+    uint8_t  transparent_flags;      // ROSETTA_X87_TRANSPARENT_FLAGS=1 — also inline flag-writing zero idioms (xor r,r) when Rosetta's flag-liveness analysis proves the flags dead (implies TRANSPARENT_INT; opt-in)
     uint8_t  bridge_carry;           // ROSETTA_X87_BRIDGE_CARRY=1 — carry base-address-cache + RC GPRs across bridged gaps (implies RUN_BRIDGE; opt-in)
     uint8_t  runtime_keepalive;      // ROSETTA_X87_RUNTIME_KEEPALIVE=1 — keep the pinned cache alive across runtime-routine transcendentals (fsin/fcos/…; opt-in)
     uint8_t  disable_fcos_fast;      // ROSETTA_X87_DISABLE_FCOS_FAST=1 — route FCOS through the classic prologue/vtable stub instead of the in-blob fast path
@@ -129,11 +130,12 @@ struct RosettaConfig {
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
 // Grown 0x20 → 0x28 when the 17th byte-flag (bridge_carry) crossed the old
-// size, and 0x28 → 0x30 when the 25th (disable_fyl2x_val) crossed again.
+// size, 0x28 → 0x30 when the 25th (disable_fyl2x_val) crossed again, and
+// 0x30 → 0x38 when the 33rd (transparent_flags) crossed again.
 // The loader writes this struct into the runtime's __DATA,config by
 // sizeof — both sides compile from this header, so they stay in sync as long
 // as loader and runtime dylib come from the same build.
-static_assert(sizeof(RosettaConfig) == 0x30);
+static_assert(sizeof(RosettaConfig) == 0x38);
 
 inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
     return (cfg.disabled_ops_mask >> static_cast<int>(id)) & 1u;

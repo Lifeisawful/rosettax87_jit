@@ -127,7 +127,8 @@ enum class Op : uint8_t {
     // packed into imm_bits (see GuestPayload) — inputs[] stay -1 so the
     // optimizer's use-count / input-rewrite loops never touch guest fields.
     GuestMovRR,     // mov r32/r64, r
-    GuestMovRI,     // mov r32, imm32 (64-bit imm dst declined at build)
+    GuestMovRI,     // mov r32, imm32 (64-bit imm dst declined at build); also
+                    // xor r,r zero idiom under TRANSPARENT_FLAGS (imm 0)
     GuestLea,       // lea r32/r64, [base + index<<shift + disp32]
     GuestExt,       // movzx/movsx/movsxd r32/r64, r8/r16/r32 (register source)
 

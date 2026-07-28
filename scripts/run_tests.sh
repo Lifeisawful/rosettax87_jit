@@ -74,6 +74,7 @@ ALL_TESTS=(
     test_ir_deferred
     test_mem_cse
     test_fstsw_topdelta
+    test_transparent_flags
     test_ir_algebra
     test_addr_fold
     test_const_promote
@@ -254,7 +255,7 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             ERRORS=$((ERRORS + 1))
             continue
         fi
-        OUT=$(ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 ROSETTA_X87_CONST_PROMOTE=1 ROSETTA_X87_F32_NARROW=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        OUT=$(ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_TRANSPARENT_FLAGS=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 ROSETTA_X87_CONST_PROMOTE=1 ROSETTA_X87_F32_NARROW=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi
@@ -274,7 +275,7 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             ERRORS=$((ERRORS + 1))
             continue
         fi
-        OUT=$(ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 ROSETTA_X87_CONST_PROMOTE=1 ROSETTA_X87_F32_NARROW=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        OUT=$(ROSETTA_X87_RUNTIME_KEEPALIVE=1 ROSETTA_X87_TRANSPARENT_INT=1 ROSETTA_X87_TRANSPARENT_FLAGS=1 ROSETTA_X87_BRIDGE_CARRY=1 ROSETTA_X87_EXTENDED_FPR_SCRATCH=1 ROSETTA_X87_CONST_PROMOTE=1 ROSETTA_X87_F32_NARROW=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi

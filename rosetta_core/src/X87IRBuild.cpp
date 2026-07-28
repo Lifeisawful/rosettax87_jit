@@ -637,6 +637,10 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
 //     is the fixup target, not the literal
 // A declined instruction ends IR consumption there; the run bridge still
 // carries the pinned GPRs across it and the IR re-enters mid-run after.
+//
+// ROSETTA_X87_TRANSPARENT_FLAGS=1 (implies TRANSPARENT_INT) extends the set
+// with the xor r,r zero idiom, gated on Rosetta's flag-liveness analysis
+// proving the written flags dead (see the xor block in build_guest_int).
 
 // Memory operand admissible for a Guest load/store: no segment override
 // (compute_operand_address's GS/TLS fallback fixed-allocates pool slot 7 and
@@ -676,6 +680,38 @@ static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
     if (instr->num_operands < 2) return false;
     const IROperand& dst = instr->operands[0];
     const IROperand& src = instr->operands[1];
+
+    // ── xor r,r zero idiom (opt-in TRANSPARENT_FLAGS) ──────────────────
+    // xor defines all six arithmetic flags, so it is only transparent when
+    // Rosetta's backward flag-liveness analysis proves its flag results
+    // dead: flag_liveness holds the flags live OUT of this instruction
+    // (block-fixpoint, conservative all-live at unknown targets), so 0
+    // means nothing the xor writes is ever read.  Lowered as the existing
+    // GuestMovRI 0 — a plain MOVZ Wd, #0: flag-free on the host (the
+    // Guest-node NZCV contract is unchanged), and the W-write zero-extends,
+    // covering the r64 form.  Non-self forms and 8/16-bit destinations
+    // (partial-register merge) decline as usual.
+    if (op == kOpcodeName_xor) {
+        if (!g_rosetta_config->transparent_flags) return false;
+        if (instr->flag_liveness != 0) return false;
+        if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr() ||
+            src.kind != IROperandKind::Register || !src.reg.reg.is_gpr())
+            return false;
+        if (dst.reg.size != IROperandSize::S32 &&
+            dst.reg.size != IROperandSize::S64)
+            return false;
+        if (src.reg.size != dst.reg.size) return false;
+        if (src.reg.reg.value != dst.reg.reg.value) return false;
+        GuestPayload p = {};
+        p.dst = dst.reg.reg.index();
+        p.imm = 0;
+        auto id = ctx.add_node(Op::GuestMovRI);
+        if (id < 0) return false;
+        ctx.nodes[id].imm_bits = guest_pack(p);
+        ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+        mem_cse_evict_reg(ctx, p.dst);
+        return true;
+    }
 
     // ── Memory-destination forms: mov m←r / mov m←i ────────────────────
     if (op == kOpcodeName_mov && (dst.kind == IROperandKind::MemRef ||
@@ -1341,6 +1377,7 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_lea:
             case kOpcodeName_nop:
             case kOpcodeName_wait:
+            case kOpcodeName_xor:
                 ok = build_guest_int(ctx, instr, op);
                 break;
 

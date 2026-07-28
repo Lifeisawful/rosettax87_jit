@@ -167,6 +167,17 @@ RosettaConfig parse_config_from_env() {
         if (cfg.transparent_int) cfg.run_bridge = 1;
     }
 
+    // Flag-writing zero idioms are an extension of the transparent-int set;
+    // consuming them presupposes everything TRANSPARENT_INT does. Setting it
+    // implies TRANSPARENT_INT (and thereby RUN_BRIDGE).
+    if (const char* v = std::getenv("ROSETTA_X87_TRANSPARENT_FLAGS")) {
+        cfg.transparent_flags = (*v == '1') ? 1 : 0;
+        if (cfg.transparent_flags) {
+            cfg.transparent_int = 1;
+            cfg.run_bridge = 1;
+        }
+    }
+
     // Carrying pinned addr-cache/RC GPRs across gaps only means anything when
     // gaps are bridged. Setting it implies RUN_BRIDGE.
     if (const char* v = std::getenv("ROSETTA_X87_BRIDGE_CARRY")) {
