@@ -854,6 +854,32 @@ auto read_operand_to_gpr(TranslationResult& result, bool is_64bit, IROperand* op
     __builtin_unreachable();
 }
 
+// dst = src + disp with dst == src allowed. Uses ADD/SUB imm12 (plain or
+// LSL #12) when the displacement fits; otherwise materializes it into one
+// transient scratch GPR (callers''' pressure models charge 1 for that case).
+auto emit_add_disp(TranslationResult& result, int is_64bit, int dst, int src,
+                   int64_t disp) -> void {
+    AssemblerBuffer& buf = result.insn_buf;
+    if (disp == 0) {
+        if (dst != src) emit_mov_reg(buf, is_64bit, dst, src);
+        return;
+    }
+    const int is_sub = disp < 0;
+    const int64_t mag = is_sub ? -disp : disp;
+    if (mag < 4096) {
+        emit_add_imm(buf, is_64bit, is_sub, 0, /*shift=*/0, mag, src, dst);
+        return;
+    }
+    if ((mag & 0xFFF) == 0 && (mag >> 12) < 4096) {
+        emit_add_imm(buf, is_64bit, is_sub, 0, /*shift=*/1, mag >> 12, src, dst);
+        return;
+    }
+    const int tmp = alloc_free_gpr(result);
+    emit_load_immediate_no_xzr(result, is_64bit, static_cast<uint64_t>(disp), tmp);
+    emit_add_sub_shifted_reg(buf, is_64bit, /*is_sub=*/0, 0, /*LSL*/0, tmp, 0, src, dst);
+    free_gpr(result, tmp);
+}
+
 void emit_bl_runtime_routine(TranslationResult& result, int routine) {
     // BL #0 placeholder, patched to `routine` by a Branch26 fixup.
     result._fixups.push_back(Fixup{FixupKind::Branch26,

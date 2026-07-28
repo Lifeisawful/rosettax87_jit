@@ -663,30 +663,6 @@ static int plan_addr_cache(Context& ctx) {
 // the scratch pool (x22–x29), so pinned cache GPRs and held values (packed
 // CC, hoisted NZCV) are never clobbered.
 
-// dst = src + disp with dst==src allowed. Allocates one transient GPR only
-// when disp fits neither ADD/SUB imm12 form (mirrored in peak_live_gprs).
-static void emit_guest_add_disp(TranslationResult& result, AssemblerBuffer& buf,
-                                int is64, int dst, int src, int64_t disp) {
-    if (disp == 0) {
-        if (dst != src) emit_mov_reg(buf, is64, dst, src);
-        return;
-    }
-    const int is_sub = disp < 0;
-    const int64_t mag = is_sub ? -disp : disp;
-    if (mag < 4096) {
-        emit_add_imm(buf, is64, is_sub, 0, /*shift=*/0, mag, src, dst);
-        return;
-    }
-    if ((mag & 0xFFF) == 0 && (mag >> 12) < 4096) {
-        emit_add_imm(buf, is64, is_sub, 0, /*shift=*/1, mag >> 12, src, dst);
-        return;
-    }
-    const int tmp = alloc_free_gpr(result);
-    emit_load_immediate_no_xzr(result, is64, static_cast<uint64_t>(disp), tmp);
-    emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/0, 0, /*LSL*/0, tmp, 0, src, dst);
-    free_gpr(result, tmp);
-}
-
 static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                             const Node& n) {
     const GuestPayload p = guest_unpack(n.imm_bits);
@@ -718,16 +694,16 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             // Flag-free in-place ALU on a guest GPR (TRANSPARENT_FLAGS).
             // Build pre-validated: logical imms are bitmask-encodable, shift
             // counts are masked and nonzero, add/sub imms fit via
-            // emit_guest_add_disp (temp GPR on the hard path, as for lea).
+            // emit_add_disp (temp GPR on the hard path, as for lea).
             const int is64 = p.is64 ? 1 : 0;
             const int bits = is64 ? 64 : 32;
             switch (static_cast<GuestAlu>(n.aux)) {
                 case GuestAlu::Add:
-                    emit_guest_add_disp(result, buf, is64, p.dst, p.dst,
+                    emit_add_disp(result, is64, p.dst, p.dst,
                                         static_cast<int32_t>(p.imm));
                     break;
                 case GuestAlu::Sub:
-                    emit_guest_add_disp(result, buf, is64, p.dst, p.dst,
+                    emit_add_disp(result, is64, p.dst, p.dst,
                                         -static_cast<int64_t>(
                                             static_cast<int32_t>(p.imm)));
                     break;
@@ -782,14 +758,14 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             if (p.has_base && p.has_index) {
                 emit_add_sub_shifted_reg(buf, is64, 0, 0, /*LSL*/0, p.idx,
                                          static_cast<int8_t>(p.cls), p.src, p.dst);
-                emit_guest_add_disp(result, buf, is64, p.dst, p.dst, disp);
+                emit_add_disp(result, is64, p.dst, p.dst, disp);
             } else if (p.has_base) {
-                emit_guest_add_disp(result, buf, is64, p.dst, p.src, disp);
+                emit_add_disp(result, is64, p.dst, p.src, disp);
             } else if (p.has_index) {
                 // ADD dst, ZR, idx, LSL #s  (reg 31 = ZR in shifted-reg forms)
                 emit_add_sub_shifted_reg(buf, is64, 0, 0, /*LSL*/0, p.idx,
                                          static_cast<int8_t>(p.cls), GPR::XZR, p.dst);
-                emit_guest_add_disp(result, buf, is64, p.dst, p.dst, disp);
+                emit_add_disp(result, is64, p.dst, p.dst, disp);
             } else {
                 emit_load_immediate_no_xzr(result, is64, static_cast<uint64_t>(disp),
                                            p.dst);
@@ -809,33 +785,6 @@ static bool carried_key_match(const X87Cache::CarriedBase& c, const IROperand* o
            c.base_reg == op->mem.base_reg &&
            c.index_reg == op->mem.index_reg &&
            c.shift_amount == op->mem.shift_amount;
-}
-
-// ── RC preamble: load control_word and extract rounding-control bits ────────
-
-static void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out) {
-    // LDRH Wd_out, [Xbase, #0]  — control_word is at offset 0x00
-    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, /*imm12=*/0, Xbase, Wd_out);
-    // UBFX Wd_out, Wd_out, #10, #2  — extract RC field (bits 11:10)
-    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/2, /*N*/0, /*immr*/10, /*imms*/11, Wd_out, Wd_out);
-}
-
-// ── Rounding-mode dispatch for FISTP/FIST ──────────────────────────────────
-//
-// Reads control_word, extracts RC, then emits the shared binary TBNZ dispatch
-// tree (or a single FCVTNS under fast_round).  Wd_rc is left holding the
-// extracted RC value (the tree is non-destructive).
-
-static void emit_rcmode_dispatch(AssemblerBuffer& buf, int Wd_int, int Dd_val,
-                                  int is_64bit_int, int Xbase, int Wd_rc) {
-    if (g_rosetta_config && g_rosetta_config->fast_round) {
-        // Fast path: assume RC=0 (round-to-nearest).
-        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1, /*rmode=FCVTNS*/ 0,
-                            Wd_int, Dd_val);
-    } else {
-        emit_rc_preamble(buf, Xbase, Wd_rc);
-        emit_x87_rc_dispatch_fcvt(buf, Wd_rc, Wd_int, Dd_val, is_64bit_int);
-    }
 }
 
 // ── Main lowering ───────────────────────────────────────────────────────────
@@ -2188,6 +2137,7 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         case Op::GuestStoreI: case Op::GuestRmwR:
             transient = 2;
             break;
+
         }
 
         int node_total = pinned + held + transient;

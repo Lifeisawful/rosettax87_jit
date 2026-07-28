@@ -327,6 +327,13 @@ int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
 // _fcvt:  f64 → signed int    (FCVTNS/FCVTMS/FCVTPS/FCVTZS  Wd_int, Dd_val)
 // _frint: f64 → integral f64  (FRINTN/FRINTM/FRINTP/FRINTZ  Dd, Dn)
 // =============================================================================
+// Load control_word and extract the RC field (bits 11:10) into Wd_out.
+void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out);
+
+// RC preamble + FCVT dispatch tree (single FCVTNS under config fast_round).
+void emit_rcmode_dispatch(AssemblerBuffer& buf, int Wd_int, int Dd_val,
+                          int is_64bit_int, int Xbase, int Wd_rc);
+
 void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
                                 int Dd_val, int is_64bit_int);
 void emit_x87_rc_dispatch_frint(AssemblerBuffer& buf, int Wd_rc, int Dd, int Dn);

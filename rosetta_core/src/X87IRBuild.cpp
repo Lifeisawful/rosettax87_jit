@@ -786,7 +786,7 @@ static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
             break;
         }
         default:
-            break;  // Add/Sub: emit_guest_add_disp covers any imm32
+            break;  // Add/Sub: emit_add_disp covers any imm32
     }
 
     GuestPayload p = {};
@@ -1491,6 +1491,7 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_sar:
                 ok = build_guest_alu(ctx, instr, op);
                 break;
+
 
             // ── Bail on everything else ─────────────────────────────────
             default:

@@ -260,13 +260,17 @@ auto emit_ldr_str_reg(AssemblerBuffer& buf, int size, int is_fp, int opc, int Rm
 
 auto emit_ldr_str_imm_ext(AssemblerBuffer& buf, int data_size, int write_back, int extend_mode,
                           int16_t offset, int Rn, int Rt) -> void {
-    // size | 111 | V=0 | 00 | opc | 0 | imm9 | wb | 0 | Rn | Rt
+    // size | 111 | V=0 | 00 | opc | 0 | imm9 | P 1 | Rn | Rt
+    // bits [11:10]: 01 = post-index, 11 = pre-index (bit 10 is fixed 1 for the
+    // writeback forms — 00 would be LDUR/STUR, 10 the unprivileged LDTR/STTR).
+    // These are the encodings Rosetta's own emit_str_pre_idx /
+    // emit_ldr_post_idx produce (push/pop translations).
     int effective_opc = (data_size == 4) ? (extend_mode | 2) : extend_mode;
-    uint32_t insn = 0x38000000;
+    uint32_t insn = 0x38000400;
     insn |= (uint32_t)(data_size & 0x3) << 30;
     insn |= (uint32_t)(effective_opc & 0x3) << 22;
     insn |= (uint32_t)((offset & 0x1FF)) << 12;
-    insn |= (uint32_t)(write_back & 0x1) << 11;  // 1=pre, 0=post at [11:10]=01/11
+    insn |= (uint32_t)(write_back & 0x1) << 11;  // P bit: 1=pre, 0=post
     insn |= (uint32_t)(Rn & 0x1F) << 5;
     insn |= (uint32_t)(Rt & 0x1F);
     buf.emit(insn);

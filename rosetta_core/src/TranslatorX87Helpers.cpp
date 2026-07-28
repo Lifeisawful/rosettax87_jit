@@ -1,6 +1,8 @@
 #include "rosetta_core/TranslatorX87Helpers.hpp"
 
+#include "rosetta_config/Config.h"
 #include "rosetta_core/AssemblerHelpers.hpp"
+#include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/TranslationResult.h"
 #include "rosetta_core/TranslatorHelpers.hpp"
 
@@ -891,6 +893,30 @@ void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
 //   [7] FCVTZS                      ; RC=3 truncate
 //   [8] done
 // =============================================================================
+
+// RC preamble: load control_word and extract the rounding-control field.
+void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out) {
+    // LDRH Wd_out, [Xbase, #0]  — control_word is at offset 0x00
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, /*imm12=*/0, Xbase, Wd_out);
+    // UBFX Wd_out, Wd_out, #10, #2  — extract RC field (bits 11:10)
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/2, /*N*/0, /*immr*/10, /*imms*/11, Wd_out, Wd_out);
+}
+
+// Rounding-mode dispatch for FISTP/FIST: RC preamble + the shared binary
+// TBNZ dispatch tree — or a single FCVTNS under the (lossy, opt-in)
+// fast_round config.  Wd_rc is left holding the extracted RC value (the
+// tree is non-destructive).
+void emit_rcmode_dispatch(AssemblerBuffer& buf, int Wd_int, int Dd_val,
+                          int is_64bit_int, int Xbase, int Wd_rc) {
+    if (g_rosetta_config && g_rosetta_config->fast_round) {
+        // Fast path: assume RC=0 (round-to-nearest).
+        emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/1, /*rmode=FCVTNS*/0,
+                            Wd_int, Dd_val);
+    } else {
+        emit_rc_preamble(buf, Xbase, Wd_rc);
+        emit_x87_rc_dispatch_fcvt(buf, Wd_rc, Wd_int, Dd_val, is_64bit_int);
+    }
+}
 
 void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
                                 int Dd_val, int is_64bit_int) {

@@ -168,6 +168,11 @@ auto emit_gpr_mem_access(TranslationResult& result, int is_64bit, IROperand* op,
 // guest base register, which must never be used as a load destination.
 auto emit_load_int_operand(TranslationResult& result, IROperand* op, bool is_m16) -> int;
 
+// dst = src + disp (dst == src allowed): ADD/SUB imm12 or imm12<<12 when the
+// displacement fits, else one transient scratch GPR for the immediate.
+auto emit_add_disp(TranslationResult& result, int is_64bit, int dst, int src,
+                   int64_t disp) -> void;
+
 auto translate_gpr(TranslationResult* result, int is_64bit, uint8_t reg, unsigned int extend_mode,
                    int hint_reg) -> int;
 
