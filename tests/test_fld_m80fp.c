@@ -178,6 +178,157 @@ static uint64_t test_fld_m80fp_trunc(void)
 #endif
 
 // ---------------------------------------------------------------------------
+// Raw-encoded cases (NaN / overflow / subnormal / denormal) — expected values
+// are the exact RNE narrowing of the 80-bit value to f64, i.e. what native
+// hardware fldt + fstpl produces with exceptions masked.
+//
+// Helper builds the 10-byte image from mantissa + sign/exponent word.
+// ---------------------------------------------------------------------------
+static uint64_t load_f80_raw(uint64_t mantissa, uint16_t se)
+{
+    unsigned char src[10];
+    __builtin_memcpy(src, &mantissa, 8);
+    __builtin_memcpy(src + 8, &se, 2);
+    return load_f80_to_f64((volatile long double *)src);
+}
+
+// Quiet NaN with a rich payload: the top 52 fraction bits survive the
+// narrowing (hardware truncates the fraction, keeps the quiet bit).
+// f80: 7FFF C123456789ABCDEF -> f64: 0x7FF82468ACF13579
+static uint64_t test_fld_m80fp_qnan_payload(void)
+{
+    return load_f80_raw(0xC123456789ABCDEFULL, 0x7FFF);
+}
+
+// Signaling NaN (quiet bit 62 clear): masked #IA quiets it, payload kept.
+// f80: 7FFF A000000000000000 -> f64: 0x7FFC000000000000
+static uint64_t test_fld_m80fp_snan(void)
+{
+    return load_f80_raw(0xA000000000000000ULL, 0x7FFF);
+}
+
+// Negative quiet NaN: sign bit must survive.
+// f80: FFFF C000000000000000 -> f64: 0xFFF8000000000000
+static uint64_t test_fld_m80fp_neg_qnan(void)
+{
+    return load_f80_raw(0xC000000000000000ULL, 0xFFFF);
+}
+
+// 1.5 * 2^2000 — representable in f80, overflows f64 -> +inf.
+// f80: 47CF C000000000000000 -> f64: 0x7FF0000000000000
+static uint64_t test_fld_m80fp_overflow_pos(void)
+{
+    return load_f80_raw(0xC000000000000000ULL, 16383 + 2000);
+}
+
+// -1.5 * 2^2000 -> -inf.
+static uint64_t test_fld_m80fp_overflow_neg(void)
+{
+    return load_f80_raw(0xC000000000000000ULL, 0x8000 | (16383 + 2000));
+}
+
+// Overflow boundary, round-to-inf side: (2^64 - 2^10) * 2^960 lies exactly on
+// the RNE tie between DBL_MAX and 2^1024 — ties-to-even picks 2^1024 -> +inf.
+// f80: 43FE FFFFFFFFFFFFFC00 -> f64: 0x7FF0000000000000
+static uint64_t test_fld_m80fp_overflow_tie(void)
+{
+    return load_f80_raw(0xFFFFFFFFFFFFFC00ULL, 17406);
+}
+
+// Overflow boundary, round-down side: one f80 ULP below the tie -> DBL_MAX.
+// f80: 43FE FFFFFFFFFFFFFBFF -> f64: 0x7FEFFFFFFFFFFFFF
+static uint64_t test_fld_m80fp_dbl_max(void)
+{
+    return load_f80_raw(0xFFFFFFFFFFFFFBFFULL, 17406);
+}
+
+// 1.5 * 2^-1030 — exact f64 subnormal, no rounding.
+// f80: 3BF9 C000000000000000 -> f64: 0x0000180000000000
+static uint64_t test_fld_m80fp_subnormal_exact(void)
+{
+    return load_f80_raw(0xC000000000000000ULL, 15353);
+}
+
+// Subnormal rounding tie: guard bit set, no sticky, even result -> stays.
+// f80: 3BF9 C000000000040000 -> f64: 0x0000180000000000
+static uint64_t test_fld_m80fp_subnormal_tie(void)
+{
+    return load_f80_raw(0xC000000000040000ULL, 15353);
+}
+
+// Subnormal sticky: one extra bit far below the guard breaks the tie and
+// forces the round up.  (Catches sticky-bit loss in shift-then-round
+// implementations.)
+// f80: 3BF9 C000000000040001 -> f64: 0x0000180000000001
+static uint64_t test_fld_m80fp_subnormal_sticky(void)
+{
+    return load_f80_raw(0xC000000000040001ULL, 15353);
+}
+
+// Same value, negative: sign must flow through the subnormal path.
+// f80: BBF9 C000000000040001 -> f64: 0x8000180000000001
+static uint64_t test_fld_m80fp_subnormal_neg(void)
+{
+    return load_f80_raw(0xC000000000040001ULL, 0x8000 | 15353);
+}
+
+// Smallest representable result: value ~2^-1074, rounds to the minimum
+// subnormal (shift s = 64 — exercises the shift-amount edge).
+// f80: 3BCC FFFFFFFFFFFFFFFF -> f64: 0x0000000000000001
+static uint64_t test_fld_m80fp_min_subnormal(void)
+{
+    return load_f80_raw(0xFFFFFFFFFFFFFFFFULL, 15308);
+}
+
+// One binade further down (s = 65): everything below the rounding point -> +0.
+// f80: 3BCB FFFFFFFFFFFFFFFF -> f64: 0x0000000000000000
+static uint64_t test_fld_m80fp_underflow_zero(void)
+{
+    return load_f80_raw(0xFFFFFFFFFFFFFFFFULL, 15307);
+}
+
+// f80 denormal input (e=0): value ~2^-16445, far below f64 range -> +0.
+static uint64_t test_fld_m80fp_denormal_in(void)
+{
+    return load_f80_raw(0x0000000000000001ULL, 0x0000);
+}
+
+// Negative f80 denormal -> -0 (sign preserved through total underflow).
+static uint64_t test_fld_m80fp_denormal_in_neg(void)
+{
+    return load_f80_raw(0x0000000000000001ULL, 0x8000);
+}
+
+// Normal-path RNE tie, round-to-even keeps mantissa: 1 + 2^-53 -> 1.0.
+// f80: 3FFF 8000000000000400 -> f64: 0x3FF0000000000000
+static uint64_t test_fld_m80fp_tie_even_down(void)
+{
+    return load_f80_raw(0x8000000000000400ULL, 0x3FFF);
+}
+
+// Normal-path RNE tie, odd mantissa rounds up: 1 + 3*2^-53 -> 1 + 2^-51.
+// f80: 3FFF 8000000000000C00 -> f64: 0x3FF0000000000002
+static uint64_t test_fld_m80fp_tie_even_up(void)
+{
+    return load_f80_raw(0x8000000000000C00ULL, 0x3FFF);
+}
+
+// Smallest f64 normal loaded exactly (prescale path boundary, e = 15361).
+// f80: 3C01 8000000000000000 -> f64: 0x0010000000000000
+static uint64_t test_fld_m80fp_min_normal(void)
+{
+    return load_f80_raw(0x8000000000000000ULL, 16383 - 1022);
+}
+
+// Just below the smallest normal: rounds UP across the subnormal/normal
+// boundary (carry out of the subnormal fraction into the exponent field).
+// f80: 3C00 FFFFFFFFFFFFFFFF -> f64: 0x0010000000000000
+static uint64_t test_fld_m80fp_denorm_carry(void)
+{
+    return load_f80_raw(0xFFFFFFFFFFFFFFFFULL, 15360);
+}
+
+// ---------------------------------------------------------------------------
 
 typedef struct { const char* name; uint64_t (*fn)(void); uint64_t expected; } TestCase;
 
@@ -208,6 +359,25 @@ int main(void)
 #if TEST_FLD_M80FP_TRUNC
         { "fld m80fp  trunc 2^-64 lost ", test_fld_m80fp_trunc,   0x3FF0000000000001ULL },
 #endif
+        { "fld m80fp  qnan payload     ", test_fld_m80fp_qnan_payload,    0x7FF82468ACF13579ULL },
+        { "fld m80fp  snan quieted     ", test_fld_m80fp_snan,            0x7FFC000000000000ULL },
+        { "fld m80fp  -qnan sign       ", test_fld_m80fp_neg_qnan,        0xFFF8000000000000ULL },
+        { "fld m80fp  overflow +inf    ", test_fld_m80fp_overflow_pos,    0x7FF0000000000000ULL },
+        { "fld m80fp  overflow -inf    ", test_fld_m80fp_overflow_neg,    0xFFF0000000000000ULL },
+        { "fld m80fp  ovf tie -> inf   ", test_fld_m80fp_overflow_tie,    0x7FF0000000000000ULL },
+        { "fld m80fp  ovf edge DBL_MAX ", test_fld_m80fp_dbl_max,         0x7FEFFFFFFFFFFFFFULL },
+        { "fld m80fp  subnormal exact  ", test_fld_m80fp_subnormal_exact, 0x0000180000000000ULL },
+        { "fld m80fp  subnormal tie    ", test_fld_m80fp_subnormal_tie,   0x0000180000000000ULL },
+        { "fld m80fp  subnormal sticky ", test_fld_m80fp_subnormal_sticky,0x0000180000000001ULL },
+        { "fld m80fp  -subnormal sign  ", test_fld_m80fp_subnormal_neg,   0x8000180000000001ULL },
+        { "fld m80fp  min subnormal    ", test_fld_m80fp_min_subnormal,   0x0000000000000001ULL },
+        { "fld m80fp  underflow -> +0  ", test_fld_m80fp_underflow_zero,  0x0000000000000000ULL },
+        { "fld m80fp  f80 denormal in  ", test_fld_m80fp_denormal_in,     0x0000000000000000ULL },
+        { "fld m80fp  -f80 denorm -> -0", test_fld_m80fp_denormal_in_neg, 0x8000000000000000ULL },
+        { "fld m80fp  tie-even down    ", test_fld_m80fp_tie_even_down,   0x3FF0000000000000ULL },
+        { "fld m80fp  tie-even up      ", test_fld_m80fp_tie_even_up,     0x3FF0000000000002ULL },
+        { "fld m80fp  min normal exact ", test_fld_m80fp_min_normal,      0x0010000000000000ULL },
+        { "fld m80fp  denorm carry up  ", test_fld_m80fp_denorm_carry,    0x0010000000000000ULL },
     };
 
     int pass = 0, fail = 0;

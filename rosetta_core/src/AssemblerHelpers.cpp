@@ -171,6 +171,16 @@ auto emit_lslv(AssemblerBuffer& buf, int is_64bit, int Rm, int Rn, int Rd) -> vo
     buf.emit(insn);
 }
 
+auto emit_lsrv(AssemblerBuffer& buf, int is_64bit, int Rm, int Rn, int Rd) -> void {
+    // LSRV: sf | 0 | 0 | 11010110 | Rm | 001001 | Rn | Rd
+    uint32_t insn = 0x1AC02400;
+    insn |= (uint32_t)(is_64bit != 0) << 31;
+    insn |= (uint32_t)(Rm & 0x1F) << 16;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Rd & 0x1F);
+    buf.emit(insn);
+}
+
 auto emit_subs_reg(AssemblerBuffer& buf, int is_64bit, int Rn, int Rm, int Rd) -> void {
     emit_add_sub_shifted_reg(buf, is_64bit, /*is_sub=*/1, /*set_flags=*/1,
                              /*shift_type=*/0, Rm, /*shift_amount=*/0, Rn, Rd);
@@ -631,6 +641,21 @@ auto emit_scvtf(AssemblerBuffer& buf, int is_64bit_int, int ftype, int Rd, int R
 
 auto emit_scvtf_x_to_d(AssemblerBuffer& buf, int Dd, int Xn) -> void {
     emit_scvtf(buf, /*is_64bit_int=*/1, /*ftype=*/1, Dd, Xn);
+}
+
+auto emit_ucvtf(AssemblerBuffer& buf, int is_64bit_int, int ftype, int Rd, int Rn) -> void {
+    // UCVTF (scalar, integer): converts unsigned GPR to FP
+    // Same encoding as SCVTF but [18:16]=011 instead of 010.
+    uint32_t insn = 0x1E230000;
+    insn |= (uint32_t)(is_64bit_int != 0) << 31;
+    insn |= (uint32_t)(ftype & 0x3) << 22;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Rd & 0x1F);
+    buf.emit(insn);
+}
+
+auto emit_ucvtf_x_to_d(AssemblerBuffer& buf, int Dd, int Xn) -> void {
+    emit_ucvtf(buf, /*is_64bit_int=*/1, /*ftype=*/1, Dd, Xn);
 }
 
 auto emit_scvtf_d_from_d(AssemblerBuffer& buf, int Dd, int Dn) -> void {

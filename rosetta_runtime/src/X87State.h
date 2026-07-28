@@ -111,7 +111,11 @@ double inline ConvertX87RegisterToFloat64(X87Float80 x87, uint16_t* statusFlags)
         if (mantissa != 0x8000000000000000ULL) {
             if (statusFlags)
                 *statusFlags |= X87StatusWordFlag::kInvalidOperation;
-            result.bits = sign | 0x7FF8000000000000ULL;
+            // Keep the top 52 fraction bits and force the quiet bit — matches
+            // hardware narrowing, the IR const-promote f80_to_f64_bits, and
+            // the inline translate_fld m80fp path (was: collapse to 0x7FF8…).
+            result.bits = sign | 0x7FF0000000000000ULL | 0x0008000000000000ULL |
+                          ((mantissa >> 11) & 0xFFFFFFFFFFFFFULL);
             return result.value;
         }
         result.bits = sign | 0x7FF0000000000000ULL;
@@ -127,8 +131,14 @@ double inline ConvertX87RegisterToFloat64(X87Float80 x87, uint16_t* statusFlags)
         if (exp < -52) {
             return (sign ? -0.0 : 0.0);
         }
-        // Denormalize
-        mantissa >>= (1 - exp);
+        // Denormalize, folding every shifted-out bit into bit 0 so the
+        // round-to-nearest-even step below still sees it as sticky (a plain
+        // shift double-rounds: it discards sticky bits below the pre-shift,
+        // e.g. f80 3BF9:C000000000040001 misrounded down by one ULP).
+        const int sh = 1 - exp;  // in [1, 53]
+        const uint64_t lost = mantissa & ((1ULL << sh) - 1);
+        mantissa >>= sh;
+        mantissa |= (lost != 0);
         exp = 0;
     }
 

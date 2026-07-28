@@ -159,8 +159,9 @@ auto translate_fldpi(TranslationResult* a1, IRInstr* /*a2*/) -> void {
 //   FLD m64fp   DD /0    operands = [m64fp MemRef src]  — operands[0].size == S64
 //   FLD m80fp   DB /5    operands = [m80fp MemRef src]  — operands[0].size == S80
 //
-// m80fp is handled via kRuntimeRoutine_fld_fp80 and early-returns before any
-// direct x87-state setup. All other variants use direct AArch64 emission.
+// m80fp is lowered inline (f80 → f64 conversion emitted as AArch64 code) and
+// early-returns before the common setup below. All variants use direct
+// AArch64 emission.
 //
 // ST(i) ordering requirement:
 //   Intel spec: temp = ST(i); TOP--; ST(0) = temp.
@@ -176,48 +177,221 @@ auto translate_fldpi(TranslationResult* a1, IRInstr* /*a2*/) -> void {
 //   Dd_val  (fpr free pool) -- the loaded value
 //   addr_reg (free pool) -- memory paths only; freed after FP load (OPT-4)
 //
-// Register allocation (m80fp runtime path):
-//   W_lo    (gpr pool 0) -- low  8 bytes of the f80 value (mantissa)
-//   W_hi    (gpr pool 1) -- high 2 bytes of the f80 value (sign + 15-bit exponent)
-//   addr_reg (free pool) -- freed before the BL placeholder is emitted
+// Register allocation (m80fp inline path — after push, before store):
+//   Xbase/Wd_top/Wd_tmp as above (pool 0/1/2)
+//   Xm      (free pool) -- 64-bit mantissa (explicit integer bit); becomes
+//                          sticky-bit / payload scratch inside the branches
+//   Xe      (free pool) -- exponent halfword → e → k = e-16446 → per-branch scratch
+//   Xt      (free pool) -- scratch / f64 bits builder
+//   Xsign   (free pool) -- f64 sign bit, pre-shifted to bit 63
+//   Dd_val  (fpr free pool) -- conversion result
+//   Dd_scale(fpr free pool) -- 2^k scale constant (normal path only)
 // =============================================================================
 auto translate_fld(TranslationResult* a1, IRInstr* a2) -> void {
     AssemblerBuffer& buf = a1->insn_buf;
 
+    // Local forward-branch patching for the multi-path m80fp conversion below.
+    // The branch is emitted with a zero offset (via the emit_* helper), its byte
+    // position recorded, and the final instruction-count delta OR-ed in once the
+    // target is reached. Placeholder imm fields are all-zero, so OR suffices.
+    const auto patch_fwd_branch_to_here = [&buf](uint64_t br_pos) {
+        const uint32_t delta = static_cast<uint32_t>((buf.end - br_pos) >> 2);
+        uint32_t insn = buf.data[br_pos >> 2];
+        if ((insn & 0x7C000000u) == 0x14000000u) {          // B
+            insn |= delta & 0x03FFFFFFu;
+        } else if ((insn & 0x7E000000u) == 0x34000000u) {   // CBZ/CBNZ
+            insn |= (delta & 0x7FFFFu) << 5;
+        } else if ((insn & 0x7E000000u) == 0x36000000u) {   // TBZ/TBNZ
+            insn |= (delta & 0x3FFFu) << 5;
+        } else {                                            // B.cond
+            insn |= (delta & 0x7FFFFu) << 5;
+        }
+        buf.data[br_pos >> 2] = insn;
+    };
+
     // -------------------------------------------------------------------------
-    // FLD m80fp — DB /5  (early-out, handed off to runtime routine)
+    // FLD m80fp — DB /5  (inline f80 → f64 conversion, no runtime call)
+    //
+    // f80 layout: 64-bit mantissa with EXPLICIT integer bit at 63, then a
+    // 16-bit word = sign[15] | biased exponent[14:0] (bias 16383).
+    //
+    // Strategy: value = mantissa × 2^(e - 16383 - 63).  UCVTF rounds the
+    // 64-bit mantissa to 53 bits (RNE), and scaling by a power of two is
+    // exact whenever the result is normal — so UCVTF + (up to two) exact
+    // FMULs yields the correctly-rounded f64 for every normal result, with
+    // overflow saturating to ±inf inside the FMUL itself.  Subnormal results
+    // would be rounded twice by that scheme, so they take an integer
+    // guard/sticky path instead (single RNE rounding, matches hardware
+    // FLDT+FSTPL).
+    //
+    // Branch structure (offsets patched via patch_fwd_branch_to_here):
+    //   mantissa == 0        → .zero      (±0, sign preserved)
+    //   e == 0x7FFF          → .infnan    (±inf, or quiet NaN keeping the top
+    //                                      52 fraction bits — payload behavior
+    //                                      matches hardware, the runtime
+    //                                      ConvertX87RegisterToFloat64, and the
+    //                                      IR const-promote f80_to_f64_bits)
+    //   e < 15361 (k<-1085)  → .subnormal (integer guard/sticky rounding;
+    //                                      s ≥ 65 underflows to ±0)
+    //   otherwise            → normal     (UCVTF; prescale by 2^-1022 when
+    //                                      k < -1022, then ±2^k FMUL)
+    //
+    // Status-word exception flags (PE/UE/OE/IE) are NOT updated — hardware
+    // FLD m80 sets none of them for finite values (the load is exact into an
+    // 80-bit register; our narrowing is an emulation artifact), and the other
+    // inline fld/arith paths already skip exception flags.  Tag becomes
+    // kValid via the push, as with every other inline load.
     // -------------------------------------------------------------------------
     if (a2->operands[0].kind != IROperandKind::Register &&
         a2->operands[0].mem.size == IROperandSize::S80) {
-        // OPT-1: Release any cached base/top GPRs — the BL below clobbers
-        // all scratch registers, and we need pool slots 0+1 for W_lo/W_hi.
-        x87_cache_force_release(*a1, buf);
+        auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+        const int Xst_base = x87_get_st_base(*a1);
+        const int Wd_tmp = alloc_gpr(*a1, 2);
+        {
+            const int Wd_tmp2 = alloc_gpr(*a1, 3);
+            x87_push(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+            free_gpr(*a1, Wd_tmp2);
+        }
+        const int Dd_val = alloc_free_fpr(*a1);
 
-        const int W_lo = alloc_gpr(*a1, 0);
-        const int W_hi = alloc_gpr(*a1, 1);
         // m80 = 8-byte mantissa + 2-byte exponent at +8: both accesses must fold.
         const OperandAccess acc = compute_operand_access(*a1, /*is_64bit=*/1, &a2->operands[0],
                                                          /*size_log2=*/3, /*extra_off=*/8,
                                                          /*extra_size_log2=*/1);
+        // Deferred alloc (after compute_operand_access) — GS/TLS overrides
+        // need transient GPRs; see translate_fst m80 for the same pattern.
+        const int Xm = alloc_free_gpr(*a1);
+        const int Xe = alloc_free_gpr(*a1);
         if (acc.enc == OperandAccess::Enc::Unscaled9) {
-            emit_ldur_stur(buf, /*size=*/3, /*is_load=*/1, (int16_t)acc.offset, acc.base, W_lo);
+            emit_ldur_stur(buf, /*size=*/3, /*is_load=*/1, (int16_t)acc.offset, acc.base, Xm);
             emit_ldur_stur(buf, /*size=*/1, /*is_load=*/1, (int16_t)(acc.offset + 8), acc.base,
-                           W_hi);
+                           Xe);
         } else {
-            emit_ldr_imm(buf, /*size=*/3, W_lo, acc.base, (int16_t)(acc.offset >> 3));
-            emit_ldr_imm(buf, /*size=*/1, W_hi, acc.base, (int16_t)((acc.offset + 8) >> 1));
+            emit_ldr_imm(buf, /*size=*/3, Xm, acc.base, (int16_t)(acc.offset >> 3));
+            emit_ldr_imm(buf, /*size=*/1, Xe, acc.base, (int16_t)((acc.offset + 8) >> 1));
         }
         free_gpr(*a1, acc.base);
 
-        Fixup fixup;
-        fixup.kind = FixupKind::Branch26;
-        fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
-        fixup.target = kRuntimeRoutine_fld_fp80;
-        a1->_fixups.push_back(fixup);
-        a1->insn_buf.emit(0x94000000u);
+        const int Xt = alloc_free_gpr(*a1);
+        const int Xsign = alloc_free_gpr(*a1);
+        const int Dd_scale = alloc_free_fpr(*a1);
 
-        free_gpr(*a1, W_hi);
-        free_gpr(*a1, W_lo);
+        LogicalImmEncoding enc_bit63, enc_7fff, enc_bit0, enc_quiet;
+        is_bitmask_immediate(/*is_64bit=*/true, 0x8000000000000000ULL, enc_bit63);
+        is_bitmask_immediate(/*is_64bit=*/false, 0x7FFF, enc_7fff);
+        is_bitmask_immediate(/*is_64bit=*/true, 0x1, enc_bit0);
+        is_bitmask_immediate(/*is_64bit=*/true, 0x0008000000000000ULL, enc_quiet);
+
+        // Xsign = f64 sign bit:  LSL #48 moves halfword bit 15 to bit 63.
+        emit_bitfield(buf, 1, /*UBFM*/2, 1, /*immr=*/16, /*imms=*/15, Xe, Xsign);
+        emit_and_imm(buf, 1, Xsign, enc_bit63.N, enc_bit63.immr, enc_bit63.imms, Xsign);
+        // We = biased exponent e
+        emit_and_imm(buf, 0, Xe, enc_7fff.N, enc_7fff.immr, enc_7fff.imms, Xe);
+
+        // mantissa == 0 → ±0 (also pseudo-infinity, matching the runtime helper)
+        const uint64_t br_zero_m = buf.end;
+        emit_cbz(buf, 1, 0, Xm, 0);
+
+        // e == 0x7FFF → inf/NaN
+        emit_logical_imm(buf, 0, /*EOR*/2, enc_7fff.N, enc_7fff.immr, enc_7fff.imms, Xe, Xt);
+        const uint64_t br_infnan = buf.end;
+        emit_cbz(buf, 0, 0, Xt, 0);
+
+        // k = e - 16446  (scale exponent for the integer-valued mantissa)
+        emit_movn(buf, 0, /*MOVZ*/2, 0, 16446, Xt);
+        emit_add_sub_shifted_reg(buf, 0, /*sub*/1, 0, 0, Xt, 0, Xe, Xe);
+
+        // e < 15361 → result subnormal (or zero); k + 1085 < 0
+        emit_add_imm(buf, 0, 0, 0, 0, 1085, Xe, Xt);
+        const uint64_t br_subnormal = buf.end;
+        emit_tbz(buf, /*TBNZ*/1, 31, Xt, 0);
+
+        // ── normal / overflow: UCVTF + exact power-of-two scaling ──
+        emit_ucvtf_x_to_d(buf, Dd_val, Xm);
+        // k < -1022 → prescale by 2^-1022 (exact: intermediate stays normal)
+        emit_add_imm(buf, 0, 0, 0, 0, 1022, Xe, Xt);
+        emit_tbz(buf, /*TBZ*/0, 31, Xt, 5);
+        emit_movn(buf, 1, /*MOVZ*/2, /*hw=*/3, 0x0010, Xm);  // 2^-1022 bits
+        emit_fmov_x_to_d(buf, Dd_scale, Xm);
+        emit_fmul_f64(buf, Dd_val, Dd_val, Dd_scale);
+        emit_mov_reg(buf, 0, Xe, Xt);  // k += 1022  (now in [-63, -1])
+        // scale = ±2^k: exponent field k+1023 placed at [62:52], sign OR-ed in
+        // (the product then carries the f64 sign for every finite result).
+        // k can reach 16319 (e up to 32766) — a field > 2047 would be silently
+        // truncated by the UBFIZ, so clamp to 2047: the scale becomes ±inf and
+        // the FMUL yields the correct ±inf for these guaranteed overflows.
+        emit_add_imm(buf, 0, 0, 0, 0, 1023, Xe, Xt);
+        emit_bitfield(buf, 0, 2, 0, /*immr=*/11, /*imms=*/31, Xt, Xe);  // LSR #11 → overflow bits
+        emit_cbz(buf, 0, 0, Xe, 2);
+        emit_movn(buf, 0, /*MOVZ*/2, 0, 0x7FF, Xt);
+        emit_bitfield(buf, 1, 2, 1, /*immr=*/12, /*imms=*/10, Xt, Xt);  // UBFIZ #52,#11
+        emit_logical_shifted_reg(buf, 1, /*ORR*/1, 0, 0, Xsign, 0, Xt, Xt);
+        emit_fmov_x_to_d(buf, Dd_scale, Xt);
+        emit_fmul_f64(buf, Dd_val, Dd_val, Dd_scale);
+        const uint64_t br_done_normal = buf.end;
+        emit_b(buf, 0);
+
+        // ── .subnormal: single-rounding integer path ──
+        // Result fraction (grid 2^-1074) = RNE(m >> s), s = 15372 - e ∈ [12, 15372].
+        // A carry into bit 52 lands in the exponent field = smallest normal — free.
+        patch_fwd_branch_to_here(br_subnormal);
+        emit_add_imm(buf, 0, 0, 0, 0, 1074, Xe, Xt);  // Xt = k+1074 = -s
+        emit_add_imm(buf, 0, 0, 0, 0, 65, Xt, Xe);    // Xe = 65-s
+        emit_add_imm(buf, 0, /*sub*/1, /*flags*/1, 0, 1, Xe, 31);  // CMP We, #1
+        const uint64_t br_zero_uf = buf.end;
+        emit_b_cond(buf, /*LT*/11, 0);  // s ≥ 65 → even the round bit is gone → ±0
+        // s ∈ [12, 64] from here.  Shift amounts are used mod 64, so s-65 ≡ s-1
+        // and 65-s (∈ [1,53]) both encode directly.
+        emit_add_sub_shifted_reg(buf, 0, 1, 0, 0, Xe, 0, 31, Xt);  // Wt = s-65 ≡ s-1
+        emit_lsrv(buf, 1, Xt, Xm, Xt);  // Xt = r1 = m >> (s-1), guard at bit 0
+        emit_lslv(buf, 1, Xe, Xm, Xm);  // Xm = bits below the guard (sticky source)
+        emit_add_sub_shifted_reg(buf, 1, 1, 0, 0, Xm, 0, 31, Xe);  // Xe = -Xm
+        emit_logical_shifted_reg(buf, 1, /*ORR*/1, 0, 0, Xe, 0, Xm, Xm);
+        emit_bitfield(buf, 1, 2, 1, 63, 63, Xm, Xm);  // Xm = sticky ∈ {0,1}
+        emit_and_imm(buf, 1, Xe, enc_bit0.N, enc_bit0.immr, enc_bit0.imms, Xt);  // guard
+        emit_bitfield(buf, 1, 2, 1, 1, 63, Xt, Xt);   // Xt = r = m >> s
+        emit_logical_shifted_reg(buf, 1, /*ORR*/1, 0, 0, Xt, 0, Xm, Xm);  // sticky | r&1
+        emit_logical_shifted_reg(buf, 1, /*AND*/0, 0, 0, Xe, 0, Xm, Xm);  // & guard
+        emit_add_sub_shifted_reg(buf, 1, 0, 0, 0, Xm, 0, Xt, Xt);  // RNE increment
+        emit_logical_shifted_reg(buf, 1, /*ORR*/1, 0, 0, Xsign, 0, Xt, Xt);
+        emit_fmov_x_to_d(buf, Dd_val, Xt);
+        const uint64_t br_done_sub = buf.end;
+        emit_b(buf, 0);
+
+        // ── .infnan ──
+        patch_fwd_branch_to_here(br_infnan);
+        emit_movn(buf, 1, /*MOVZ*/2, /*hw=*/3, 0x7FF0, Xe);
+        emit_logical_shifted_reg(buf, 1, /*ORR*/1, 0, 0, Xsign, 0, Xe, Xe);
+        // mantissa == integer bit only → ±inf; else NaN (quieted, payload kept)
+        emit_logical_imm(buf, 1, /*EOR*/2, enc_bit63.N, enc_bit63.immr, enc_bit63.imms, Xm, Xt);
+        emit_cbz(buf, 1, 0, Xt, 4);
+        emit_bitfield(buf, 1, 2, 1, /*immr=*/11, /*imms=*/62, Xm, Xm);  // UBFX #11,#52
+        emit_orr_imm(buf, 1, Xm, Xm, enc_quiet.N, enc_quiet.immr, enc_quiet.imms);
+        emit_logical_shifted_reg(buf, 1, /*ORR*/1, 0, 0, Xm, 0, Xe, Xe);
+        emit_fmov_x_to_d(buf, Dd_val, Xe);
+        const uint64_t br_done_infnan = buf.end;
+        emit_b(buf, 0);
+
+        // ── .zero: ±0 with the source's sign ──
+        patch_fwd_branch_to_here(br_zero_m);
+        patch_fwd_branch_to_here(br_zero_uf);
+        emit_fmov_x_to_d(buf, Dd_val, Xsign);
+
+        // ── .done ──
+        patch_fwd_branch_to_here(br_done_normal);
+        patch_fwd_branch_to_here(br_done_sub);
+        patch_fwd_branch_to_here(br_done_infnan);
+        free_fpr(*a1, Dd_scale);
+        free_gpr(*a1, Xsign);
+        free_gpr(*a1, Xt);
+        free_gpr(*a1, Xe);
+        free_gpr(*a1, Xm);
+
+        emit_store_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, Dd_val, Xst_base);
+
+        free_fpr(*a1, Dd_val);
+        x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+        free_gpr(*a1, Wd_tmp);
         return;
     }
 

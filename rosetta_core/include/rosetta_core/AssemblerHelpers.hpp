@@ -58,6 +58,9 @@ auto emit_mov_reg(AssemblerBuffer& buf, int is_64bit, int Rd, int Rn) -> void;
 // LSLV — variable left shift: Rd = Rn << (Rm & 31)
 auto emit_lslv(AssemblerBuffer& buf, int is_64bit, int Rm, int Rn, int Rd) -> void;
 
+// LSRV — variable logical right shift: Rd = Rn >> (Rm mod datasize)
+auto emit_lsrv(AssemblerBuffer& buf, int is_64bit, int Rm, int Rn, int Rd) -> void;
+
 // SUBS register — always sets flags, arg order is (Rn, Rm, Rd)
 auto emit_subs_reg(AssemblerBuffer& buf, int is_64bit, int Rn, int Rm, int Rd) -> void;
 
@@ -248,6 +251,10 @@ auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void;
 // ftype:        0=f32  1=f64
 auto emit_scvtf(AssemblerBuffer& buf, int is_64bit_int, int ftype, int Rd, int Rn) -> void;
 auto emit_scvtf_x_to_d(AssemblerBuffer& buf, int Dd, int Xn) -> void;
+
+// UCVTF — unsigned integer GPR → FP (rounds per FPCR, RNE by default)
+auto emit_ucvtf(AssemblerBuffer& buf, int is_64bit_int, int ftype, int Rd, int Rn) -> void;
+auto emit_ucvtf_x_to_d(AssemblerBuffer& buf, int Dd, int Xn) -> void;
 // SCVTF (vector, integer) scalar 64-bit — int64 held in an FPR → f64 in place
 auto emit_scvtf_d_from_d(AssemblerBuffer& buf, int Dd, int Dn) -> void;
 
