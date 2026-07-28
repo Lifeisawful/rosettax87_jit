@@ -62,6 +62,8 @@ extern char stub_fscale_val[];
 extern char stub_fyl2x_val[];
 extern char stub_fyl2xp1_val[];
 extern char stub_fpatan_val[];
+extern char stub_fxam_fast[];
+extern char stub_fxtract_fast[];
 extern char stub_fsin_fast[];
 extern char stub_fsin_val[];
 extern char stub_fsincos_fast[];
@@ -322,6 +324,10 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
         route(kRuntimeRoutine_fyl2xp1, stub_fyl2xp1_val, /*disabled=*/0);
     if (fpatan_val)
         route(kRuntimeRoutine_fpatan, stub_fpatan_val, /*disabled=*/0);
+    // FXAM/FXTRACT in-blob fast paths: default-on, NOT gated by TRIG_IR
+    // (memory-state stubs, no value-call ABI involved).
+    route(kRuntimeRoutine_fxam, stub_fxam_fast, kConfig.disable_fxam_fast);
+    route(kRuntimeRoutine_fxtract, stub_fxtract_fast, kConfig.disable_fxtract_fast);
 
     CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
              "(fcos=%s fsin=%s fsincos=%s fptan=%s f2xm1=%s fscale=%s fyl2x=%s "

@@ -120,6 +120,8 @@ struct RosettaConfig {
     uint8_t  disable_fyl2x_val;      // ROSETTA_X87_DISABLE_FYL2X_VAL=1 — same for FYL2X
     uint8_t  disable_fyl2xp1_val;    // ROSETTA_X87_DISABLE_FYL2XP1_VAL=1 — same for FYL2XP1
     uint8_t  disable_fpatan_val;     // ROSETTA_X87_DISABLE_FPATAN_VAL=1 — same for FPATAN
+    uint8_t  disable_fxam_fast;      // ROSETTA_X87_DISABLE_FXAM_FAST=1 — route FXAM to the classic stub instead of the in-blob fast path
+    uint8_t  disable_fxtract_fast;   // ROSETTA_X87_DISABLE_FXTRACT_FAST=1 — same for FXTRACT
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

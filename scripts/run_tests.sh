@@ -280,7 +280,9 @@ fi
 # Apple's stock codegen BL-ing into the hooked x87_* runtime routines — the
 # purest exercise of the X87.cpp implementations (no custom singular
 # translators, fusions, or IR inlining masking them). DISABLE_IR is redundant
-# with ALL_OPS disabled but kept explicit.
+# with ALL_OPS disabled but kept explicit.  The in-blob fast stubs are also
+# disabled so the classic C handlers actually run (fast routing is
+# independent of the translation flags).
 if [[ $NATIVE_ONLY -eq 0 ]]; then
     echo ""
     echo -e "${BOLD}=== Phase 8: runtime_loader (runtime routines only, custom translation disabled) ===${NC}"
@@ -292,7 +294,11 @@ if [[ $NATIVE_ONLY -eq 0 ]]; then
             ERRORS=$((ERRORS + 1))
             continue
         fi
-        OUT=$(ROSETTA_X87_DISABLE_ALL_OPS=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1 ROSETTA_X87_DISABLE_IR=1 "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
+        OUT=$(ROSETTA_X87_DISABLE_ALL_OPS=1 ROSETTA_X87_DISABLE_ALL_FUSIONS=1 ROSETTA_X87_DISABLE_IR=1 \
+              ROSETTA_X87_DISABLE_FCOS_FAST=1 ROSETTA_X87_DISABLE_FSIN_FAST=1 \
+              ROSETTA_X87_DISABLE_FSINCOS_FAST=1 ROSETTA_X87_DISABLE_FPTAN_FAST=1 \
+              ROSETTA_X87_DISABLE_FXAM_FAST=1 ROSETTA_X87_DISABLE_FXTRACT_FAST=1 \
+              "$LOADER" "$BINARY" 2>/dev/null | filter_runtime_lines || true)
         check_output "$t" "$OUT"
     done
 fi

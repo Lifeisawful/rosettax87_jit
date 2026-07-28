@@ -210,6 +210,10 @@ RosettaConfig parse_config_from_env() {
         cfg.disable_fyl2xp1_val = (*v == '1') ? 1 : 0;
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FPATAN_VAL"))
         cfg.disable_fpatan_val = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FXAM_FAST"))
+        cfg.disable_fxam_fast = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FXTRACT_FAST"))
+        cfg.disable_fxtract_fast = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')

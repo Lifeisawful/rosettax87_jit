@@ -1587,16 +1587,22 @@ void x87_fxtract(X87State* state) {
     LOG(1, "x87_fxtract\n", 13);
 
     auto st0 = state->getSt(0);
+    const uint64_t bits = std::bit_cast<uint64_t>(st0);
 
     // If the floating-point zero-divide exception (#Z) is masked and the source
     // operand is zero, an exponent value of –∞ is stored in register ST(1) and 0
     // with the sign of the source operand is stored in register ST(0).
     // Like the normal path, both special cases must PUSH: the exponent goes
     // to what becomes ST(1) and the significand to the new ST(0).
-    if ((state->controlWord & X87ControlWord::kZeroDivideMask) != 0 && st0 == 0.0) {
+    if (st0 == 0.0) {
         state->setSt(0, -std::numeric_limits<double>::infinity());
         state->push();
-        state->setSt(0, copysign(0.0, st0));
+        if ((state->controlWord & X87ControlWord::kZeroDivideMask) != 0) {
+            state->setSt(0, st0);  // ±0 with the source's sign
+        } else {
+            // #Z unmasked: the old floor(log2)+pow path produced 0/0 here.
+            state->setSt(0, std::bit_cast<double>(0x7FF8000000000000ULL));
+        }
         return;
     }
 
@@ -1607,10 +1613,39 @@ void x87_fxtract(X87State* state) {
         return;
     }
 
-    auto e = std::floor(openlibm_log2(std::fabs(st0)));
-    auto m = st0 / openlibm_pow(2.0, e);
+    if (x87_is_nan(st0)) {
+        // Exponent = quiet(|st0|), significand = quiet(st0) — what the old
+        // floor(log2(fabs)) / st0÷pow chain propagated, minus the calls.
+        constexpr uint64_t kQuiet = 0x0008000000000000ULL;
+        state->setSt(0, std::bit_cast<double>((bits & 0x7FFFFFFFFFFFFFFFULL) | kQuiet));
+        state->push();
+        state->setSt(0, std::bit_cast<double>(bits | kQuiet));
+        return;
+    }
 
-    state->setSt(0, e);
+    // Exact bit extraction (hardware FXTRACT semantics): exponent from the
+    // biased field (subnormals normalized via CLZ), significand = source with
+    // its exponent field replaced by bias.  Replaces floor(openlibm_log2)+pow,
+    // whose double rounding broke binade boundaries — worst case
+    // fxtract(DBL_MAX) returned e=1024 and m = DBL_MAX/2^1024 instead of
+    // e=1023, m≈2.
+    constexpr uint64_t kMant = 0x000FFFFFFFFFFFFFULL;
+    const int64_t expField = (bits >> 52) & 0x7FF;
+    uint64_t frac;
+    int64_t e;
+    if (expField == 0) {
+        const uint64_t mant = bits & kMant;  // != 0: zeros handled above
+        const int sh = __builtin_clzll(mant) - 11;
+        frac = (mant << sh) & kMant;
+        e = -1022 - sh;
+    } else {
+        frac = bits & kMant;
+        e = expField - 1023;
+    }
+    const double m = std::bit_cast<double>((bits & 0x8000000000000000ULL) |
+                                           0x3FF0000000000000ULL | frac);
+
+    state->setSt(0, static_cast<double>(e));
 
     state->push();
     state->setSt(0, m);

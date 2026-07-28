@@ -2372,6 +2372,221 @@ Latanv_pilo:
     .quad 0x3CA1A62633145C07
 
 // -----------------------------------------------------------------------------
+// FXAM / FXTRACT in-blob fast paths (offset-table routed like the trig fast
+// stubs, default-on, ROSETTA_X87_DISABLE_{FXAM,FXTRACT}_FAST=1 reverts to the
+// classic slots).  Both are memory-state stubs: state at x18+0xA0
+// (+0xA0 controlWord, +0xA2 statusWord, +0xA4 tagWord, +0xA8 st[8]).
+// Register discipline (kRuntimeRoutine BL-site contract): x16/x27/x29 free,
+// x25/x26 saved on the native stack (OPT-KA keepalive relies on them),
+// NZCV never written (sub + tbz/tbnz/cbz only), FXTRACT saves q16 around
+// its one SCVTF.  Debug/single-step sessions bail to the classic slot
+// before any state is modified.
+//
+// FXAM: classify ST(0) into C3/C2/C0 with C1 = sign, from the tag word
+// first (kEmpty/kZero) then the value bits — the exact x87_fxam logic:
+//   empty 0x4100, zero 0x4000 (+C1 sign), NaN 0x0100, Inf 0x0500,
+//   subnormal 0x4400, normal 0x0400; C-bits cleared with the same ~0x4700.
+// -----------------------------------------------------------------------------
+.globl _stub_fxam_fast
+_stub_fxam_fast:
+    ldrb w29, [x18, #0x1C8]
+    cbnz w29, _stub_fxam
+    sub  sp, sp, #0x10
+    stp  x25, x26, [sp]
+    ldrh w25, [x18, #0xA2]           // statusWord
+    ldrh w26, [x18, #0xA4]           // tagWord
+    ubfx w27, w25, #11, #3           // TOP
+    lsl  w29, w27, #1
+    lsr  w26, w26, w29
+    and  w26, w26, #3                // tag of ST(0)
+    mov  w16, #0xB8FF
+    and  w25, w25, w16               // clear C3|C2|C1|C0
+    sub  w29, w26, #3
+    cbz  w29, Lfxam_empty
+    sub  w29, w26, #1
+    cbz  w29, Lfxam_zerotag
+    // kValid/kSpecial: classify the value bits
+    add  x29, x18, #0xA8
+    ldr  x16, [x29, w27, uxtw #3]    // ST(0) bits
+    tbz  x16, #63, Lfxam_signdone
+    orr  w25, w25, #0x200            // C1 = sign
+Lfxam_signdone:
+    lsl  x29, x16, #1
+    cbnz x29, Lfxam_classify
+    orr  w25, w25, #0x4000           // value == ±0 despite kValid tag: C3
+    b    Lfxam_store
+Lfxam_classify:
+    and  x29, x16, #0x7FFFFFFFFFFFFFFF
+    mov  x26, #0x7FF0000000000000
+    sub  x29, x29, x26
+    cbz  x29, Lfxam_inf
+    tbz  x29, #63, Lfxam_nan         // abs > 0x7FF0... → NaN
+    and  x29, x16, #0x7FF0000000000000
+    cbz  x29, Lfxam_subn             // zero exponent field (value != 0)
+    orr  w25, w25, #0x400            // normal: C2
+    b    Lfxam_store
+Lfxam_subn:
+    mov  w29, #0x4400                // subnormal: C3|C2
+    orr  w25, w25, w29
+    b    Lfxam_store
+Lfxam_inf:
+    mov  w29, #0x500                 // infinity: C2|C0
+    orr  w25, w25, w29
+    b    Lfxam_store
+Lfxam_nan:
+    orr  w25, w25, #0x100            // NaN: C0
+    b    Lfxam_store
+Lfxam_zerotag:
+    orr  w25, w25, #0x4000           // kZero: C3, C1 = sign of the -0/+0
+    add  x29, x18, #0xA8
+    ldr  x16, [x29, w27, uxtw #3]
+    tbz  x16, #63, Lfxam_store
+    orr  w25, w25, #0x200
+    b    Lfxam_store
+Lfxam_empty:
+    mov  w29, #0x4100                // kEmpty: C3|C0
+    orr  w25, w25, w29
+Lfxam_store:
+    strh w25, [x18, #0xA2]
+    ldp  x25, x26, [sp]
+    add  sp, sp, #0x10
+    ret
+
+// -----------------------------------------------------------------------------
+// FXTRACT: ST(0) ← exponent, push, ST(0) ← significand — mirrors the
+// rewritten x87_fxtract bit for bit (exact bit extraction; the old
+// floor(log2)+pow C path is gone from both sides).  Empty ST(0) mirrors
+// getSt: statusWord |= IE|SF (0x41) and the default qNaN flows through the
+// NaN leg.  Tag effects match setSt/push: slot TOP ← class(exponent),
+// slot newTOP ← class(significand).
+// Packing: x27 = TOP | newTop<<8 | eclass<<16 | mclass<<24.
+// -----------------------------------------------------------------------------
+.globl _stub_fxtract_fast
+_stub_fxtract_fast:
+    ldrb w29, [x18, #0x1C8]
+    cbnz w29, _stub_fxtract
+    sub  sp, sp, #0x20
+    stp  x25, x26, [sp]
+    str  q16, [sp, #0x10]
+    ldrh w25, [x18, #0xA2]           // statusWord
+    ldrh w26, [x18, #0xA4]           // tagWord
+    ubfx w27, w25, #11, #3           // TOP
+    sub  w29, w27, #1
+    and  w29, w29, #7
+    orr  x27, x27, x29, lsl #8       // pack newTop
+    // getSt(0) with tag check
+    ubfx w29, w27, #0, #3
+    lsl  w29, w29, #1
+    lsr  w26, w26, w29
+    and  w26, w26, #3
+    sub  w26, w26, #3
+    cbnz w26, Lfxtr_load
+    mov  w29, #0x41                  // empty: IE | SF, value = default qNaN
+    orr  w25, w25, w29
+    mov  x16, #0x7FF8000000000000
+    b    Lfxtr_have
+Lfxtr_load:
+    add  x29, x18, #0xA8
+    ubfx w26, w27, #0, #3
+    ldr  x16, [x29, w26, uxtw #3]    // ST(0) bits
+Lfxtr_have:
+    lsl  x29, x16, #1
+    cbz  x29, Lfxtr_zero
+    and  x29, x16, #0x7FFFFFFFFFFFFFFF
+    mov  x26, #0x7FF0000000000000
+    sub  x29, x29, x26
+    cbz  x29, Lfxtr_inf
+    tbz  x29, #63, Lfxtr_nan
+    // finite nonzero
+    ubfx x26, x16, #52, #11
+    cbnz x26, Lfxtr_normal
+    // subnormal: normalize via CLZ
+    and  x26, x16, #0xFFFFFFFFFFFFF
+    clz  x29, x26
+    sub  x29, x29, #11               // sh
+    lsl  x26, x26, x29
+    and  x26, x26, #0xFFFFFFFFFFFFF  // fraction of the normalized value
+    and  x16, x16, #0x8000000000000000
+    orr  x16, x16, x26
+    orr  x16, x16, #0x3FF0000000000000
+    mov  x26, #-1022
+    sub  x26, x26, x29               // e = -1022 - sh
+    b    Lfxtr_fin
+Lfxtr_normal:
+    sub  x26, x26, #0x3FF            // e = expField - 1023
+    and  x16, x16, #0x800FFFFFFFFFFFFF
+    orr  x16, x16, #0x3FF0000000000000
+Lfxtr_fin:
+    scvtf d16, w26                   // (double)e — exact, |e| <= 1074
+    cbz  w26, Lfxtr_ez
+    b    Lfxtr_common                // eclass 0 (valid), mclass 0 (valid)
+Lfxtr_ez:
+    orr  x27, x27, #0x10000          // e == 0 → eclass kZero
+    b    Lfxtr_common
+Lfxtr_zero:
+    // exponent = -Inf; significand: #Z masked → ±0 (bits already in x16),
+    // unmasked → default qNaN (the old 0/0 outcome)
+    mov  x29, #0xFFF0000000000000
+    fmov d16, x29
+    orr  x27, x27, #0x20000          // eclass kSpecial
+    ldrh w29, [x18, #0xA0]           // controlWord
+    tbz  w29, #2, Lfxtr_zero_unmasked
+    orr  x27, x27, #0x1000000        // mclass kZero
+    b    Lfxtr_common
+Lfxtr_zero_unmasked:
+    mov  x16, #0x7FF8000000000000
+    orr  x27, x27, #0x2000000        // mclass kSpecial
+    b    Lfxtr_common
+Lfxtr_inf:
+    mov  x29, #0x7FF0000000000000    // exponent = +Inf; significand = ±Inf
+    fmov d16, x29
+    orr  x27, x27, #0x20000
+    orr  x27, x27, #0x2000000
+    b    Lfxtr_common
+Lfxtr_nan:
+    and  x29, x16, #0x7FFFFFFFFFFFFFFF
+    orr  x29, x29, #0x8000000000000   // quiet(|st0|)
+    fmov d16, x29
+    orr  x16, x16, #0x8000000000000   // quiet(st0)
+    orr  x27, x27, #0x20000
+    orr  x27, x27, #0x2000000
+Lfxtr_common:
+    // stores: st[TOP] = e (d16), st[newTop] = m (x16)
+    add  x29, x18, #0xA8
+    ubfx w26, w27, #0, #3
+    str  d16, [x29, w26, uxtw #3]
+    ubfx w26, w27, #8, #3
+    str  x16, [x29, w26, uxtw #3]
+    // tag updates for both slots
+    ldrh w16, [x18, #0xA4]
+    ubfx w29, w27, #0, #3
+    lsl  w29, w29, #1
+    mov  w26, #3
+    lslv w26, w26, w29
+    bic  w16, w16, w26
+    ubfx w26, w27, #16, #2           // eclass
+    lslv w26, w26, w29
+    orr  w16, w16, w26
+    ubfx w29, w27, #8, #3
+    lsl  w29, w29, #1
+    mov  w26, #3
+    lslv w26, w26, w29
+    bic  w16, w16, w26
+    ubfx w26, w27, #24, #2           // mclass
+    lslv w26, w26, w29
+    orr  w16, w16, w26
+    strh w16, [x18, #0xA4]
+    // statusWord: TOP ← newTop (plus any IE|SF from the empty read)
+    and  w25, w25, #0xFFFFC7FF
+    ubfx w29, w27, #8, #3
+    orr  w25, w25, w29, lsl #11
+    strh w25, [x18, #0xA2]
+    ldr  q16, [sp, #0x10]
+    ldp  x25, x26, [sp]
+    add  sp, sp, #0x20
+    ret
+
+// -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
 // -----------------------------------------------------------------------------
 TRIG_ENTRY fsin
