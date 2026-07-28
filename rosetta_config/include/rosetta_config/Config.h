@@ -127,6 +127,7 @@ struct RosettaConfig {
     uint8_t  disable_fprem1_fast;    // ROSETTA_X87_DISABLE_FPREM1_FAST=1 — same for FPREM1
     uint8_t  transparent_pushpop;    // ROSETTA_X87_TRANSPARENT_PUSHPOP=1 — inline push/pop r32/r64 and push imm into IR runs (flag-neutral, no liveness gate; implies TRANSPARENT_INT; opt-in)
     uint8_t  disable_stack_ops;      // ROSETTA_X87_DISABLE_STACKOPS=1 — family gate for fdecstp/fincstp/ffree inline translation (no OpcodeId bits left; also forced by DISABLE_ALL_OPS)
+    uint8_t  disable_nzcv_liveness;  // ROSETTA_X87_DISABLE_NZCV_LIVENESS=1 — don't use Rosetta's flag-liveness dataflow to prove NZCV dead at run exit (fall back to the forward whitelist walk alone; bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

@@ -242,6 +242,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_STACKOPS"))
         cfg.disable_stack_ops = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: drop the flag-liveness dataflow proof for NZCV
+    // deadness at run exit, keeping only the forward whitelist walk.
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_NZCV_LIVENESS"))
+        cfg.disable_nzcv_liveness = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

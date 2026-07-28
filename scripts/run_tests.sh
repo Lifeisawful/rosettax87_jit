@@ -96,6 +96,7 @@ ALL_TESTS=(
     test_transparent_int
     test_ir_fpr_pressure
     test_sse_whitelist
+    test_nzcv_liveness
     test_bridge_pressure
     test_addr32
     test_keepalive

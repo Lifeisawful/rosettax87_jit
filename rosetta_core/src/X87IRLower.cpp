@@ -277,6 +277,33 @@ struct FPRState {
 // sit between the run and the redefinition. Anything unknown — including
 // reaching block end, since the terminator may be a JCC and Rosetta itself
 // treats flags as live across RET/CALL — keeps the conservative pair.
+//
+// Flag-liveness assist: for a PARTIAL or CONDITIONAL definer the walk can't
+// prove deadness by redefinition, but Rosetta's backward flag-liveness
+// dataflow can prove the flags that flow THROUGH it dead.
+// IRInstr::flag_liveness holds the flags live OUT of that instruction
+// (block-fixpoint with predecessor propagation, conservative all-live at
+// unknown targets — the same byte TRANSPARENT_FLAGS already gates on), so
+//     live-in  =  (flag_liveness & ~defined) | read
+// and for an instruction that READS no flags, live-in ⊆ flag_liveness with
+// the architecturally-always-defined bits masked off. Only the NZCV-mapped
+// guest flags (SF/ZF/CF/OF) matter: eliding the pair leaves host NZCV
+// unprotected across the FCMP and nothing else — wherever Rosetta keeps
+// guest PF/AF/DF, an unsaved FCMP cannot touch it.
+//
+// Eligible opcodes (each defines-only, never reads EFLAGS; masks are OUR
+// architectural sets, NOT the x86_opcode_flag_effects rows — those encode
+// reader/cc semantics Rosetta resolves elsewhere and are not trustworthy
+// as plain (used, defined) pairs outside the unconditional definers):
+//   inc/dec   — define OF/SF/ZF/AF/PF, preserve CF     → check CF only
+//   sahf      — defines SF/ZF/AF/PF/CF from AH, not OF → check OF only
+//   shl/shr/sar by CL — flags untouched iff masked count is 0, else
+//               defined; either way nothing is read    → check SF/ZF/CF/OF
+//   rol/ror   — define at most CF/OF, count-dependent  → check SF/ZF/CF/OF
+// The dataflow answers at the FIRST such instruction are final: a live bit
+// there means a real reader downstream (modulo the analysis' conservatism),
+// so returning its verdict directly loses nothing over walking on.
+// ROSETTA_X87_DISABLE_NZCV_LIVENESS=1 drops the assist (bisection lever).
 
 // Shift count when provably a compile-time constant: -1 for CL/memory/unknown
 // forms, else the masked count. The 0x1F mask under-approximates the 0x3F
@@ -291,8 +318,14 @@ static int shift_imm_count(const IRInstr* t) {
     return static_cast<int>(c.imm.value & 0x1F);
 }
 
+// Guest flags whose materialization lives in host NZCV.
+static constexpr uint8_t kNzcvLiveMask = FLAG_SF | FLAG_ZF | FLAG_CF | FLAG_OF;
+
 static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_t end_idx) {
+    const bool use_liveness =
+        !(g_rosetta_config && g_rosetta_config->disable_nzcv_liveness);
     for (int64_t i = end_idx; i < num_instrs; i++) {
+        const uint8_t fl = instr_array[i].flag_liveness;
         switch (instr_array[i].opcode()) {
             // Full EFLAGS definers (write SF/ZF/CF/OF/PF; AF at worst
             // architecturally undefined): pre-run flags die here.
@@ -318,8 +351,24 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
                 const int cnt = shift_imm_count(&instr_array[i]);
                 if (cnt > 0) return true;
                 if (cnt == 0) continue;
-                return false;
+                // CL-count: conditional definer, reads no flags — the pre-run
+                // flags are dead iff nothing NZCV-mapped is live out of it.
+                return use_liveness && (fl & kNzcvLiveMask) == 0;
             }
+            // Partial/conditional definers — deadness of the flags that flow
+            // through them comes from the flag-liveness dataflow (header).
+            case kOpcodeName_inc:
+            case kOpcodeName_dec:
+                // OF/SF/ZF/AF/PF defined here; only CF flows through.
+                return use_liveness && (fl & FLAG_CF) == 0;
+            case kOpcodeName_sahf:
+                // SF/ZF/AF/PF/CF defined from AH; only OF flows through.
+                return use_liveness && (fl & FLAG_OF) == 0;
+            case kOpcodeName_rol:
+            case kOpcodeName_ror:
+                // Define at most CF/OF (count-dependent), read nothing
+                // (unlike rcl/rcr, which read CF and stay conservative).
+                return use_liveness && (fl & kNzcvLiveMask) == 0;
             // Flag-neutral instructions (neither read nor write EFLAGS).
             case kOpcodeName_mov:
             case kOpcodeName_movzx:
