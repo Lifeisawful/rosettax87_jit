@@ -853,3 +853,11 @@ auto read_operand_to_gpr(TranslationResult& result, bool is_64bit, IROperand* op
     assert(false && "read_operand_to_gpr: invalid OperandKind");
     __builtin_unreachable();
 }
+
+void emit_bl_runtime_routine(TranslationResult& result, int routine) {
+    // BL #0 placeholder, patched to `routine` by a Branch26 fixup.
+    result._fixups.push_back(Fixup{FixupKind::Branch26,
+                                   static_cast<uint32_t>(result.insn_buf.end),
+                                   static_cast<uint32_t>(routine)});
+    result.insn_buf.emit(0x94000000u);
+}

@@ -318,4 +318,11 @@ inline void x87_pop_n(AssemblerBuffer& buf, TranslationResult& a1, int Xbase, in
     free_gpr(a1, Wd_tmp2);
 }
 
+// ── Shared FCOS/FSIN body (defined in TranslatorX87Helpers.cpp) ──────────────
+//
+// ldr d16 <- ST(0), BL <routine>, store d16 back to the ST(0) slot, then the
+// C1|C2 status clear (0x600; ~mask = 0xFFFFF9FF = immr 21, imms 29).  FPTAN /
+// FSINCOS have their own wrappers (they store extra results / push).
+void emit_trig_value_call_inplace(TranslationResult* a1, int routine);
+
 }  // namespace TranslatorX87

@@ -171,5 +171,19 @@ auto emit_load_int_operand(TranslationResult& result, IROperand* op, bool is_m16
 auto translate_gpr(TranslationResult* result, int is_64bit, uint8_t reg, unsigned int extend_mode,
                    int hint_reg) -> int;
 
+// ---------------------------------------------------------------------------
+// emit_bl_runtime_routine — emit a placeholder BL (0x94000000) and record the
+// Branch26 fixup that patches it to `routine` (a kRuntimeRoutine_* id).
+//
+// Replaces the repeated pattern:
+//   Fixup fixup;
+//   fixup.kind = FixupKind::Branch26;
+//   fixup.insn_offset = static_cast<uint32_t>(result.insn_buf.end);
+//   fixup.target = routine;
+//   result._fixups.push_back(fixup);
+//   result.insn_buf.emit(0x94000000u);
+// ---------------------------------------------------------------------------
+auto emit_bl_runtime_routine(TranslationResult& result, int routine) -> void;
+
 auto read_operand_to_gpr(TranslationResult& result, bool is_64bit, IROperand* operand,
                          int extend_mode, int hint_reg) -> int;

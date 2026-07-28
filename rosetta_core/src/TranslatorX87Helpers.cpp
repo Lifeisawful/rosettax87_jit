@@ -2,6 +2,9 @@
 
 #include "rosetta_core/AssemblerHelpers.hpp"
 #include "rosetta_core/TranslationResult.h"
+#include "rosetta_core/TranslatorHelpers.hpp"
+
+#include "TranslatorX87Internal.hpp"
 
 // emit_ldr_str_imm with size=1 (LDRH/STRH) uses a halfword-scaled imm12:
 // byte_offset = imm12 * 2.  Pass byte_offset/2 for all LDRH/STRH calls.
@@ -915,3 +918,46 @@ void emit_x87_rc_dispatch_frint(AssemblerBuffer& buf, int Wd_rc, int Dd, int Dn)
     emit_b(buf, 2);
     emit_fp_dp1(buf, /*type=f64*/1, /*FRINTZ*/11, Dd, Dn);
 }
+
+// =============================================================================
+// Shared FCOS/FSIN body — value call into a runtime trig stub (OPT-TI).
+//
+// ldr d16 <- ST(0), BL <routine>, store d16 back to the ST(0) slot, then the
+// C1|C2 status clear (0x600; ~mask = 0xFFFFF9FF = immr 21, imms 29).  TOP and
+// tags are unchanged (value in, value out — same tag discipline as
+// translate_fsqrt).  d16 is written raw, not allocated: at an instruction
+// boundary no pool FPR holds a live value.
+//
+// Lives here (not with translate_fcos/fsin in TranslatorX87.cpp) as a shared
+// code-emission helper; declared in TranslatorX87Internal.hpp.  Wrapped in
+// namespace TranslatorX87 so it can call the namespaced inline preamble/
+// epilogue helpers (x87_begin, x87_get_st_base, x87_end, resolve_depth).
+// =============================================================================
+namespace TranslatorX87 {
+
+void emit_trig_value_call_inplace(TranslationResult* a1, int routine) {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                                /*Dd=*/16, Xst_base);
+
+    emit_bl_runtime_routine(*a1, routine);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);
+
+    // status_word &= ~(C1|C2).  Wd_tmp is dead after the store (slot offset).
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/21, /*imms=*/29, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+}  // namespace TranslatorX87
