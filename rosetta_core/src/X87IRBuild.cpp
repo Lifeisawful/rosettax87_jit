@@ -645,6 +645,14 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
 // Rosetta's flag-liveness analysis proving the written flags dead (see
 // build_guest_alu).
 
+// The arithmetic EFLAGS — every flag_liveness bit except DF (0x01). The
+// binary ALU forms below define all of these (AF at worst architecturally
+// undefined, matching Rosetta's 0xfe rows), so their gate is "no arithmetic
+// flag live"; DF-liveness (string ops downstream) never blocks consumption
+// since none of these forms touch DF.
+static constexpr uint8_t kEflagsArith =
+    FLAG_AF | FLAG_PF | FLAG_OF | FLAG_CF | FLAG_ZF | FLAG_SF;
+
 // GuestAlu selector for a flag-writing ALU opcode; -1 for anything else.
 static int guest_alu_of(uint16_t op) {
     switch (op) {
@@ -691,13 +699,14 @@ static IROperandSize guest_mem_size(const IROperand& m) {
 // ── Flag-writing ALU forms (opt-in TRANSPARENT_FLAGS) ───────────────────────
 //
 // add/sub/and/or/xor r,imm — shl/shr/sar r,imm — {add,sub,and,or,xor} [m],r —
-// and the xor r,r zero idiom.  Every one of these defines EFLAGS, so all are
-// gated on Rosetta's backward flag-liveness analysis proving the results
-// dead: flag_liveness holds the flags live OUT of this instruction
-// (block-fixpoint, conservative all-live at unknown targets), so 0 means
-// nothing this instruction writes is ever read.  Every lowering is flag-free
-// on the host (MOVZ / ADD / SUB / AND / ORR / EOR / UBFM / SBFM / LDR / STR),
-// so the Guest-node NZCV contract is unchanged.
+// and the xor r,r zero idiom.  Every one of these defines the arithmetic
+// EFLAGS, so all are gated on Rosetta's backward flag-liveness analysis
+// proving the results dead: flag_liveness holds the flags live OUT of this
+// instruction (block-fixpoint, conservative all-live at unknown targets),
+// so no kEflagsArith bit live means nothing this instruction writes is ever
+// read (DF-liveness never blocks: these forms don't touch DF).  Every
+// lowering is flag-free on the host (MOVZ / ADD / SUB / AND / ORR / EOR /
+// UBFM / SBFM / LDR / STR), so the Guest-node NZCV contract is unchanged.
 //
 // Form restrictions (everything else declines, ending IR consumption there):
 //   - 8/16-bit operands → decline (partial-register / partial-width RMW)
@@ -709,7 +718,7 @@ static IROperandSize guest_mem_size(const IROperand& m) {
 //     pure no-op and is consumed without emitting a node
 static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
     if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
-    if (instr->flag_liveness != 0) return false;
+    if (instr->flag_liveness & kEflagsArith) return false;
     if (instr->num_operands < 2) return false;
     const IROperand& dst = instr->operands[0];
     const IROperand& src = instr->operands[1];
@@ -793,6 +802,61 @@ static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
     p.dst = dst.reg.reg.index();
     p.is64 = is64;
     p.imm = imm;
+    auto id = ctx.add_node(Op::GuestAluRI);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    ctx.nodes[id].aux = static_cast<uint64_t>(alu);
+    ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+    mem_cse_evict_reg(ctx, p.dst);
+    return true;
+}
+
+// ── Unary ALU forms: inc/dec/neg r (TRANSPARENT_FLAGS), not r (INT tier) ────
+//
+// Register-destination forms of the alu-unary family only (mem/abs/RIP-RMW
+// destinations decline and stay bridge-only — the family is audited for
+// bridging). Per-form liveness gates:
+//   inc/dec — define OF/SF/ZF/AF/PF but PRESERVE CF, so consumption only
+//     needs those five dead; CF may stay live (the flag-free ADD/SUB
+//     lowering leaves guest CF in host NZCV untouched, exactly matching
+//     x86 inc/dec semantics — Rosetta's own translation makes the same
+//     bet, emitting flag-clobbering SUBS when fl & FLAG_CF == 0).
+//   neg — defines all arithmetic flags (CF = src != 0) → kEflagsArith gate.
+//   not — writes NO flags: no gate at all, and only TRANSPARENT_INT
+//     (flag-neutral like mov/lea, no reason to require the FLAGS tier).
+// 8/16-bit forms decline (partial-register merge). LOCK (rep_prefix) can
+// only reach the mem forms, which decline anyway.
+static bool build_guest_unary(Context& ctx, IRInstr* instr, uint16_t op) {
+    const bool is_not = (op == kOpcodeName_not);
+    if (is_not) {
+        if (!(g_rosetta_config && g_rosetta_config->transparent_int))
+            return false;
+    } else {
+        if (!(g_rosetta_config && g_rosetta_config->transparent_flags))
+            return false;
+        const uint8_t defined =
+            (op == kOpcodeName_neg)
+                ? kEflagsArith
+                : static_cast<uint8_t>(kEflagsArith & ~FLAG_CF);
+        if (instr->flag_liveness & defined) return false;
+    }
+    if (instr->num_operands < 1) return false;
+    const IROperand& dst = instr->operands[0];
+    if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr())
+        return false;
+    const bool is64 = dst.reg.size == IROperandSize::S64;
+    if (!is64 && dst.reg.size != IROperandSize::S32) return false;
+
+    GuestPayload p = {};
+    p.dst = dst.reg.reg.index();
+    p.is64 = is64;
+    GuestAlu alu;
+    switch (op) {
+        case kOpcodeName_inc: alu = GuestAlu::Add; p.imm = 1; break;
+        case kOpcodeName_dec: alu = GuestAlu::Sub; p.imm = 1; break;
+        case kOpcodeName_neg: alu = GuestAlu::Neg; break;
+        default:              alu = GuestAlu::Not; break;
+    }
     auto id = ctx.add_node(Op::GuestAluRI);
     if (id < 0) return false;
     ctx.nodes[id].imm_bits = guest_pack(p);
@@ -1559,6 +1623,14 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_shr:
             case kOpcodeName_sar:
                 ok = build_guest_alu(ctx, instr, op);
+                break;
+
+            // ── Unary ALU forms (inc/dec/neg: FLAGS tier; not: INT tier) ─
+            case kOpcodeName_inc:
+            case kOpcodeName_dec:
+            case kOpcodeName_neg:
+            case kOpcodeName_not:
+                ok = build_guest_unary(ctx, instr, op);
                 break;
 
             // ── push/pop (opt-in TRANSPARENT_PUSHPOP) ───────────────────

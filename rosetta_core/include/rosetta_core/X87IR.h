@@ -141,9 +141,11 @@ enum class Op : uint8_t {
     GuestStoreI,    // store immediate to [mem]
 
     // Flag-writing ALU forms (opt-in ROSETTA_X87_TRANSPARENT_FLAGS), consumed
-    // only when Rosetta's flag-liveness analysis proves the written EFLAGS
-    // dead (IRInstr::flag_liveness == 0). Lowerings are flag-free A64.
-    GuestAluRI,     // add/sub/and/or/xor r32/r64, imm; shl/shr/sar r32/r64, imm
+    // only when Rosetta's flag-liveness analysis proves the EFLAGS this
+    // instruction defines dead (per-form mask against IRInstr::flag_liveness;
+    // inc/dec preserve CF so CF may stay live). Lowerings are flag-free A64.
+    GuestAluRI,     // add/sub/and/or/xor r32/r64, imm; shl/shr/sar r32/r64, imm;
+                    // inc/dec r (imm=1); neg r; not r (flag-neutral, INT tier)
                     // (payload in imm_bits, GuestAlu selector in aux)
     GuestRmwR,      // {add,sub,and,or,xor} [m32/m64], r — load/ALU/store
                     // (mem_operand + aux: bits[3:0] src reg, bits[6:4] GuestAlu)
@@ -161,7 +163,10 @@ enum class Op : uint8_t {
 };
 
 // ALU sub-op selector for GuestAluRI (whole aux) and GuestRmwR (aux[6:4]).
-enum class GuestAlu : uint8_t { Add = 0, Sub, And, Or, Xor, Shl, Shr, Sar };
+// GuestRmwR's 3-bit field only ever carries Add..Xor; the unary selectors
+// (Neg = SUB from XZR, Not = ORN from XZR) are GuestAluRI-only.
+enum class GuestAlu : uint8_t { Add = 0, Sub, And, Or, Xor, Shl, Shr, Sar,
+                                Neg, Not };
 
 enum NodeFlags : uint8_t {
     kNone         = 0,

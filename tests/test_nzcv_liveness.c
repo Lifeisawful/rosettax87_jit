@@ -112,7 +112,30 @@ static int inc_cf_dead(void) {
     return out;
 }
 
+/* x87 instructions in the post-run tail are EFLAGS-neutral: the run breaks
+   at the fstpt (m80 store — the IR declines it), the walk crosses it and
+   reaches the test (full definer) — elision may fire; result must be exact. */
+static int x87_tail_elision(void) {
+    int out;
+    unsigned char t80[10];
+    __asm__ volatile(
+        "fldl   (%2)\n\t"          /* 1.5 */
+        "fldl   8(%2)\n\t"         /* 2.5 */
+        "fcompp\n\t"               /* 2.5 vs 1.5 → above: C0=C2=C3=0 */
+        "fnstsw %%ax\n\t"
+        "fldl   (%2)\n\t"
+        "fstpt  %1\n\t"            /* m80 store: run ends here */
+        "testb  $0x45, %%ah\n\t"
+        "sete   %%al\n\t"          /* above → all CC clear → 1 */
+        "movzbl %%al, %0\n\t"
+        : "=r"(out), "=m"(t80)
+        : "r"(vals)
+        : "ax", "cc", "memory");
+    return out;
+}
+
 int main(void) {
+    CHECK("x87_tail_elision", x87_tail_elision() == 1, x87_tail_elision());
     CHECK("pre_cf_survives_inc_b", pre_cf_survives_inc(0) == 1, pre_cf_survives_inc(0));
     CHECK("pre_cf_survives_inc_ae", pre_cf_survives_inc(5) == 0, pre_cf_survives_inc(5));
     CHECK("pre_of_survives_sahf_o", pre_of_survives_sahf((int)0x80000000) == 1,

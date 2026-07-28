@@ -277,6 +277,75 @@ static uint32_t nonencodable_and(uint32_t x, double *a) {
     return r;
 }
 
+/* ── Stage 3: unary ALU forms (inc/dec/neg r; not r on the INT tier) ──────── */
+
+/* inc/dec/neg/not chained mid-run; flags die at the trailing test.
+ * Net effect: inc,dec,neg,not,inc == identity (~(-x) = x-1). */
+static uint32_t unary_chain(uint32_t x, double *d) {
+    uint32_t r = x;
+    __asm__ volatile(
+        "fldl (%2)\n"
+        "incl %0\n"
+        "fabs\n"
+        "decl %0\n"
+        "fchs\n"
+        "negl %0\n"
+        "fldl 8(%2)\n"
+        "notl %0\n"
+        "faddp\n"
+        "incl %0\n"
+        "fstpl (%2)\n"
+        "testl %0, %0\n"
+        : "+r"(r) : "r"(d) : "memory", "cc");
+    return r;
+}
+
+/* inc consumed WITH CF live across it (the per-form gate: inc preserves CF,
+ * so only OF/SF/ZF/AF/PF need be dead — they die at the trailing test).
+ * The setc reads the PRE-inc CF from the cmp. */
+static uint32_t inc_preserves_cf(uint32_t x, double *d) {
+    uint32_t cnt = 7, out;
+    __asm__ volatile(
+        "cmpl $1, %2\n"        /* CF = (x < 1) */
+        "fldl (%3)\n"
+        "incl %1\n"            /* consumable: CF flows through */
+        "fchs\n"
+        "fstpl (%3)\n"
+        "setc %%al\n"          /* reads the cmp's CF */
+        "movzbl %%al, %0\n"
+        "testl %1, %1\n"       /* full definer: kills ret's all-live seed */
+        : "=r"(out), "+r"(cnt) : "r"(x), "r"(d) : "eax", "memory", "cc");
+    return out | (cnt << 8);
+}
+
+/* Flags LIVE: setz reads neg's ZF — must decline and materialize ZF=1. */
+static uint32_t flags_live_neg(double *a) {
+    uint32_t r;
+    __asm__ volatile(
+        "movl $0, %%eax\n"
+        "fldl (%1)\n"
+        "negl %%eax\n"         /* ZF=1 (neg of 0) — read below, NOT dead */
+        "fchs\n"
+        "fstpl (%1)\n"
+        "setz %%al\n"
+        "movzbl %%al, %0\n"
+        : "=r"(r) : "r"(a) : "eax", "memory", "cc");
+    return r;  /* 1 iff the neg's ZF survived */
+}
+
+/* Memory-destination inc: declined (stays bridged/native), semantics hold. */
+static uint32_t inc_mem_declines(double *a) {
+    uint32_t m = 41;
+    __asm__ volatile(
+        "fldl (%1)\n"
+        "incl %0\n"            /* mem-dest — not consumable */
+        "fchs\n"
+        "fstpl (%1)\n"
+        "testl $1, %0\n"
+        : "+m"(m) : "r"(a) : "memory", "cc");
+    return m;
+}
+
 int main(void) {
     float v[4] = {2.0f, 3.0f, 4.0f, 55.5f};
     uint32_t z = 0x12345678;
@@ -353,8 +422,31 @@ int main(void) {
         check_u("  (fchs applied)", dv == -8.0, 1);
     }
 
+    /* ── Stage 3 ── */
+    {
+        double dd[2] = {2.0, 3.0};
+        check_u("unary chain inc/dec/neg/not mid-run", unary_chain(12345, dd), 12345);
+        /* |2.0| → fchs → -2.0; -2.0 + 3.0 = 1.0 */
+        check_u("  (fp results intact)", dd[0] == 1.0 && dd[1] == 3.0, 1);
+    }
+    {
+        double dv = 5.0;
+        check_u("inc consumed with CF live (borrow)", inc_preserves_cf(0, &dv), 0x801);
+        check_u("inc consumed with CF live (no borrow)", inc_preserves_cf(5, &dv), 0x800);
+    }
+    {
+        double dv = 9.0;
+        check_u("flags live: setz observes neg's ZF=1", flags_live_neg(&dv), 1);
+        check_u("  (fchs applied)", dv == -9.0, 1);
+    }
+    {
+        double dv = 1.0;
+        check_u("inc [m] declines, semantics hold", inc_mem_declines(&dv), 42);
+        check_u("  (fchs applied)", dv == -1.0, 1);
+    }
+
     if (failures == 0)
-        printf("ALL TESTS PASSED (25 tests)\n");
+        printf("ALL TESTS PASSED (33 tests)\n");
     else
         printf("%d TESTS FAILED\n", failures);
     return failures != 0;

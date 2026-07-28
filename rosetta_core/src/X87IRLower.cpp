@@ -326,7 +326,22 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
         !(g_rosetta_config && g_rosetta_config->disable_nzcv_liveness);
     for (int64_t i = end_idx; i < num_instrs; i++) {
         const uint8_t fl = instr_array[i].flag_liveness;
-        switch (instr_array[i].opcode()) {
+        const uint16_t op = instr_array[i].opcode();
+        // x87 instructions (unconsumed ones end up in the tail: declined
+        // forms, runtime-routine ops like fprem) never touch EFLAGS — walk
+        // across them. The two exceptions live OUTSIDE this enum cluster:
+        // the fcomi family fully redefines EFLAGS (ZF/PF/CF from the
+        // compare, OF/SF/AF cleared) and the fcmov family READS cc flags
+        // (stays at the conservative default below).
+        static_assert(kOpcodeName_f2xm1 < kOpcodeName_fld &&
+                          kOpcodeName_fld < kOpcodeName_fyl2xp1 &&
+                          kOpcodeName_fcomi < kOpcodeName_f2xm1,
+                      "x87 opcode cluster moved — revisit the range walk");
+        if (op >= kOpcodeName_f2xm1 && op <= kOpcodeName_fyl2xp1) continue;
+        if (op == kOpcodeName_fcomi || op == kOpcodeName_fcomip ||
+            op == kOpcodeName_fucomi || op == kOpcodeName_fucomip)
+            return true;
+        switch (op) {
             // Full EFLAGS definers (write SF/ZF/CF/OF/PF; AF at worst
             // architecturally undefined): pre-run flags die here.
             case kOpcodeName_and:
@@ -411,6 +426,9 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
             case kOpcodeName_cvtsd2ss:
             case kOpcodeName_cvttss2si:
             case kOpcodeName_cvttsd2si:
+            // fwait checks unmodeled FP exceptions; Rosetta translates it to
+            // nothing (same disposition as build_guest_int's consumption).
+            case kOpcodeName_wait:
                 continue;
             default:
                 return false;  // reader / partial definer / unknown
@@ -828,6 +846,18 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                                   static_cast<int8_t>(bits - 1), p.dst, p.dst);
                     break;
                 }
+                case GuestAlu::Neg:
+                    // NEG Rd == SUB Rd, ZR, Rd
+                    emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/1, 0,
+                                             /*LSL*/0, p.dst, 0, GPR::XZR,
+                                             p.dst);
+                    break;
+                case GuestAlu::Not:
+                    // MVN Rd == ORN Rd, ZR, Rd
+                    emit_logical_shifted_reg(buf, is64, /*ORR*/1, /*n=*/1,
+                                             /*LSL*/0, p.dst, 0, GPR::XZR,
+                                             p.dst);
+                    break;
             }
             break;
         }
