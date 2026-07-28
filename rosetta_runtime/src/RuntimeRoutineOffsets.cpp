@@ -61,6 +61,7 @@ extern char stub_f2xm1_val[];
 extern char stub_fscale_val[];
 extern char stub_fyl2x_val[];
 extern char stub_fyl2xp1_val[];
+extern char stub_fpatan_val[];
 extern char stub_fsin_fast[];
 extern char stub_fsin_val[];
 extern char stub_fsincos_fast[];
@@ -310,6 +311,7 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
     const bool fscale_val = trig_ir_fscale_enabled(kConfig);
     const bool fyl2x_val = trig_ir_fyl2x_enabled(kConfig);
     const bool fyl2xp1_val = trig_ir_fyl2xp1_enabled(kConfig);
+    const bool fpatan_val = trig_ir_fpatan_enabled(kConfig);
     if (f2xm1_val)
         route(kRuntimeRoutine_f2xm1, stub_f2xm1_val, /*disabled=*/0);
     if (fscale_val)
@@ -318,10 +320,12 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
         route(kRuntimeRoutine_fyl2x, stub_fyl2x_val, /*disabled=*/0);
     if (fyl2xp1_val)
         route(kRuntimeRoutine_fyl2xp1, stub_fyl2xp1_val, /*disabled=*/0);
+    if (fpatan_val)
+        route(kRuntimeRoutine_fpatan, stub_fpatan_val, /*disabled=*/0);
 
     CORE_LOG("register_runtime_routine_offsets: rewrote %d/%d offsets to our stubs "
              "(fcos=%s fsin=%s fsincos=%s fptan=%s f2xm1=%s fscale=%s fyl2x=%s "
-             "fyl2xp1=%s)",
+             "fyl2xp1=%s fpatan=%s)",
              n, count,
              fcos_val ? "val" : (kConfig.disable_fcos_fast ? "classic" : "fast"),
              fsin_val ? "val" : (kConfig.disable_fsin_fast ? "classic" : "fast"),
@@ -330,5 +334,6 @@ void rewrite_runtime_routine_offsets(intptr_t* offsets, int32_t count) {
              f2xm1_val ? "val" : "classic",
              fscale_val ? "val" : "classic",
              fyl2x_val ? "val" : "classic",
-             fyl2xp1_val ? "val" : "classic");
+             fyl2xp1_val ? "val" : "classic",
+             fpatan_val ? "val" : "classic");
 }

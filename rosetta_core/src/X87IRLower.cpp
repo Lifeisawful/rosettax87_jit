@@ -1053,17 +1053,18 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::F2XM1Call:
         case Op::FScaleCall:
         case Op::FYl2xCall:
-        case Op::FYl2xp1Call: {
+        case Op::FYl2xp1Call:
+        case Op::FPatanCall: {
             int Dn = fprs.get(n.inputs[0]);
             int Dd = fprs.try_reuse_input(ctx, i);
             if (Dd < 0) Dd = alloc_free_fpr(*result);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             // v16 is excluded from the pool for runs containing these nodes
             // (compile_run), so Dn/Dd are never d16 and the moves are real.
-            // FScaleCall/FYl2xCall/FYl2xp1Call also exclude v17 and pass
-            // ST(1) there.
+            // FScaleCall/FYl2xCall/FYl2xp1Call/FPatanCall also exclude v17
+            // and pass ST(1) there.
             if (n.op == Op::FScaleCall || n.op == Op::FYl2xCall ||
-                n.op == Op::FYl2xp1Call) {
+                n.op == Op::FYl2xp1Call || n.op == Op::FPatanCall) {
                 int Dm = fprs.get(n.inputs[1]);
                 if (Dm != 17)
                     emit_fp_dp1(buf, /*type=*/1, /*FMOV=*/0, /*Dd=*/17, Dm);
@@ -1080,6 +1081,7 @@ void lower(Context& ctx, TranslationResult* result) {
                            : (n.op == Op::FScaleCall)   ? kRuntimeRoutine_fscale
                            : (n.op == Op::FYl2xCall)    ? kRuntimeRoutine_fyl2x
                            : (n.op == Op::FYl2xp1Call)  ? kRuntimeRoutine_fyl2xp1
+                           : (n.op == Op::FPatanCall)   ? kRuntimeRoutine_fpatan
                                                         : kRuntimeRoutine_fsincos;
             result->_fixups.push_back(fixup);       // routed to _stub_*_val
             buf.emit(0x94000000u);
@@ -1093,7 +1095,7 @@ void lower(Context& ctx, TranslationResult* result) {
             // (classic helper parity).
             if (n.op != Op::F2XM1Call) {
                 const bool c1_only = (n.op == Op::FScaleCall || n.op == Op::FYl2xCall ||
-                                      n.op == Op::FYl2xp1Call);
+                                      n.op == Op::FYl2xp1Call || n.op == Op::FPatanCall);
                 const int immr = c1_only ? 22 : 21;
                 const int imms = c1_only ? 30 : 29;
                 int Wd = alloc_free_gpr(*result);
@@ -1865,7 +1867,7 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         // status effect but keep the estimate uniform and safe)
         case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
         case Op::FSinCosCall: case Op::F2XM1Call: case Op::FScaleCall:
-        case Op::FYl2xCall: case Op::FYl2xp1Call:
+        case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
             transient = 1;
             break;
 
@@ -2038,7 +2040,7 @@ int peak_live_fprs(const Context& ctx) {
             case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
             case Op::FSinCosCall: case Op::FSinCosProjCos:
             case Op::F2XM1Call: case Op::FScaleCall:
-            case Op::FYl2xCall: case Op::FYl2xp1Call:
+            case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
             case Op::FCSel:
             case Op::CvtF32ToF64: case Op::CvtF64ToF32:
                 produces_fpr = true;
@@ -2145,7 +2147,8 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
             op == Op::F2XM1Call)
             has_fcos_call = true;
         else if (op == Op::FSinCosCall || op == Op::FScaleCall ||
-                 op == Op::FYl2xCall || op == Op::FYl2xp1Call)
+                 op == Op::FYl2xCall || op == Op::FYl2xp1Call ||
+                 op == Op::FPatanCall)
             has_fcos_call = has_sincos_call = true;
     }
     const uint32_t fpr_mask_before_v16_excl = result->free_fpr_mask;

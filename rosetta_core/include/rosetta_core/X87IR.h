@@ -87,6 +87,12 @@ enum class Op : uint8_t {
     FYl2xCall,
     FYl2xp1Call,
 
+    // FPatanCall = atan2(inputs[1], inputs[0]) via `BL _stub_fpatan_val`
+    // (d16 = ST(0) = x in/out, d17 = ST(1) = y in, consumed).  Same popping
+    // 2-input shape and rules as FYl2xCall (slot_val[1] + pop in build(),
+    // C1 cleared inline, v16+v17 pool-excluded).
+    FPatanCall,
+
     // Conditional select (FCMOV): inputs[0]=ST(0) false arm, inputs[1]=ST(i) true arm
     // imm_bits[3:0] = AArch64 condition code
     FCSel,

@@ -176,6 +176,27 @@ int regs_survive_fyl2x(void) {
            x0 == 1.5 && x1 == -2.5 && x2 == 3.25 && x3 == 1e300;
 }
 
+/* Guest GPRs and XMM registers must survive the fpatan value stub
+ * (it saves q18-q21 + x24-x27/x29 itself). */
+int regs_survive_fpatan(void) {
+    volatile double x = 3.0, y = 4.0;
+    double sink;
+    uint64_t g0 = 0x1122334455667788ULL, g1 = 0x99AABBCCDDEEFF00ULL;
+    uint64_t g2 = 0xDEADBEEFCAFEBABEULL, g3 = 0x0123456789ABCDEFULL;
+    double x0 = 1.5, x1 = -2.5, x2 = 3.25, x3 = 1e300;
+    __asm__ volatile(
+        "fldl %9\n\t"
+        "fldl %8\n\t"
+        "fpatan\n\t"
+        "fstpl %10\n"
+        : "+r"(g0), "+r"(g1), "+r"(g2), "+r"(g3),
+          "+x"(x0), "+x"(x1), "+x"(x2), "+x"(x3)
+        : "m"(x), "m"(y), "m"(sink));
+    return g0 == 0x1122334455667788ULL && g1 == 0x99AABBCCDDEEFF00ULL &&
+           g2 == 0xDEADBEEFCAFEBABEULL && g3 == 0x0123456789ABCDEFULL &&
+           x0 == 1.5 && x1 == -2.5 && x2 == 3.25 && x3 == 1e300;
+}
+
 /* EFLAGS must survive fcos (both the fast path and the huge fallback). */
 int flags_survive(double arg) {
     int ok;
@@ -836,6 +857,101 @@ int main(void) {
                   pow(3.7, 2.6));
     }
     check_true("GPRs + XMM survive fyl2x", regs_survive_fyl2x());
+
+    /* ================= FPATAN ================= */
+    {
+        /* all four quadrants + the x == 1.0 fast path vs libm atan2 */
+        static const double cs[][2] = {
+            /* x, y */
+            { 3.0, 4.0 }, { -3.0, 4.0 }, { -3.0, -4.0 }, { 3.0, -4.0 },
+            { 1.0, 0.6 }, { 1.0, -2.5 },      /* x == 1: atan(y) path */
+            { 0.3, 0.2 }, { 5.0, 0.001 },     /* small-ratio kernel band */
+            { 0.5, 0.4 }, { 1.0, 1.0 },       /* reduction bands */
+            { 1e-300, 1e300 }, { 1e300, 1e-300 },  /* k>60 / k<-60 gaps */
+            { -1e-300, 1e300 }, { -1e300, 1e-300 },
+        };
+        for (int i = 0; i < 14; i++) {
+            volatile double x = cs[i][0], y = cs[i][1];
+            double r;
+            __asm__ volatile(
+                "fldl %2\n\t fldl %1\n\t fpatan\n\t fstpl %0\n"
+                : "=m"(r) : "m"(x), "m"(y));
+            check_tol("fpatan quadrants", r, atan2(cs[i][1], cs[i][0]));
+        }
+    }
+    {
+        /* IEEE-pinned zero results: atan2(+-0, x>0) = +-0,
+         * atan2(+-y finite, +Inf) = +-0 */
+        struct { double x, y; uint64_t want; } zc[] = {
+            { 2.0, 0.0, 0x0000000000000000ULL },
+            { 2.0, -0.0, 0x8000000000000000ULL },
+            { __builtin_inf(), 5.0, 0x0000000000000000ULL },
+            { __builtin_inf(), -5.0, 0x8000000000000000ULL },
+        };
+        for (int i = 0; i < 4; i++) {
+            volatile double x = zc[i].x, y = zc[i].y;
+            double r;
+            __asm__ volatile(
+                "fldl %2\n\t fldl %1\n\t fpatan\n\t fstpl %0\n"
+                : "=m"(r) : "m"(x), "m"(y));
+            check_true("fpatan signed-zero result", as_u64(r) == zc[i].want);
+        }
+    }
+    {
+        /* pi-family specials (value-checked, not bit-checked, for native
+         * headroom): +-pi/2, +-pi, +-pi/4, +-3pi/4 */
+        struct { double x, y, want; } pc[] = {
+            { 0.0, 3.0, 1.5707963267948966 },
+            { 0.0, -3.0, -1.5707963267948966 },
+            { -2.0, 0.0, 3.141592653589793 },
+            { -2.0, -0.0, -3.141592653589793 },
+            { __builtin_inf(), __builtin_inf(), 0.7853981633974483 },
+            { -__builtin_inf(), __builtin_inf(), 2.356194490192345 },
+            { -__builtin_inf(), -__builtin_inf(), -2.356194490192345 },
+            { -__builtin_inf(), 7.0, 3.141592653589793 },
+        };
+        for (int i = 0; i < 8; i++) {
+            volatile double x = pc[i].x, y = pc[i].y;
+            double r;
+            __asm__ volatile(
+                "fldl %2\n\t fldl %1\n\t fpatan\n\t fstpl %0\n"
+                : "=m"(r) : "m"(x), "m"(y));
+            check_tol("fpatan pi-family special", r, pc[i].want);
+        }
+    }
+    {
+        volatile double x = __builtin_nan(""), y = 1.0;
+        double r;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fpatan\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fpatan(NaN x) is NaN", isnan(r));
+        x = 1.5; y = __builtin_nan("");
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fpatan\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fpatan(NaN y) is NaN", isnan(r));
+    }
+    {
+        /* pop coherence + in-run with live values:
+         * c1 * atan2(y, x) + c0, with a guard below everything */
+        volatile double x = 3.0, y = 4.0, c0 = 0.5, c1 = 2.0, guard = 91.25;
+        double r, g;
+        __asm__ volatile(
+            "fldl %6\n\t"   /* guard                       */
+            "fldl %5\n\t"   /* c1    guard                 */
+            "fldl %3\n\t"   /* y     c1     guard          */
+            "fldl %2\n\t"   /* x     y      c1     guard   */
+            "fpatan\n\t"    /* z     c1     guard          */
+            "fmulp\n\t"     /* z*c1  guard                 */
+            "fldl %4\n\t"
+            "faddp\n\t"     /* z*c1+c0  guard              */
+            "fstpl %0\n\t"
+            "fstpl %1\n"
+            : "=m"(r), "=m"(g)
+            : "m"(x), "m"(y), "m"(c0), "m"(c1), "m"(guard));
+        check_tol("fpatan run: 2*atan2(4,3)+0.5", r, 2.0 * atan2(4.0, 3.0) + 0.5);
+        check_bits("fpatan run: deep guard intact", g, 91.25);
+    }
+    check_true("GPRs + XMM survive fpatan", regs_survive_fpatan());
 
 
     printf("================================\n");

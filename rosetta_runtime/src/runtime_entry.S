@@ -2009,6 +2009,369 @@ Llog2v_log2e:
     .quad 0x3FF71547652B82FE         // log2(e)
 
 // -----------------------------------------------------------------------------
+// FPATAN value call: d16 = ST(0) = x, d17 = ST(1) = y (consumed);
+// d16 = atan2(y, x).  Popping value call like fyl2x — the ST(1) store, pop
+// and C1 clear live in the JIT; no C fallback leg, no SIMDGuard.
+//
+// openlibm e_atan2 + s_atan ported from the COMPILED classic helper
+// (post-LTO x87_fpatan) so both paths give bit-identical results:
+//   - the reduction quotients keep clang's contractions (2x-1 and 1+1.5x as
+//     FMADD), the polynomial is the same fmadd chain, and the tails are the
+//     contracted forms FMSUB(x - x*(s1+s2)) / FNMSUB(x*(s1+s2) - atanlo[id]),
+//   - special-path arithmetic keeps the compiled operand order:
+//     (pi_lo - z) + pi, (z - pi_lo) + (-pi), atanlo[3] + atanhi[3],
+//     (-pi/2) - atanlo[3], tiny + pi, (-pi) - tiny, etc.,
+//   - the small-|x| leg performs the (dead-valued) huge+x add so INEXACT
+//     reaches FPSR exactly like the classic path, and NaN operands return
+//     x + y in that operand order,
+//   - LTO's dead branches are NOT reproduced: the second atan kernel's
+//     >= 2^66 / sign legs are unreachable (the quotient is |y/x| with
+//     exponent gap <= 60) and the huge+x <= 1.0 fcmp can never be taken.
+// Control flow is re-expressed flag-free (sub + tbz/tbnz/cbz on integer
+// bits — the compiled code's fcmp/ccmp/fcsel would clobber NZCV, which
+// translated code may hold live).  Saves q18-q21 + x24-x27/x29 as singles.
+// -----------------------------------------------------------------------------
+
+// atan kernel: d16 = atan(d16), x27 = bits of the argument (sign source).
+// Clobbers d18-d21, x26, x29.  Mirrors the compiled s_atan inlining; the
+// >= 2^66 leg is live only for instantiation 1 (x == 1.0 -> atan(y)).
+.macro ATAN_VAL_KERNEL name
+    ubfx x26, x27, #32, #31          // i31 = high word of |arg|
+    mov  w29, #0x44100000
+    sub  x29, x26, x29
+    tbz  x29, #63, L\name\()_big     // |arg| >= 2^66
+    mov  w29, #0x3fdc0000
+    sub  x29, x26, x29
+    tbz  x29, #63, L\name\()_reduce  // |arg| >= 0.4375
+    // |arg| < 0.4375: id = -1, arg unchanged.  huge+arg raises INEXACT
+    // (classic parity — the compiled code performs it on this whole leg).
+    ldr  d18, Latanv_huge
+    fadd d18, d16, d18
+    mov  w29, #0x3e400000
+    sub  x29, x26, x29
+    tbnz x29, #63, L\name\()_done    // |arg| < 2^-27: atan(arg) = arg
+    mov  x26, #-1                    // id = -1
+    b    L\name\()_poly
+L\name\()_reduce:
+    fabs d16, d16
+    mov  w29, #0x3ff30000
+    sub  x29, x26, x29
+    tbnz x29, #63, L\name\()_lo      // |arg| < 1.1875
+    mov  w29, #0x8000
+    movk w29, #0x4003, lsl #16       // 0x40038000
+    sub  x29, x26, x29
+    tbz  x29, #63, L\name\()_id3     // |arg| >= 2.4375
+    fmov d18, #-1.5                  // id = 2: (x-1.5)/(1+1.5x)
+    fadd d18, d16, d18
+    fmov d19, #1.0
+    fmov d20, #1.5
+    fmadd d16, d16, d20, d19
+    fdiv d16, d18, d16
+    mov  x26, #2
+    b    L\name\()_poly
+L\name\()_id3:
+    fmov d18, #-1.0                  // id = 3: -1/x
+    fdiv d16, d18, d16
+    mov  x26, #3
+    b    L\name\()_poly
+L\name\()_lo:
+    mov  w29, #0x3fe60000
+    sub  x29, x26, x29
+    tbnz x29, #63, L\name\()_id0     // |arg| < 0.6875
+    fmov d18, #-1.0                  // id = 1: (x-1)/(x+1)
+    fadd d18, d16, d18
+    fmov d19, #1.0
+    fadd d16, d16, d19
+    fdiv d16, d18, d16
+    mov  x26, #1
+    b    L\name\()_poly
+L\name\()_id0:
+    fmov d18, #-1.0                  // id = 0: (2x-1)/(2+x)
+    fmov d19, #2.0
+    fmadd d18, d16, d19, d18
+    fadd d16, d16, d19
+    fdiv d16, d18, d16
+    mov  x26, #0
+L\name\()_poly:
+    fmul d18, d16, d16               // z
+    fmul d19, d18, d18               // w = z*z
+    // s1 = z*(aT0+w*(aT2+w*(aT4+w*(aT6+w*(aT8+w*aT10)))))
+    ldr  d20, Latanv_aT8
+    ldr  d21, Latanv_aT10
+    fmadd d20, d19, d21, d20
+    ldr  d21, Latanv_aT6
+    fmadd d20, d19, d20, d21
+    ldr  d21, Latanv_aT4
+    fmadd d20, d19, d20, d21
+    ldr  d21, Latanv_aT2
+    fmadd d20, d19, d20, d21
+    ldr  d21, Latanv_aT0
+    fmadd d20, d19, d20, d21
+    fmul d18, d18, d20               // s1
+    // s2 = w*(aT1+w*(aT3+w*(aT5+w*(aT7+w*aT9))))
+    ldr  d20, Latanv_aT7
+    ldr  d21, Latanv_aT9
+    fmadd d20, d19, d21, d20
+    ldr  d21, Latanv_aT5
+    fmadd d20, d19, d20, d21
+    ldr  d21, Latanv_aT3
+    fmadd d20, d19, d20, d21
+    ldr  d21, Latanv_aT1
+    fmadd d20, d19, d20, d21
+    fmul d19, d19, d20               // s2
+    tbnz x26, #63, L\name\()_noid
+    // id >= 0: atanhi[id] - ((x*(s1+s2) - atanlo[id]) - x), negated for
+    // a negative original argument
+    fadd d18, d19, d18               // s2 + s1
+    adr  x29, Latanv_atanhi
+    ldr  d20, [x29, x26, lsl #3]
+    adr  x29, Latanv_atanlo
+    ldr  d21, [x29, x26, lsl #3]
+    fnmsub d18, d16, d18, d21        // x*(s1+s2) - atanlo[id]
+    fsub d18, d18, d16               // ... - x
+    fsub d16, d20, d18               // atanhi[id] - ...
+    tbz  x27, #63, L\name\()_done
+    fneg d16, d16
+    b    L\name\()_done
+L\name\()_noid:
+    fadd d18, d19, d18               // s2 + s1
+    fmsub d16, d16, d18, d16         // x - x*(s1+s2)
+    b    L\name\()_done
+L\name\()_big:
+    // |arg| >= 2^66 (never NaN here): +-(atanhi[3] + atanlo[3]), with the
+    // compiled operand orders per sign
+    ldr  d16, Latanv_atanlo3
+    tbnz x27, #63, L\name\()_bigneg
+    ldr  d18, Latanv_pio2
+    fadd d16, d16, d18               // atanlo[3] + atanhi[3]
+    b    L\name\()_done
+L\name\()_bigneg:
+    ldr  d18, Latanv_mpio2
+    fsub d16, d18, d16               // (-pi/2) - atanlo[3]
+L\name\()_done:
+.endm
+
+.globl _stub_fpatan_val
+_stub_fpatan_val:
+    sub  sp, sp, #0x70
+    str  q18, [sp]
+    str  q19, [sp, #0x10]
+    str  q20, [sp, #0x20]
+    str  q21, [sp, #0x30]
+    stp  x24, x25, [sp, #0x40]
+    stp  x26, x27, [sp, #0x50]
+    str  x29, [sp, #0x60]
+    fmov x27, d16                    // bits(x)
+    fmov x25, d17                    // bits(y)
+    // NaN operands -> x + y (same operand order as the classic helper)
+    and  x29, x27, #0x7FFFFFFFFFFFFFFF
+    mov  x26, #0x7FF0000000000000
+    sub  x29, x26, x29               // < 0 iff x is NaN
+    tbnz x29, #63, Lfpatanv_nan
+    and  x29, x25, #0x7FFFFFFFFFFFFFFF
+    sub  x29, x26, x29               // < 0 iff y is NaN
+    tbnz x29, #63, Lfpatanv_nan
+    // x == 1.0: atan2(y, 1) = atan(y)
+    mov  x29, #0x3FF0000000000000
+    sub  x29, x27, x29
+    cbnz x29, Lfpatanv_gen
+    fmov d16, d17
+    mov  x27, x25
+    ATAN_VAL_KERNEL fpatanv1
+    b    Lfpatanv_ret
+Lfpatanv_gen:
+    // m = 2*sign(x) + sign(y)
+    lsr  x24, x27, #63
+    lsl  x24, x24, #1
+    orr  x24, x24, x25, lsr #63
+    // y == +-0
+    lsl  x29, x25, #1
+    cbz  x29, Lfpatanv_y0
+    // x == +-0 (y != 0): +-(pi/2 + tiny) by sign of y
+    lsl  x29, x27, #1
+    cbz  x29, Lfpatanv_pmhalfpi
+    // x == +-Inf
+    and  x29, x27, #0x7FFFFFFFFFFFFFFF
+    mov  x26, #0x7FF0000000000000
+    sub  x29, x29, x26
+    cbz  x29, Lfpatanv_xinf
+    // y == +-Inf (x finite): +-(pi/2 + tiny)
+    and  x29, x25, #0x7FFFFFFFFFFFFFFF
+    sub  x29, x29, x26
+    cbz  x29, Lfpatanv_pmhalfpi
+    // exponent-gap classification on the 31-bit high words
+    ubfx x29, x25, #32, #31          // iy31
+    ubfx x26, x27, #32, #31          // ix31
+    sub  x29, x29, x26               // iy31 - ix31 (exact in 64-bit)
+    mov  w26, #0x3d00000
+    sub  x26, x29, x26
+    tbz  x26, #63, Lfpatanv_k60      // k > 60: z = pi/2 + 0.5*pi_lo, m &= 1
+    tbz  x27, #63, Lfpatanv_quot     // x > 0: straight to the quotient
+    mov  w26, #0x3c00000
+    add  x26, x29, x26
+    tbnz x26, #63, Lfpatanv_z0       // x < 0, k < -60: z = 0
+Lfpatanv_quot:
+    fdiv d16, d17, d16               // y/x
+    fabs d16, d16
+    fmov x27, d16                    // |y/x| bits (kernel sign leg dead)
+    ATAN_VAL_KERNEL fpatanv2
+    b    Lfpatanv_mswitch
+Lfpatanv_k60:
+    ldr  d18, Latanv_pilo
+    fmov d19, #0.5
+    ldr  d16, Latanv_pio2
+    fmadd d16, d18, d19, d16         // z = 0.5*pi_lo + pi/2
+    and  x24, x24, #1
+    b    Lfpatanv_mswitch
+Lfpatanv_z0:
+    fmov d16, xzr
+Lfpatanv_mswitch:
+    // m: 0 -> z; 1 -> -z; 2 -> (pi_lo - z) + pi; 3 -> (z - pi_lo) + (-pi)
+    tbnz x24, #1, Lfpatanv_m23
+    tbz  x24, #0, Lfpatanv_ret
+    fneg d16, d16
+    b    Lfpatanv_ret
+Lfpatanv_m23:
+    ldr  d18, Latanv_pilo
+    tbnz x24, #0, Lfpatanv_m3
+    fsub d16, d18, d16               // pi_lo - z
+    ldr  d18, Latanv_pi
+    fadd d16, d16, d18               // + pi
+    b    Lfpatanv_ret
+Lfpatanv_m3:
+    fsub d16, d16, d18               // z - pi_lo
+    ldr  d18, Latanv_mpi
+    fadd d16, d16, d18               // + (-pi)
+    b    Lfpatanv_ret
+Lfpatanv_y0:
+    // y == +-0: m 0/1 -> y itself; 2 -> tiny + pi; 3 -> (-pi) - tiny
+    tbnz x24, #1, Lfpatanv_y0_x
+    fmov d16, d17
+    b    Lfpatanv_ret
+Lfpatanv_y0_x:
+    ldr  d16, Latanv_tiny
+    tbnz x24, #0, Lfpatanv_y0_m3
+    ldr  d18, Latanv_pi
+    fadd d16, d16, d18               // tiny + pi
+    b    Lfpatanv_ret
+Lfpatanv_y0_m3:
+    ldr  d18, Latanv_mpi
+    fsub d16, d18, d16               // (-pi) - tiny
+    b    Lfpatanv_ret
+Lfpatanv_pmhalfpi:
+    // +-(pi/2 + tiny) by sign of y, compiled operand orders
+    ldr  d16, Latanv_tiny
+    tbnz x25, #63, Lfpatanv_mhalfpi
+    ldr  d18, Latanv_pio2
+    fadd d16, d16, d18               // tiny + pi/2
+    b    Lfpatanv_ret
+Lfpatanv_mhalfpi:
+    ldr  d18, Latanv_mpio2
+    fsub d16, d18, d16               // (-pi/2) - tiny
+    b    Lfpatanv_ret
+Lfpatanv_xinf:
+    and  x29, x25, #0x7FFFFFFFFFFFFFFF
+    sub  x29, x29, x26               // y also Inf?
+    cbz  x29, Lfpatanv_bothinf
+    // x = +-Inf, y finite: m 0 -> +0; 1 -> -0; 2 -> tiny + pi; 3 -> -pi - tiny
+    tbnz x24, #1, Lfpatanv_y0_x      // m 2/3: same arithmetic as the y==0 leg
+    fmov d16, xzr
+    tbz  x24, #0, Lfpatanv_ret
+    mov  x29, #0x8000000000000000
+    fmov d16, x29                    // -0.0
+    b    Lfpatanv_ret
+Lfpatanv_bothinf:
+    // m 0 -> tiny + pi/4; 1 -> (-pi/4) - tiny; 2 -> tiny + 3pi/4;
+    //   3 -> (-3pi/4) - tiny
+    ldr  d16, Latanv_tiny
+    tbnz x24, #1, Lfpatanv_binf23
+    tbnz x24, #0, Lfpatanv_binf1
+    ldr  d18, Latanv_pio4
+    fadd d16, d16, d18
+    b    Lfpatanv_ret
+Lfpatanv_binf1:
+    ldr  d18, Latanv_mpio4
+    fsub d16, d18, d16
+    b    Lfpatanv_ret
+Lfpatanv_binf23:
+    tbnz x24, #0, Lfpatanv_binf3
+    ldr  d18, Latanv_3pio4
+    fadd d16, d16, d18
+    b    Lfpatanv_ret
+Lfpatanv_binf3:
+    ldr  d18, Latanv_m3pio4
+    fsub d16, d18, d16
+    b    Lfpatanv_ret
+Lfpatanv_nan:
+    fadd d16, d16, d17               // x + y (classic operand order)
+Lfpatanv_ret:
+    ldr  x29, [sp, #0x60]
+    ldp  x26, x27, [sp, #0x50]
+    ldp  x24, x25, [sp, #0x40]
+    ldr  q21, [sp, #0x30]
+    ldr  q20, [sp, #0x20]
+    ldr  q19, [sp, #0x10]
+    ldr  q18, [sp]
+    add  sp, sp, #0x70
+    ret
+
+.p2align 3
+Latanv_atanhi:
+    .quad 0x3FDDAC670561BB4F         // atan(0.5) hi
+    .quad 0x3FE921FB54442D18         // atan(1.0) hi
+    .quad 0x3FEF730BD281F69B         // atan(1.5) hi
+Latanv_pio2:
+    .quad 0x3FF921FB54442D18         // atan(inf) hi = pi/2
+Latanv_atanlo:
+    .quad 0x3C7A2B7F222F65E2         // atan(0.5) lo
+    .quad 0x3C81A62633145C07         // atan(1.0) lo
+    .quad 0x3C7007887AF0CBBD         // atan(1.5) lo
+Latanv_atanlo3:
+    .quad 0x3C91A62633145C07         // atan(inf) lo
+Latanv_aT0:
+    .quad 0x3FD555555555550D
+Latanv_aT1:
+    .quad 0xBFC999999998EBC4
+Latanv_aT2:
+    .quad 0x3FC24924920083FF
+Latanv_aT3:
+    .quad 0xBFBC71C6FE231671
+Latanv_aT4:
+    .quad 0x3FB745CDC54C206E
+Latanv_aT5:
+    .quad 0xBFB3B0F2AF749A6D
+Latanv_aT6:
+    .quad 0x3FB10D66A0D03D51
+Latanv_aT7:
+    .quad 0xBFADDE2D52DEFD9A
+Latanv_aT8:
+    .quad 0x3FA97B4B24760DEB
+Latanv_aT9:
+    .quad 0xBFA2B4442C6A6C2F
+Latanv_aT10:
+    .quad 0x3F90AD3AE322DA11
+Latanv_huge:
+    .quad 0x7E37E43C8800759C         // 1e300
+Latanv_tiny:
+    .quad 0x01A56E1FC2F8F359         // 1e-300
+Latanv_pi:
+    .quad 0x400921FB54442D18
+Latanv_mpi:
+    .quad 0xC00921FB54442D18
+Latanv_mpio2:
+    .quad 0xBFF921FB54442D18
+Latanv_pio4:
+    .quad 0x3FE921FB54442D18
+Latanv_mpio4:
+    .quad 0xBFE921FB54442D18
+Latanv_3pio4:
+    .quad 0x4002D97C7F3321D2
+Latanv_m3pio4:
+    .quad 0xC002D97C7F3321D2
+Latanv_pilo:
+    .quad 0x3CA1A62633145C07
+
+// -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
 // -----------------------------------------------------------------------------
 TRIG_ENTRY fsin

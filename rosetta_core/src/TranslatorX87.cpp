@@ -3005,4 +3005,10 @@ auto translate_fyl2xp1(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     translate_fyl2x_common(a1, kRuntimeRoutine_fyl2xp1);
 }
 
+// FPATAN: ST(1) = atan2(ST(1), ST(0)), pop — identical singular shape to
+// fyl2x (2 inputs, result to ST(1), pop, C1 clear).
+auto translate_fpatan(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    translate_fyl2x_common(a1, kRuntimeRoutine_fpatan);
+}
+
 };  // namespace TranslatorX87

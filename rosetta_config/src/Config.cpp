@@ -208,6 +208,8 @@ RosettaConfig parse_config_from_env() {
         cfg.disable_fyl2x_val = (*v == '1') ? 1 : 0;
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FYL2XP1_VAL"))
         cfg.disable_fyl2xp1_val = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FPATAN_VAL"))
+        cfg.disable_fpatan_val = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1')

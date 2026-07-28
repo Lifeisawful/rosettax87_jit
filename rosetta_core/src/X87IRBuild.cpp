@@ -1179,6 +1179,22 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ctx.pop();
                 break;
             }
+            case kOpcodeName_fpatan: {
+                // Value call: ST(1) = atan2(ST(1), ST(0)), pop.
+                if (!(g_rosetta_config && trig_ir_fpatan_enabled(*g_rosetta_config))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto st1 = ctx.resolve(1);
+                if (st1 < 0) { ok = false; break; }
+                auto id = ctx.add_node(Op::FPatanCall, st0, st1);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[1] = id;
+                ctx.pop();
+                break;
+            }
             case kOpcodeName_frndint: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }
