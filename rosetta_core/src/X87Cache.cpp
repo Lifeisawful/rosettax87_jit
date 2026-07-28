@@ -370,6 +370,10 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
                 return true;
             if (op == kOpcodeName_fscale && trig_ir_fscale_enabled(*g_rosetta_config))
                 return true;
+            if (op == kOpcodeName_fyl2x && trig_ir_fyl2x_enabled(*g_rosetta_config))
+                return true;
+            if (op == kOpcodeName_fyl2xp1 && trig_ir_fyl2xp1_enabled(*g_rosetta_config))
+                return true;
         }
         if (is_handled_x87(op))
             return !op_disabled_for_run(op, disabled_ops_mask);

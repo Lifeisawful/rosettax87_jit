@@ -309,6 +309,12 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         } else if (opcode == Opcode::kOpcodeName_fscale && g_rosetta_config &&
                    trig_ir_fscale_enabled(*g_rosetta_config)) {
             TranslatorX87::translate_fscale(translation_result, cur_instr);
+        } else if (opcode == Opcode::kOpcodeName_fyl2x && g_rosetta_config &&
+                   trig_ir_fyl2x_enabled(*g_rosetta_config)) {
+            TranslatorX87::translate_fyl2x(translation_result, cur_instr);
+        } else if (opcode == Opcode::kOpcodeName_fyl2xp1 && g_rosetta_config &&
+                   trig_ir_fyl2xp1_enabled(*g_rosetta_config)) {
+            TranslatorX87::translate_fyl2xp1(translation_result, cur_instr);
         } else
         switch (opcode) {
             case Opcode::kOpcodeName_fldz:

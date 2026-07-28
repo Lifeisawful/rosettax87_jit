@@ -101,5 +101,7 @@ auto translate_fptan(TranslationResult* a1, IRInstr* a2) -> void;
 auto translate_fsincos(TranslationResult* a1, IRInstr* a2) -> void;
 auto translate_f2xm1(TranslationResult* a1, IRInstr* a2) -> void;
 auto translate_fscale(TranslationResult* a1, IRInstr* a2) -> void;
+auto translate_fyl2x(TranslationResult* a1, IRInstr* a2) -> void;
+auto translate_fyl2xp1(TranslationResult* a1, IRInstr* a2) -> void;
 
 };  // namespace TranslatorX87

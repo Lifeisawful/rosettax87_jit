@@ -1157,6 +1157,28 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ctx.slot_val[0] = id;
                 break;
             }
+            case kOpcodeName_fyl2x:
+            case kOpcodeName_fyl2xp1: {
+                // OPT-TI pow-trio completion value calls:
+                // ST(1) = ST(1) * log2(ST(0) [+ 1]), pop.  All failable
+                // add_node calls happen before the slot_val/pop mutations.
+                const bool p1 = (op == kOpcodeName_fyl2xp1);
+                if (!(g_rosetta_config &&
+                      (p1 ? trig_ir_fyl2xp1_enabled(*g_rosetta_config)
+                          : trig_ir_fyl2x_enabled(*g_rosetta_config)))) {
+                    ok = false;
+                    break;
+                }
+                auto st0 = ctx.resolve(0);
+                if (st0 < 0) { ok = false; break; }
+                auto st1 = ctx.resolve(1);
+                if (st1 < 0) { ok = false; break; }
+                auto id = ctx.add_node(p1 ? Op::FYl2xp1Call : Op::FYl2xCall, st0, st1);
+                if (id < 0) { ok = false; break; }
+                ctx.slot_val[1] = id;
+                ctx.pop();
+                break;
+            }
             case kOpcodeName_frndint: {
                 auto st0 = ctx.resolve(0);
                 if (st0 < 0) { ok = false; break; }

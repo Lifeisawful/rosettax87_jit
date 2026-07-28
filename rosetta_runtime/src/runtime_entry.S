@@ -1779,6 +1779,236 @@ Lfscalev_qnan:
     .quad 0x7FF8000000000000
 
 // -----------------------------------------------------------------------------
+// FYL2X / FYL2XP1 value calls (OPT-TI pow-trio completion): the last leg of
+// the guest pow() idiom (__powhlp = fyl2x -> f2xm1 -> fscale).  Like
+// f2xm1/fscale the ENTIRE math runs here — no C fallback leg, no SIMDGuard.
+//
+//   _stub_fyl2x_val:   d16 = ST(0) = x, d17 = ST(1) = y (consumed);
+//                      d16 = y * log2(x)
+//   _stub_fyl2xp1_val: same registers; d16 = y * log2(1 + x), with the
+//                      classic helper's tiny-|x| cubic series for |x| < 2^-20
+//
+// The kernel is openlibm e_log2 + k_log1p ported from the COMPILED classic
+// helper (x87_fyl2x after LTO), operation for operation, so both paths give
+// bit-identical results.  That includes clang's contractions: the val_lo
+// combine is one FMADD ((lo+hi)*ivln2lo fused with + lo*ivln2hi), and the
+// fyl2xp1 tiny series is FMADD(x, -1/3, 0.5) then FMSUB(1 - x*t).  It also
+// includes LTO's constant-folding of log2(±0)'s -two54/0.0 into a literal
+// -Inf (no DIVBYZERO in FPSR — classic parity), while log2(-x)'s
+// (x-x)/0.0 stays a real division (INVALID raised — classic parity).
+//
+// The push/pop asymmetry vs fscale: both ops write ST(1) and POP.  The
+// stack effect lives entirely in the JIT (IR: slot_val[1]=node + pop();
+// singular: store to ST(1) then emit_x87_pop), the stub is a pure value
+// function.  Runs containing these nodes exclude v16 AND v17 from the pool
+// (FScaleCall's rule); everything else is preserved: q18-q24 + x25-x27/x29
+// saved here as singles, NZCV never written (sub + tbz/tbnz/cbz only).
+// -----------------------------------------------------------------------------
+
+// log2 kernel: d16 = log2(d16).  Clobbers d18-d24, x25-x27, x29.
+// Branch labels are per-instantiation (\name); the Llog2v_* literal pool is
+// shared by both instantiations (PC-relative LDR reaches file-wide).
+.macro LOG2_VAL_KERNEL name
+    fmov x27, d16                    // bits(x)
+    mov  x25, xzr                    // k = 0
+    sbfx x26, x27, #32, #32          // hx = signed high word
+    mov  w29, #0x100000
+    sub  x29, x26, x29               // 64-bit: no wrap for any hx
+    tbz  x29, #63, L\name\()_bignorm // hx >= 0x00100000
+    // hx < 0x00100000: ±0 / negative / positive subnormal
+    lsl  x29, x27, #1
+    cbz  x29, L\name\()_zero
+    tbnz x27, #63, L\name\()_neg
+    ldr  d18, Llog2v_two54
+    fmul d16, d16, d18               // scale subnormal up by 2^54
+    fmov x27, d16
+    sbfx x26, x27, #32, #32
+    mov  x25, #-54                   // k = -54
+    b    L\name\()_main
+L\name\()_bignorm:
+    mov  w29, #0x7ff00000
+    sub  x29, x26, x29
+    tbz  x29, #63, L\name\()_infnan  // hx >= 0x7ff00000 -> x + x
+L\name\()_main:
+    // x == 1.0 -> +0 exactly
+    mov  x29, #0x3FF0000000000000
+    sub  x29, x27, x29
+    cbz  x29, L\name\()_one
+    // k += hx>>20; i = ((hx&0xfffff)+0x95f64)&0x100000; normalize x or x/2
+    add  x25, x25, x26, asr #20
+    and  x26, x26, #0xfffff
+    mov  w29, #0x5f64
+    movk w29, #0x9, lsl #16          // 0x95f64
+    add  x29, x26, x29
+    add  x25, x25, x29, lsr #20      // k += i>>20
+    and  x29, x29, #0x100000         // i
+    orr  x26, x26, x29
+    eor  x26, x26, #0x3ff00000       // (hx&fffff) | (i ^ 0x3ff00000)
+    and  x27, x27, #0xffffffff
+    orr  x27, x27, x26, lsl #32
+    fmov d16, x27                    // x normalized to [sqrt(2)/2, sqrt(2))
+    sub  x25, x25, #0x3ff            // unbias k
+    // f = x - 1.0; hfsq = (f*0.5)*f
+    fmov d19, #-1.0
+    fadd d16, d16, d19               // f
+    fmov d19, #0.5
+    fmul d19, d16, d19
+    fmul d19, d16, d19               // hfsq
+    // s = f/(2+f); z = s*s; w = z*z
+    fmov d20, #2.0
+    fadd d20, d16, d20
+    fdiv d20, d16, d20               // s
+    fmul d21, d20, d20               // z
+    fmul d22, d21, d21               // w
+    // t1 = w*(Lg2 + w*(Lg4 + w*Lg6))
+    ldr  d18, Llog2v_Lg4
+    ldr  d24, Llog2v_Lg6
+    fmadd d18, d22, d24, d18
+    ldr  d24, Llog2v_Lg2
+    fmadd d18, d22, d18, d24
+    fmul d23, d22, d18               // t1
+    // t2 = z*(Lg1 + w*(Lg3 + w*(Lg5 + w*Lg7)))
+    ldr  d18, Llog2v_Lg5
+    ldr  d24, Llog2v_Lg7
+    fmadd d18, d22, d24, d18
+    ldr  d24, Llog2v_Lg3
+    fmadd d18, d22, d18, d24
+    ldr  d24, Llog2v_Lg1
+    fmadd d22, d22, d18, d24         // Lg1 + w*(...)  (w dead)
+    fmul d21, d21, d22               // t2             (z dead)
+    fadd d21, d23, d21               // R = t1 + t2
+    fadd d21, d19, d21               // hfsq + R
+    fmul d20, d20, d21               // r = s*(hfsq+R)  (s dead)
+    // Dekker split: hi = clearlow32(f - hfsq); lo = (f - hi) - hfsq + r
+    fsub d21, d16, d19
+    fmov x29, d21
+    and  x29, x29, #0xFFFFFFFF00000000
+    fmov d21, x29                    // hi
+    fsub d16, d16, d21
+    fsub d16, d16, d19               // (f - hi) - hfsq
+    fadd d16, d16, d20               // lo             (f dead)
+    ldr  d22, Llog2v_ivln2hi
+    fmul d20, d21, d22               // val_hi = hi*ivln2hi
+    fadd d21, d16, d21               // lo + hi
+    fmul d16, d16, d22               // lo*ivln2hi
+    ldr  d22, Llog2v_ivln2lo
+    fmadd d16, d21, d22, d16         // val_lo (single FMADD — clang parity)
+    // spadd(val_hi, val_lo, y_k)
+    scvtf d18, w25                   // y_k = (double)k
+    fadd d19, d20, d18               // w' = val_hi + y_k
+    fsub d18, d18, d19               // y_k - w'
+    fadd d18, d20, d18               // val_hi + (y_k - w')
+    fadd d16, d18, d16               // val_lo'
+    fadd d16, d19, d16               // log2(x) = w' + val_lo'
+    b    L\name\()_done
+L\name\()_zero:
+    ldr  d16, Llog2v_ninf            // log2(±0) = -Inf (LTO-folded constant)
+    b    L\name\()_done
+L\name\()_neg:
+    fsub d16, d16, d16               // x - x
+    fmov d18, xzr
+    fdiv d16, d16, d18               // (x-x)/0 -> NaN, INVALID (classic parity)
+    b    L\name\()_done
+L\name\()_infnan:
+    fadd d16, d16, d16               // +Inf/NaN -> x + x
+    b    L\name\()_done
+L\name\()_one:
+    fmov d16, xzr                    // log2(1) = +0
+L\name\()_done:
+.endm
+
+.macro LOG2_VAL_FRAME_PUSH
+    sub  sp, sp, #0x90
+    str  q18, [sp]
+    str  q19, [sp, #0x10]
+    str  q20, [sp, #0x20]
+    str  q21, [sp, #0x30]
+    str  q22, [sp, #0x40]
+    str  q23, [sp, #0x50]
+    str  q24, [sp, #0x60]
+    stp  x25, x26, [sp, #0x70]
+    stp  x27, x29, [sp, #0x80]
+.endm
+
+.macro LOG2_VAL_FRAME_POP
+    ldp  x27, x29, [sp, #0x80]
+    ldp  x25, x26, [sp, #0x70]
+    ldr  q24, [sp, #0x60]
+    ldr  q23, [sp, #0x50]
+    ldr  q22, [sp, #0x40]
+    ldr  q21, [sp, #0x30]
+    ldr  q20, [sp, #0x20]
+    ldr  q19, [sp, #0x10]
+    ldr  q18, [sp]
+    add  sp, sp, #0x90
+.endm
+
+.globl _stub_fyl2x_val
+_stub_fyl2x_val:
+    LOG2_VAL_FRAME_PUSH
+    LOG2_VAL_KERNEL fyl2xv
+    fmul d16, d17, d16               // y * log2(x)
+    LOG2_VAL_FRAME_POP
+    ret
+
+.globl _stub_fyl2xp1_val
+_stub_fyl2xp1_val:
+    LOG2_VAL_FRAME_PUSH
+    fmov x27, d16
+    and  x29, x27, #0x7FFFFFFFFFFFFFFF
+    mov  x26, #0x3EB0000000000000    // 0x1p-20
+    sub  x29, x29, x26               // < 0 iff |x| < 2^-20 (NaN: >= 0)
+    tbnz x29, #63, Lfyl2xp1v_tiny
+    fmov d18, #1.0
+    fadd d16, d16, d18               // 1 + x
+    LOG2_VAL_KERNEL fyl2xp1v
+    fmul d16, d17, d16               // y * log2(1+x)
+    LOG2_VAL_FRAME_POP
+    ret
+Lfyl2xp1v_tiny:
+    // y * (x * (1 - x*(0.5 - x/3)) * log2e) — compiled-helper contractions:
+    // FMADD(x, -1/3, 0.5) then FMSUB(1 - x*t), then two ordered multiplies.
+    ldr  d18, Llog2v_mthird
+    fmov d19, #0.5
+    fmadd d18, d16, d18, d19         // 0.5 - x/3
+    fmov d19, #1.0
+    fmsub d18, d16, d18, d19         // 1 - x*(...)
+    fmul d16, d16, d18               // x * (...)
+    ldr  d18, Llog2v_log2e
+    fmul d16, d16, d18               // ... * log2(e)
+    fmul d16, d17, d16               // y * (...)
+    LOG2_VAL_FRAME_POP
+    ret
+
+.p2align 3
+Llog2v_two54:
+    .quad 0x4350000000000000         // 2^54
+Llog2v_Lg1:
+    .quad 0x3FE5555555555593
+Llog2v_Lg2:
+    .quad 0x3FD999999997FA04
+Llog2v_Lg3:
+    .quad 0x3FD2492494229359
+Llog2v_Lg4:
+    .quad 0x3FCC71C51D8E78AF
+Llog2v_Lg5:
+    .quad 0x3FC7466496CB03DE
+Llog2v_Lg6:
+    .quad 0x3FC39A09D078C69F
+Llog2v_Lg7:
+    .quad 0x3FC2F112DF3E5244
+Llog2v_ivln2hi:
+    .quad 0x3FF7154765200000         // 1/ln2 high (33 bits)
+Llog2v_ivln2lo:
+    .quad 0x3DE705FC2EEFA200         // 1/ln2 low
+Llog2v_ninf:
+    .quad 0xFFF0000000000000         // -Inf
+Llog2v_mthird:
+    .quad 0xBFD5555555555555         // -1/3
+Llog2v_log2e:
+    .quad 0x3FF71547652B82FE         // log2(e)
+
+// -----------------------------------------------------------------------------
 // FSIN: ST(0) = sin(ST(0)).  n & 3 selects 0:+sin 1:+cos 2:-sin 3:-cos.
 // -----------------------------------------------------------------------------
 TRIG_ENTRY fsin

@@ -2955,4 +2955,54 @@ auto translate_fscale(TranslationResult* a1, IRInstr* /*a2*/) -> void {
     free_gpr(*a1, Wd_tmp);
 }
 
+// FYL2X / FYL2XP1 (OPT-TI pow-trio completion): ST(1) = ST(1) * log2(ST(0))
+// (+1 for the P1 form), pop — via _stub_fyl2x_val/_stub_fyl2xp1_val with
+// d16 = ST(0) in, d17 = ST(1) in (consumed), d16 = result out.  The stub is
+// a pure value function; the ST(1) store, the pop, and the C1 clear
+// (fyl2x_common parity) all happen here.
+static auto translate_fyl2x_common(TranslationResult* a1, int runtime_routine) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+    const int Xst_base = x87_get_st_base(*a1);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+
+    // ST(0) first (offset discarded), ST(1) second so Wd_tmp keys the
+    // result store into the ST(1) slot.
+    emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp,
+                 /*Dd=*/16, Xst_base);
+    const int Wk = emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 1), Wd_tmp,
+                                /*Dd=*/17, Xst_base);
+
+    Fixup fixup;
+    fixup.kind = FixupKind::Branch26;
+    fixup.insn_offset = static_cast<uint32_t>(a1->insn_buf.end);
+    fixup.target = runtime_routine;
+    a1->_fixups.push_back(fixup);
+    a1->insn_buf.emit(0x94000000u);
+
+    emit_store_st_at_offset(buf, Xbase, Wk, /*Dd=*/16, Xst_base);
+
+    // status_word &= ~C1  (~0x200: immr=22, imms=30)
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/22, /*imms=*/30, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                     /*imm12=*/kX87StatusWordOff / 2, Xbase, Wd_tmp);
+
+    // Pop: Wd_tmp is dead after the RMW, safe as emit_x87_pop scratch.
+    x87_pop(buf, *a1, Xbase, Wd_top, Wd_tmp);
+
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+auto translate_fyl2x(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    translate_fyl2x_common(a1, kRuntimeRoutine_fyl2x);
+}
+
+auto translate_fyl2xp1(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    translate_fyl2x_common(a1, kRuntimeRoutine_fyl2xp1);
+}
+
 };  // namespace TranslatorX87

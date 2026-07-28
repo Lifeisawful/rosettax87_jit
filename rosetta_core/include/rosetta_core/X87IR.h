@@ -76,6 +76,17 @@ enum class Op : uint8_t {
     F2XM1Call,
     FScaleCall,
 
+    // OPT-TI pow-trio completion: FYl2xCall = inputs[1] * log2(inputs[0])
+    // via `BL _stub_fyl2x_val` (d16 = ST(0) = x in/out, d17 = ST(1) = y in,
+    // consumed); FYl2xp1Call is the same with log2(1 + x) and the classic
+    // helper's tiny-|x| series.  Whole math in the val stub's assembly (no
+    // C fallback leg).  Both ops write ST(1) and POP — build() sets
+    // slot_val[1] and pops; the nodes themselves are pure values.  Lowering
+    // additionally clears C1 (fyl2x_common parity).  Runs containing them
+    // exclude v16 AND v17 from the pool (FScaleCall's rule).
+    FYl2xCall,
+    FYl2xp1Call,
+
     // Conditional select (FCMOV): inputs[0]=ST(0) false arm, inputs[1]=ST(i) true arm
     // imm_bits[3:0] = AArch64 condition code
     FCSel,

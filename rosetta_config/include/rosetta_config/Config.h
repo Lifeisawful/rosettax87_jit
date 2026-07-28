@@ -117,14 +117,17 @@ struct RosettaConfig {
     uint8_t  trig_ir;                // ROSETTA_X87_TRIG_IR=1 — translate FCOS as a value call (_stub_fcos_val): IR node inside runs, ldr/BL/str singular form outside (opt-in)
     uint8_t  disable_f2xm1_val;      // ROSETTA_X87_DISABLE_F2XM1_VAL=1 — keep F2XM1 on the classic prologue/vtable stub even under TRIG_IR
     uint8_t  disable_fscale_val;     // ROSETTA_X87_DISABLE_FSCALE_VAL=1 — same for FSCALE
+    uint8_t  disable_fyl2x_val;      // ROSETTA_X87_DISABLE_FYL2X_VAL=1 — same for FYL2X
+    uint8_t  disable_fyl2xp1_val;    // ROSETTA_X87_DISABLE_FYL2XP1_VAL=1 — same for FYL2XP1
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
 // Grown 0x20 → 0x28 when the 17th byte-flag (bridge_carry) crossed the old
-// size. The loader writes this struct into the runtime's __DATA,config by
+// size, and 0x28 → 0x30 when the 25th (disable_fyl2x_val) crossed again.
+// The loader writes this struct into the runtime's __DATA,config by
 // sizeof — both sides compile from this header, so they stay in sync as long
 // as loader and runtime dylib come from the same build.
-static_assert(sizeof(RosettaConfig) == 0x28);
+static_assert(sizeof(RosettaConfig) == 0x30);
 
 inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
     return (cfg.disabled_ops_mask >> static_cast<int>(id)) & 1u;
@@ -175,6 +178,12 @@ inline bool trig_ir_f2xm1_enabled(const RosettaConfig& cfg) {
 }
 inline bool trig_ir_fscale_enabled(const RosettaConfig& cfg) {
     return cfg.trig_ir != 0 && cfg.disable_fscale_val == 0;
+}
+inline bool trig_ir_fyl2x_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_fyl2x_val == 0;
+}
+inline bool trig_ir_fyl2xp1_enabled(const RosettaConfig& cfg) {
+    return cfg.trig_ir != 0 && cfg.disable_fyl2xp1_val == 0;
 }
 
 // Parse configuration from environment variables.

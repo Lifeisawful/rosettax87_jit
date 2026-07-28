@@ -155,6 +155,27 @@ int regs_survive_powtrio(void) {
            x0 == 1.5 && x1 == -2.5 && x2 == 3.25 && x3 == 1e300;
 }
 
+/* Guest GPRs and XMM registers must survive the fyl2x/fyl2xp1 value stubs
+ * (they save q18-q24 + x25-x27/x29 themselves). */
+int regs_survive_fyl2x(void) {
+    volatile double x = 5.5, y = 1.75;
+    double sink;
+    uint64_t g0 = 0x1122334455667788ULL, g1 = 0x99AABBCCDDEEFF00ULL;
+    uint64_t g2 = 0xDEADBEEFCAFEBABEULL, g3 = 0x0123456789ABCDEFULL;
+    double x0 = 1.5, x1 = -2.5, x2 = 3.25, x3 = 1e300;
+    __asm__ volatile(
+        "fldl %9\n\t"
+        "fldl %8\n\t"
+        "fyl2x\n\t"
+        "fstpl %10\n"
+        : "+r"(g0), "+r"(g1), "+r"(g2), "+r"(g3),
+          "+x"(x0), "+x"(x1), "+x"(x2), "+x"(x3)
+        : "m"(x), "m"(y), "m"(sink));
+    return g0 == 0x1122334455667788ULL && g1 == 0x99AABBCCDDEEFF00ULL &&
+           g2 == 0xDEADBEEFCAFEBABEULL && g3 == 0x0123456789ABCDEFULL &&
+           x0 == 1.5 && x1 == -2.5 && x2 == 3.25 && x3 == 1e300;
+}
+
 /* EFLAGS must survive fcos (both the fast path and the huge fallback). */
 int flags_survive(double arg) {
     int ok;
@@ -644,6 +665,177 @@ int main(void) {
         check_tol("pow idiom: 2^3.3 via f2xm1+fscale", r, pow(2.0, 3.3));
     }
     check_true("GPRs + XMM survive f2xm1+fscale", regs_survive_powtrio());
+
+    /* ================= FYL2X / FYL2XP1 (pow-trio completion) ============ */
+    {
+        /* accuracy across the domain: y*log2(x) */
+        static const double xs[] = { 0.5, 2.0, 3.0, 0.1, 1e10, 1e-10, 1.0000001 };
+        static const double ys2[] = { 1.0, -3.0, 0.5 };
+        for (int i = 0; i < 7; i++) {
+            for (int j = 0; j < 3; j++) {
+                volatile double x = xs[i], y = ys2[j];
+                double r;
+                __asm__ volatile(
+                    "fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                    : "=m"(r) : "m"(x), "m"(y));
+                check_tol("fyl2x domain", r, ys2[j] * log2(xs[i]));
+            }
+        }
+    }
+    {
+        /* exact powers of two: y*log2(2^n) must be bit-exact */
+        volatile double x = 8.0, y = 3.0;
+        double r;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_bits("fyl2x(8, 3) == 9", r, 9.0);
+        x = 0.25; y = -2.0;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_bits("fyl2x(0.25, -2) == 4", r, 4.0);
+        x = 0x1p-1074; y = 1.0;  /* subnormal: log2 = -1074 exactly */
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_bits("fyl2x(2^-1074, 1) == -1074", r, -1074.0);
+    }
+    {
+        /* x == 1: exact +/-0 result with sign from y */
+        volatile double x = 1.0, y = 3.0;
+        double r;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_bits("fyl2x(1, 3) == +0", r, 0.0);
+    }
+    {
+        /* x == 0 -> y * -Inf; negative x / NaN -> NaN.  Inf checks are
+         * bit-pattern based (CONST_PROMOTE isinf() hazard — see header). */
+        volatile double x = 0.0, y = 2.0;
+        double r;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fyl2x(0, 2) == -Inf",
+                   as_u64(r) == 0xFFF0000000000000ULL);
+        x = -0.0; y = 2.0;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fyl2x(-0, 2) == -Inf",
+                   as_u64(r) == 0xFFF0000000000000ULL);
+        x = -2.0; y = 1.0;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fyl2x(-2, 1) is NaN", isnan(r));
+        x = __builtin_nan(""); y = 1.0;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fyl2x(NaN, 1) is NaN", isnan(r));
+        x = 4.0; y = __builtin_nan("");
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2x\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        check_true("fyl2x(4, NaN) is NaN", isnan(r));
+    }
+    {
+        /* pop coherence: a value below y must become ST(0)'s neighbor after
+         * the pop and come out intact */
+        volatile double x = 4.0, y = 1.5, guard = 27.75;
+        double r, g;
+        __asm__ volatile(
+            "fldl %4\n\t"   /* guard              */
+            "fldl %3\n\t"   /* y     guard        */
+            "fldl %2\n\t"   /* x     y      guard */
+            "fyl2x\n\t"     /* 3.0   guard        */
+            "fstpl %0\n\t"
+            "fstpl %1\n"
+            : "=m"(r), "=m"(g) : "m"(x), "m"(y), "m"(guard));
+        check_bits("fyl2x pop: 1.5*log2(4) == 3", r, 3.0);
+        check_bits("fyl2x pop: stack coherent", g, 27.75);
+    }
+    {
+        /* in-run with live values: c1 * (y*log2(x)) + c0 */
+        volatile double x = 32.0, y = 0.5, c0 = 1.25, c1 = 2.0;
+        double r;
+        __asm__ volatile(
+            "fldl %4\n\t"   /* c1                  */
+            "fldl %3\n\t"   /* y     c1            */
+            "fldl %1\n\t"   /* x     y      c1     */
+            "fyl2x\n\t"     /* 2.5   c1            */
+            "fmulp\n\t"     /* 5.0                 */
+            "fldl %2\n\t"
+            "faddp\n\t"     /* 6.25                */
+            "fstpl %0\n"
+            : "=m"(r) : "m"(x), "m"(c0), "m"(y), "m"(c1));
+        check_bits("fyl2x run: 2*(0.5*log2(32))+1.25", r, 6.25);
+    }
+    {
+        /* fyl2xp1: moderate args vs log2(1+x) */
+        static const double xs[] = { 0.5, -0.25, 3.0, 0.001 };
+        for (int i = 0; i < 4; i++) {
+            volatile double x = xs[i], y = 2.0;
+            double r;
+            __asm__ volatile(
+                "fldl %2\n\t fldl %1\n\t fyl2xp1\n\t fstpl %0\n"
+                : "=m"(r) : "m"(x), "m"(y));
+            check_tol("fyl2xp1 domain", r, 2.0 * log2(1.0 + xs[i]));
+        }
+    }
+    {
+        /* fyl2xp1 tiny path (|x| < 2^-20): the series must keep the
+         * significance a naive 1+x would round away */
+        volatile double x = 0x1p-30, y = 1.0;
+        double r;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2xp1\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        /* log2(1+eps) ~= eps*log2(e) — relative accuracy, not absolute */
+        double expect = 0x1p-30 * 1.4426950408889634074;
+        check_true("fyl2xp1 tiny keeps significance",
+                   r > expect * 0.999999999 && r < expect * 1.000000001);
+        x = -0x1p-40; y = -1.0;
+        __asm__ volatile("fldl %2\n\t fldl %1\n\t fyl2xp1\n\t fstpl %0\n"
+                         : "=m"(r) : "m"(x), "m"(y));
+        expect = 0x1p-40 * 1.4426950408889634074;
+        check_true("fyl2xp1 tiny negative x, negative y",
+                   r > expect * 0.999999999 && r < expect * 1.000000001);
+    }
+    {
+        /* fyl2xp1 out-of-domain (Intel restricts |x| < 1-sqrt(2)/2; outside
+         * is architecturally undefined and native Rosetta computes unrelated
+         * values: -1 -> -4.3e9, -2 -> -192.3).  Our helper gives y*-Inf for
+         * x == -1 and NaN for x < -1; only require a coherent stack — the
+         * guard below the operands proves the pop happened exactly once. */
+        static const double xs[] = { -1.0, -2.0 };
+        for (int i = 0; i < 2; i++) {
+            volatile double x = xs[i], y = 1.0, guard = 13.5;
+            double r, g;
+            __asm__ volatile(
+                "fldl %4\n\t fldl %3\n\t fldl %2\n\t fyl2xp1\n\t"
+                "fstpl %0\n\t fstpl %1\n"
+                : "=m"(r), "=m"(g) : "m"(x), "m"(y), "m"(guard));
+            check_bits("fyl2xp1 out-of-domain: stack coherent", g, 13.5);
+        }
+    }
+    {
+        /* the full CRT pow shape (__powhlp): x^y = 2^(y*log2 x), all three
+         * pow-trio value calls in one x87 neighborhood */
+        volatile double b = 3.7, e = 2.6;
+        double r;
+        __asm__ volatile(
+            "fldl %2\n\t"          /* e                        */
+            "fldl %1\n\t"          /* b     e                  */
+            "fyl2x\n\t"            /* t=e*log2(b)              */
+            "fld %%st(0)\n\t"      /* t     t                  */
+            "frndint\n\t"          /* i     t                  */
+            "fxch\n\t"             /* t     i                  */
+            "fsub %%st(1), %%st(0)\n\t" /* f  i                */
+            "f2xm1\n\t"            /* 2^f-1 i                  */
+            "fld1\n\t"             /* 1     2^f-1  i           */
+            "faddp\n\t"            /* 2^f   i                  */
+            "fscale\n\t"           /* 2^t   i                  */
+            "fstpl %0\n\t"
+            "fstp %%st(0)\n"
+            : "=m"(r) : "m"(b), "m"(e));
+        check_tol("pow idiom: 3.7^2.6 via fyl2x+f2xm1+fscale", r,
+                  pow(3.7, 2.6));
+    }
+    check_true("GPRs + XMM survive fyl2x", regs_survive_fyl2x());
 
 
     printf("================================\n");
