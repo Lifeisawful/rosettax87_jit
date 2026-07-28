@@ -2882,6 +2882,131 @@ auto translate_fnop(TranslationResult* a1, IRInstr* /*a2*/) -> void {
 }
 
 // =============================================================================
+// FDECSTP / FINCSTP — rotate TOP without touching values or tags.
+//
+// x87 semantics (matches x87_fdecstp / x87_fincstp in X87.cpp):
+//   FDECSTP:  TOP = (TOP - 1) & 7;  C1 = 0
+//   FINCSTP:  TOP = (TOP + 1) & 7;  C1 = 0
+//   No tag change, no value change — a newly-exposed ST(0) may be empty;
+//   that is authentic hardware behavior.
+//
+// Deferred-state protocol (same rule as x87_push/x87_pop): TOP is about to
+// move, so everything anchored to the current TOP must be materialized
+// first — the FXCH permutation (depth map is TOP-relative) and the deferred
+// push/pop tag batches (their slots are computed from Wd_top at flush time).
+// The TOP bump itself is deferred (top_dirty), exactly like a deferred
+// push/pop: x87_end / FSTSW / keepalive flush write it back before any
+// reader sees status_word memory.
+//
+// The C1 clear is a status_word RMW that touches only bit 9 — the stale TOP
+// field in memory (top_dirty) is preserved and later corrected by
+// emit_store_top's own bits-[13:11] RMW.
+// =============================================================================
+static void translate_stack_rotate(TranslationResult* a1, bool is_inc) {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
+
+    perm_flush_before_stack_change(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    x87_flush_deferred_pops(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    x87_flush_deferred_pushes(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+
+    // TOP bump in the cached register only (2 insns); writeback deferred.
+    if (is_inc)
+        emit_x87_pop_top_only(buf, Wd_top);
+    else
+        emit_x87_push_fully_deferred(buf, Wd_top);
+    a1->x87_cache.top_dirty = 1;
+
+    // status_word &= ~C1 (0x0200): AND with the 32-bit bitmask immediate
+    // ~(1 << 9) = 31 ones rotated so the zero lands at bit 9.
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87StatusWordOff / 2, Xbase,
+                     Wd_tmp);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/22, /*imms=*/30, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87StatusWordOff / 2, Xbase,
+                     Wd_tmp);
+
+    free_gpr(*a1, Wd_tmp2);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+auto translate_fdecstp(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    translate_stack_rotate(a1, /*is_inc=*/false);
+}
+
+auto translate_fincstp(TranslationResult* a1, IRInstr* /*a2*/) -> void {
+    translate_stack_rotate(a1, /*is_inc=*/true);
+}
+
+// =============================================================================
+// FFREE ST(i) — mark one stack slot empty.  DD C0+i, operands[0] = ST(i).
+//
+// x87 semantics (Intel and the runtime's classic handler agree): the slot's
+// tag pair is set to kEmpty (0b11).  TOP, C-bits, and the slot's stored
+// value are untouched (any residue under an empty tag is unobservable —
+// getSt tag-checks, FXAM classifies empty before reading bits).
+//
+// Deferred-state interactions:
+//   - FXCH perm: MUST be materialized first.  The perm flush moves VALUES
+//     (not tag pairs) so physical layout matches logical — a tag written
+//     through resolve_depth() ends up on the wrong slot once the flush
+//     rearranges the values (caught by test_stackops under DISABLE_IR,
+//     where the singular deferred-FXCH path is exercised).  After the
+//     flush, physical == logical and the raw depth is correct.
+//   - Deferred push tags (set-valid) pending on this slot would overwrite
+//     our kEmpty at run end — flush pushes first (program order wins).
+//   - Deferred pop tags also write kEmpty; a collision (only possible at
+//     depth 7 ≡ TOP-1 mod 8) is idempotent — pops stay deferred.
+//   - TOP writeback: not needed; the tag RMW doesn't read status_word.
+//
+// Emission (7 insns): idx = (TOP + depth) & 7; tagWord |= 3 << (idx*2).
+// =============================================================================
+auto translate_ffree(TranslationResult* a1, IRInstr* a2) -> void {
+    AssemblerBuffer& buf = a1->insn_buf;
+    auto [Xbase, Wd_top] = x87_begin(*a1, buf);
+
+    const int depth = (a2->num_operands >= 1 &&
+                       a2->operands[0].kind == IROperandKind::Register)
+                          ? static_cast<int>(a2->operands[0].reg.reg.index())
+                          : 0;
+
+    const int Wd_tmp = alloc_gpr(*a1, 2);
+    const int Wd_tmp2 = alloc_gpr(*a1, 3);
+
+    perm_flush_before_stack_change(buf, *a1, Xbase, Wd_top, Wd_tmp);
+    x87_flush_deferred_pushes(buf, *a1, Xbase, Wd_top, Wd_tmp, Wd_tmp2);
+
+    // Wd_tmp = (Wd_top + depth) & 7, then bit_pos = slot * 2
+    if (depth != 0) {
+        emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                     /*shift=*/0, depth, Wd_top, Wd_tmp);
+        emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp, /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_tmp);
+        // LSL Wd_tmp, Wd_tmp, #1
+        emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                      /*immr*/ 31, /*imms*/ 30, Wd_tmp, Wd_tmp);
+    } else {
+        // TOP is already in [0,7] — just double it.
+        emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                      /*immr*/ 31, /*imms*/ 30, Wd_top, Wd_tmp);
+    }
+    // MOVZ Wd_tmp2, #3;  LSLV Wd_tmp2, Wd_tmp2, Wd_tmp  → mask
+    emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp2);
+    emit_lslv(buf, 0, Wd_tmp, Wd_tmp2, Wd_tmp2);
+    // tagWord |= mask  (LDRH / ORR / STRH)
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordOff / 2, Xbase, Wd_tmp);
+    emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                             /*LSL*/ 0, Wd_tmp2, /*shift_amt*/ 0, Wd_tmp, Wd_tmp);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87TagWordOff / 2, Xbase, Wd_tmp);
+
+    free_gpr(*a1, Wd_tmp2);
+    x87_end(*a1, buf, Xbase, Wd_top, Wd_tmp);
+    free_gpr(*a1, Wd_tmp);
+}
+
+// =============================================================================
 // OPT-KA — keepalive prologue for runtime-routine transcendentals.
 //
 // The runtime helper (x87_fsin/…) reads and writes X87State MEMORY at

@@ -124,6 +124,7 @@ struct RosettaConfig {
     uint8_t  disable_fxtract_fast;   // ROSETTA_X87_DISABLE_FXTRACT_FAST=1 — same for FXTRACT
     uint8_t  disable_fprem_fast;     // ROSETTA_X87_DISABLE_FPREM_FAST=1 — route FPREM to the classic stub instead of the in-blob fast path
     uint8_t  disable_fprem1_fast;    // ROSETTA_X87_DISABLE_FPREM1_FAST=1 — same for FPREM1
+    uint8_t  disable_stack_ops;      // ROSETTA_X87_DISABLE_STACKOPS=1 — family gate for fdecstp/fincstp/ffree inline translation (no OpcodeId bits left; also forced by DISABLE_ALL_OPS)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

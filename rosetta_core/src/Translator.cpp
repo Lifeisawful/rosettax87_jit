@@ -283,6 +283,18 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                     translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
                 return std::nullopt;
             }
+            // Stack-op family gate (no OpcodeId bits left): when disabled,
+            // decline exactly like a masked-off opcode. is_handled_x87 is
+            // gated by the same flag, so these never join runs then.
+            if (g_rosetta_config->disable_stack_ops &&
+                (opcode == Opcode::kOpcodeName_fdecstp ||
+                 opcode == Opcode::kOpcodeName_fincstp ||
+                 opcode == Opcode::kOpcodeName_ffree)) {
+                cache.invalidate(translation_result->free_gpr_mask, kGprScratchMask);
+                translation_result->free_fpr_mask =
+                    translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
+                return std::nullopt;
+            }
         }
 
         // OPT-TI: trig translated as value calls when enabled (IR-declined
@@ -502,6 +514,18 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
 
             case Opcode::kOpcodeName_fnop:
                 TranslatorX87::translate_fnop(translation_result, cur_instr);
+                break;
+
+            case Opcode::kOpcodeName_fdecstp:
+                TranslatorX87::translate_fdecstp(translation_result, cur_instr);
+                break;
+
+            case Opcode::kOpcodeName_fincstp:
+                TranslatorX87::translate_fincstp(translation_result, cur_instr);
+                break;
+
+            case Opcode::kOpcodeName_ffree:
+                TranslatorX87::translate_ffree(translation_result, cur_instr);
                 break;
 
             case Opcode::kOpcodeName_arpl:

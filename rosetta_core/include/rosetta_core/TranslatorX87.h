@@ -87,6 +87,14 @@ auto translate_fnstcw(TranslationResult* a1, IRInstr* a2) -> void;
 
 auto translate_fnop(TranslationResult* a1, IRInstr* a2) -> void;
 
+// Stack-register maintenance ops (family-gated by disable_stack_ops —
+// no OpcodeId bits left, the enum is at 64).
+auto translate_fdecstp(TranslationResult* a1, IRInstr* a2) -> void;
+
+auto translate_fincstp(TranslationResult* a1, IRInstr* a2) -> void;
+
+auto translate_ffree(TranslationResult* a1, IRInstr* a2) -> void;
+
 // OPT-KA: emitted before handing a keepalive transcendental back to Rosetta
 // (which lowers it as a runtime-routine BL). Flushes deferred perm/tag/TOP
 // state so the runtime helper sees coherent X87State memory, then adjusts the

@@ -77,6 +77,14 @@ static bool is_handled_x87(uint16_t op) {
         case kOpcodeName_fnstcw:
         case kOpcodeName_fnop:
             return true;
+        // Stack-register maintenance family — no OpcodeId bits left, so the
+        // whole family is gated by one config flag (also forced by
+        // DISABLE_ALL_OPS). When disabled they must not join runs: the
+        // dispatch declines them and Rosetta's own translation takes over.
+        case kOpcodeName_fdecstp:
+        case kOpcodeName_fincstp:
+        case kOpcodeName_ffree:
+            return !(g_rosetta_config && g_rosetta_config->disable_stack_ops);
         default:
             return false;
     }

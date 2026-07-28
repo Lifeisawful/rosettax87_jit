@@ -85,6 +85,13 @@ while [[ $# -gt 0 ]]; do
             others=$(printf '%s\n' "${ALL_OPCODES[@]}" | grep -vFx "$op" | paste -s -d ',' -)
             EXTRA_ENV+=("ROSETTA_X87_DISABLE_ALL_FUSIONS=1")
             [[ -n "$others" ]] && EXTRA_ENV+=("ROSETTA_X87_DISABLE_OPS=$others")
+            # fdecstp/fincstp/ffree share one family flag (no OpcodeId bits):
+            # isolating any other opcode must switch the family off too.
+            # "--opcode stackops" (or naming one of the three) keeps it on.
+            case "$op" in
+                stackops|fdecstp|fincstp|ffree) ;;
+                *) EXTRA_ENV+=("ROSETTA_X87_DISABLE_STACKOPS=1") ;;
+            esac
             ;;
         --fusion)
             f="$2"; shift 2

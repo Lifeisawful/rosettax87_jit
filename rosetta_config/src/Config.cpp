@@ -218,10 +218,17 @@ RosettaConfig parse_config_from_env() {
         cfg.disable_fprem_fast = (*v == '1') ? 1 : 0;
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FPREM1_FAST"))
         cfg.disable_fprem1_fast = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_STACKOPS"))
+        cfg.disable_stack_ops = (*v == '1') ? 1 : 0;
 
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
-        if (*v == '1')
+        if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;
+            // The stack-op family has no OpcodeId bits (enum full at 64) —
+            // "all ops" must cover it too, or phase-8-style configs and
+            // --opcode isolation would leave these three translated.
+            cfg.disable_stack_ops = 1;
+        }
 
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_FUSIONS"))
         if (*v == '1')
