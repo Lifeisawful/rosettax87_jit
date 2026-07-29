@@ -311,8 +311,12 @@ void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
 // Same RMW, but returns the GPR holding the merged status_word instead of
 // freeing it — lets the caller reuse the value (e.g. FSTSW AX) without
 // reloading the halfword it just stored. Caller frees the returned GPR.
+//
+// `store` = false emits the load/merge but NOT the STRH, leaving the caller to
+// store the register once it has finished patching it (the IR FSTSW path folds
+// the run's final TOP in first, so the halfword is written exactly once).
 int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
-                                int Xbase, int Wd_packed);
+                                int Xbase, int Wd_packed, bool store = true);
 
 // =============================================================================
 // RC dispatch — binary tree over the x87 RC field (control_word bits [11:10],

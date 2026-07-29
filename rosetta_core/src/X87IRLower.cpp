@@ -1242,6 +1242,45 @@ void lower(Context& ctx, TranslationResult* result) {
         nzcv_hoist = !nzcv_skip && !has_nzcv_user && cmp_count >= 2;
     }
 
+    // ── FSTSW / epilogue status_word merge ──────────────────────────────────
+    // `fcomp; fnstsw ax` — the dominant compare idiom — wrote status_word
+    // twice: once in the FSTSW (CC bits, stale TOP field) and again in
+    // epilogue step 3 (LDRH/BFI/STRH to patch TOP), the LDRH reloading the
+    // halfword just stored. When the FSTSW's TOP snapshot already equals the
+    // run's final top_delta — true whenever nothing pushes or pops after it,
+    // which is the shape of the idiom — the FSTSW can fold the FINAL TOP in
+    // and store once, and step 3 drops out entirely.
+    //
+    // Requires the FSTSW to be the last status_word writer in the run: a later
+    // FCmp/FTst (CC RMW), FStsw, or trig/pow value call (C1|C2 clear) would
+    // overwrite the halfword after we finalized it.
+    // Walks backward: anything reached before the last FStsw sits AFTER it in
+    // program order, so a status_word writer there disqualifies the sink. The
+    // FCmp/FTst fused into this FStsw is earlier, and is never seen.
+    auto writes_status_word = [](Op op) {
+        switch (op) {
+            case Op::FCmp: case Op::FTst: case Op::FStsw:
+            case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+            case Op::FSinCosCall: case Op::FScaleCall:
+            case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
+                return true;   // F2XM1Call touches no status bits
+            default:
+                return false;
+        }
+    };
+    int sw_sink_node = -1;
+    if (ctx.top_delta != 0 || entry_top_dirty) {
+        for (int i = ctx.num_nodes - 1; i >= 0; i--) {
+            const auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            if (!writes_status_word(n.op)) continue;
+            if (n.op == Op::FStsw &&
+                static_cast<int16_t>(n.aux >> 16) == ctx.top_delta)
+                sw_sink_node = i;
+            break;  // first writer found from the end decides
+        }
+    }
+
     // ── Run body (node loop + x87-state epilogue) ───────────────────────────
     // Emitted once normally, or twice when TOP=0 specialization is active:
     // top_known = 0 makes every stack-slot physical index / tag mask / TOP
@@ -1874,6 +1913,11 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::FStsw: {
             static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
 
+            // Absorb the epilogue's TOP writeback into this FSTSW's own
+            // status_word store (see sw_sink_node): the halfword is written
+            // once, with the final TOP already folded in.
+            const bool sink = (i == sw_sink_node);
+
             int Wd_sw;
             if (n.flags & kFcomFused) {
                 // Fused: RMW status_word with the packed CC held from the
@@ -1882,7 +1926,9 @@ void lower(Context& ctx, TranslationResult* result) {
                 int16_t fcmp_id = n.inputs[0];
                 int Wd_packed = fprs.get(fcmp_id);
 
-                Wd_sw = emit_fcom_cc_write_sw_keep(buf, *result, Xbase, Wd_packed);
+                // When sinking, the STRH moves below the TOP patch.
+                Wd_sw = emit_fcom_cc_write_sw_keep(buf, *result, Xbase, Wd_packed,
+                                                   /*store=*/!sink);
                 free_gpr(*result, Wd_packed);
                 fprs.node_fpr[fcmp_id] = -1;
             } else {
@@ -1928,6 +1974,14 @@ void lower(Context& ctx, TranslationResult* result) {
                         emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
                                       Wd_top, Wd_sw);
                 }
+
+                // Sinking: Wd_sw now holds CC + the run's FINAL TOP, so this
+                // single STRH replaces the epilogue's LDRH/BFI/STRH (step 3 is
+                // suppressed). Emitted before the AX write purely for clarity;
+                // the two are independent.
+                if (sink)
+                    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
+                                     kSwImm12, Xbase, Wd_sw);
 
                 // BFI W_ax, Wd_sw, #0, #16 — write status_word into x86 AX
                 const int W_ax =
@@ -2008,7 +2062,9 @@ void lower(Context& ctx, TranslationResult* result) {
 
     // 3. Write TOP to status_word if changed, or if it was already stale on
     //    entry (carried-in top_dirty from deferred pushes/pops).
-    if (ctx.top_delta != 0 || entry_top_dirty) {
+    //    Skipped when an FSTSW already stored the halfword with the final TOP
+    //    folded in (sw_sink_node).
+    if ((ctx.top_delta != 0 || entry_top_dirty) && sw_sink_node < 0) {
         emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
     }
 

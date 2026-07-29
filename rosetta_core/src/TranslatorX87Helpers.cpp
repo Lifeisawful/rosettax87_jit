@@ -846,7 +846,7 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
 // C1 (bit 9) is cleared per Intel SDM for all FCOM variants.
 // =============================================================================
 int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
-                                int Xbase, int Wd_packed) {
+                                int Xbase, int Wd_packed, bool store) {
     static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;
 
     const int Wd_sw = alloc_free_gpr(a1);
@@ -861,8 +861,8 @@ int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
     // ORR Wd_sw, Wd_sw, Wd_packed
     emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_packed, 0, Wd_sw, Wd_sw);
 
-    // STRH Wd_sw, [Xbase, #0x02]
-    emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
+    // STRH Wd_sw, [Xbase, #0x02]  — deferred to the caller when !store.
+    if (store) emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
 
     return Wd_sw;
 }
