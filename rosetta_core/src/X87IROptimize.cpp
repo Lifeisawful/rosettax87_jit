@@ -196,6 +196,11 @@ static void pass_dse(Context& ctx) {
     }
 
     // Backward pass: mark dead nodes (pure-value nodes with zero uses).
+    //
+    // One pass catches every cascade: a node's inputs always have strictly
+    // lower IDs (add_node appends, and every optimizer rewrite replaces an
+    // input with one of ITS inputs), so killing node i decrements inputs the
+    // walk has not visited yet and reaches them with the count already at 0.
     for (int i = ctx.num_nodes - 1; i >= 0; i--) {
         auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
@@ -224,32 +229,6 @@ static void pass_dse(Context& ctx) {
             }
         }
     }
-
-    // Second backward pass to catch cascading dead nodes.
-    for (int i = ctx.num_nodes - 1; i >= 0; i--) {
-        auto& n = ctx.nodes[i];
-        if (n.flags & kDead) continue;
-        switch (n.op) {
-            case Op::StoreF64: case Op::StoreF32Raw:
-            case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
-            case Op::FCmp: case Op::FTst: case Op::FStsw: case Op::FComI:
-            case Op::StoreCW: case Op::LoadCW:
-            case Op::GuestMovRR: case Op::GuestMovRI:
-            case Op::GuestLea: case Op::GuestExt:
-            case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
-            case Op::GuestAluRI: case Op::GuestRmwR:
-            case Op::GuestPushR: case Op::GuestPushI: case Op::GuestPop:
-                continue;
-            default: break;
-        }
-        if (use_count[i] == 0) {
-            n.flags |= kDead;
-            for (int j = 0; j < 3; j++) {
-                if (n.inputs[j] >= 0)
-                    use_count[n.inputs[j]]--;
-            }
-        }
-    }
 }
 
 // ── Pass 1.5: FNeg folding ──────────────────────────────────────────────────
@@ -264,6 +243,14 @@ static void pass_dse(Context& ctx) {
 // Note: FNMul diverges from FMUL+FNEG only in the sign bit of a NaN result
 // (AArch64 propagates the input NaN unnegated) — same fidelity class as the
 // FMA fusion's rounding difference, accepted.
+//
+// ORDER MATTERS — the two rewrites compete for the same FNeg. Inputs always
+// have lower node IDs, so one forward loop reaches FNeg(FMul(a,b)) BEFORE its
+// FAdd/FSub consumer: the FNeg becomes FNMul, the consumer no longer sees an
+// FNeg to fold, and pass_fma (which only looks for FMul) finds nothing —
+// `fld a; fld b; fmul; fchs; fadd x` lowers to FNMUL+FADD instead of the
+// single FMSUB it should. So the consumer folds run to completion first, and
+// only FNegs that survive them collapse into FNMul.
 
 static void pass_fneg_fold(Context& ctx) {
     int16_t use_count[kMaxNodes] = {};
@@ -284,40 +271,50 @@ static void pass_fneg_fold(Context& ctx) {
                !(ctx.nodes[id].flags & kDead) && use_count[id] == 1;
     };
 
+    // Step 1: fold FNeg into its FAdd/FSub consumer.
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
+        if (n.op != Op::FAdd && n.op != Op::FSub) continue;
 
-        if (n.op == Op::FAdd || n.op == Op::FSub) {
-            int16_t in0 = n.inputs[0], in1 = n.inputs[1];
-            if (single_use_op(in1, Op::FNeg)) {
-                auto& neg = ctx.nodes[in1];
-                n.op = (n.op == Op::FAdd) ? Op::FSub : Op::FAdd;
-                n.inputs[1] = neg.inputs[0];
-                neg.flags |= kDead;
-                use_count[in1] = 0;
-                if (neg.inputs[0] >= 0) use_count[neg.inputs[0]]++;
-            } else if (n.op == Op::FAdd && single_use_op(in0, Op::FNeg)) {
-                auto& neg = ctx.nodes[in0];
-                n.op = Op::FSub;
-                n.inputs[0] = in1;
-                n.inputs[1] = neg.inputs[0];
-                neg.flags |= kDead;
-                use_count[in0] = 0;
-                if (neg.inputs[0] >= 0) use_count[neg.inputs[0]]++;
-            }
-        } else if (n.op == Op::FNeg) {
-            int16_t m = n.inputs[0];
-            if (single_use_op(m, Op::FMul)) {
-                auto& mul = ctx.nodes[m];
-                n.op = Op::FNMul;
-                n.inputs[0] = mul.inputs[0];
-                n.inputs[1] = mul.inputs[1];
-                mul.flags |= kDead;
-                use_count[m] = 0;
-                if (mul.inputs[0] >= 0) use_count[mul.inputs[0]]++;
-                if (mul.inputs[1] >= 0) use_count[mul.inputs[1]]++;
-            }
+        int16_t in0 = n.inputs[0], in1 = n.inputs[1];
+        if (single_use_op(in1, Op::FNeg)) {
+            auto& neg = ctx.nodes[in1];
+            n.op = (n.op == Op::FAdd) ? Op::FSub : Op::FAdd;
+            n.inputs[1] = neg.inputs[0];
+            neg.flags |= kDead;
+            use_count[in1] = 0;
+            // Over-counts by one (the dead FNeg's use is never decremented) —
+            // safe because counts only ever exceed truth, so single-use checks
+            // stay conservative; mind this before adding deeper folds here.
+            if (neg.inputs[0] >= 0) use_count[neg.inputs[0]]++;
+        } else if (n.op == Op::FAdd && single_use_op(in0, Op::FNeg)) {
+            auto& neg = ctx.nodes[in0];
+            n.op = Op::FSub;
+            n.inputs[0] = in1;
+            n.inputs[1] = neg.inputs[0];
+            neg.flags |= kDead;
+            use_count[in0] = 0;
+            if (neg.inputs[0] >= 0) use_count[neg.inputs[0]]++;
+        }
+    }
+
+    // Step 2: FNegs that survived step 1 collapse a single-use mul into FNMUL.
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op != Op::FNeg) continue;
+
+        int16_t m = n.inputs[0];
+        if (single_use_op(m, Op::FMul)) {
+            auto& mul = ctx.nodes[m];
+            n.op = Op::FNMul;
+            n.inputs[0] = mul.inputs[0];
+            n.inputs[1] = mul.inputs[1];
+            mul.flags |= kDead;
+            use_count[m] = 0;
+            if (mul.inputs[0] >= 0) use_count[mul.inputs[0]]++;
+            if (mul.inputs[1] >= 0) use_count[mul.inputs[1]]++;
         }
     }
 }

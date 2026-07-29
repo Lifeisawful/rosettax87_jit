@@ -140,6 +140,38 @@ static double fmul_fchs(double a, double b) {
     return out;
 }
 
+/* ==== fld a; fmul b; fchs; fadd c  →  c - a*b  (must reach ONE FMSUB) ====
+ * The FNeg has two possible folds: into the FMul below it (FNMUL) or into
+ * the FAdd above it (FSub, which pass_fma then turns into FMSUB). Inputs
+ * have lower node IDs, so a single forward loop would reach the FNeg first
+ * and take FNMUL, stranding the FAdd — pass_fneg_fold therefore runs the
+ * consumer folds to completion before any FNMUL rewrite. */
+static double fmul_fchs_fadd(double a, double b, double c) {
+    double out;
+    __asm__ volatile(
+        "fldl %1\n\t"
+        "fmull %2\n\t"         /* a*b */
+        "fchs\n\t"             /* -(a*b) */
+        "faddl %3\n\t"         /* c - a*b */
+        "fstpl %0\n"
+        : "=m"(out) : "m"(a), "m"(b), "m"(c));
+    return out;
+}
+
+/* ==== same shape, popping form: fld c; fld a; fmul b; fchs; faddp ==== */
+static double fmul_fchs_faddp(double a, double b, double c) {
+    double out;
+    __asm__ volatile(
+        "fldl %3\n\t"          /* c */
+        "fldl %1\n\t"          /* a */
+        "fmull %2\n\t"         /* a*b */
+        "fchs\n\t"             /* -(a*b) */
+        "faddp\n\t"            /* c + (-(a*b)) */
+        "fstpl %0\n"
+        : "=m"(out) : "m"(a), "m"(b), "m"(c));
+    return out;
+}
+
 /* ==== fmul result used twice, then fchs: FNMUL must NOT fire ==== */
 static void fmul_shared_fchs(double a, double b, double *neg, double *pos) {
     __asm__ volatile(
@@ -212,6 +244,10 @@ int main(void) {
     check("fmul+fchs → -(a*b)", fmul_fchs(3.0, 4.0), -12.0);
     check("fmul+fchs sign of zero (+0*x → -0)", fmul_fchs(0.0, 5.0), -0.0);
     check("fmul+fchs sign of zero (-0*x → +0)", fmul_fchs(-0.0, 5.0), 0.0);
+    /* Exact products, so the fused (FMSUB) and unfused forms agree bitwise. */
+    check("fmul+fchs+fadd → c - a*b", fmul_fchs_fadd(3.0, 4.0, 20.0), 8.0);
+    check("fmul+fchs+fadd negative result", fmul_fchs_fadd(3.0, 4.0, 2.0), -10.0);
+    check("fmul+fchs+faddp → c - a*b", fmul_fchs_faddp(3.0, 4.0, 20.0), 8.0);
 
     {
         double neg, pos;
