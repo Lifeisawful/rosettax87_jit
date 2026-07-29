@@ -19,25 +19,47 @@
 
 // Internal helpers from TranslatorX87Internal.hpp that we need.
 namespace TranslatorX87 {
-inline auto x87_begin(TranslationResult& a1, AssemblerBuffer& buf) -> std::pair<int, int> {
+// The x87-state preamble registers. Any of them may be -1 when the run does
+// not read them (see X87IR::StateNeeds); the emitters that take them are only
+// reached from nodes that demanded them.
+struct X87Regs {
+    int base = -1;      // Xbase   — &X87State
+    int top = -1;       // Wd_top  — current TOP (extracted from status_word)
+    int st_base = -1;   // Xst_base — &X87State.st[0]
+};
+
+// Materialize only the requested subset of the preamble. `want_st_base`
+// additionally requires the run cache to be live (the ST-base register is the
+// cache's, and emit_load_st/emit_store_st fall back to Xbase+Wd_tmp without
+// it). Returns already-pinned registers unchanged on mid-run entry.
+inline X87Regs x87_begin_sel(TranslationResult& a1, AssemblerBuffer& buf, bool want_base,
+                             bool want_top, bool want_st_base) {
     if (a1.x87_cache.run_remaining > 0 && a1.x87_cache.gprs_valid)
-        return {a1.x87_cache.base_gpr, a1.x87_cache.top_gpr};
-    const int Xbase = alloc_gpr(a1, 0);
-    const int Wd_top = alloc_gpr(a1, 1);
-    emit_x87_base(buf, a1, Xbase);
-    emit_load_top(buf, a1, Xbase, Wd_top);
-    if (a1.x87_cache.run_remaining > 0) {
-        a1.x87_cache.base_gpr = static_cast<int8_t>(Xbase);
-        a1.x87_cache.top_gpr = static_cast<int8_t>(Wd_top);
-        const int Xst_base = alloc_gpr(a1, 6);
-        emit_add_imm(buf, 1, 0, 0, 0, kX87RegFileOff, Xbase, Xst_base);
-        a1.x87_cache.st_base_gpr = static_cast<int8_t>(Xst_base);
+        return {a1.x87_cache.base_gpr, a1.x87_cache.top_gpr, a1.x87_cache.st_base_gpr};
+    // Everything below is addressed through Xbase (emit_load_top may use it as
+    // its LDRH base, and Xst_base is Xbase + kX87RegFileOff).
+    if (want_top || want_st_base) want_base = true;
+    X87Regs r;
+    if (!want_base) return r;
+    r.base = alloc_gpr(a1, 0);
+    emit_x87_base(buf, a1, r.base);
+    if (want_top) {
+        r.top = alloc_gpr(a1, 1);
+        emit_load_top(buf, a1, r.base, r.top);
+    }
+    if (want_st_base && a1.x87_cache.run_remaining > 0) {
+        r.st_base = alloc_gpr(a1, 6);
+        emit_add_imm(buf, 1, 0, 0, 0, kX87RegFileOff, r.base, r.st_base);
+    }
+    // Publish to the run cache only when all three are live — a later run in
+    // the window reads all of them, so a partial set must not be advertised.
+    if (a1.x87_cache.run_remaining > 0 && r.top >= 0 && r.st_base >= 0) {
+        a1.x87_cache.base_gpr = static_cast<int8_t>(r.base);
+        a1.x87_cache.top_gpr = static_cast<int8_t>(r.top);
+        a1.x87_cache.st_base_gpr = static_cast<int8_t>(r.st_base);
         a1.x87_cache.gprs_valid = 1;
     }
-    return {Xbase, Wd_top};
-}
-inline int x87_get_st_base(TranslationResult& a1) {
-    return a1.x87_cache.gprs_valid ? a1.x87_cache.st_base_gpr : -1;
+    return r;
 }
 }  // namespace TranslatorX87
 
@@ -899,15 +921,114 @@ static bool carried_key_match(const X87Cache::CarriedBase& c, const IROperand* o
            c.shift_amount == op->mem.shift_amount;
 }
 
+// ── x87-state preamble demand ───────────────────────────────────────────────
+//
+// The preamble (ADD Xbase / LDRH+UBFX TOP / ADD Xst_base / Wd_tmp) used to be
+// emitted unconditionally, but a run only reads those registers when it
+// touches the x87 register file, the status/tag/control words, or leaves the
+// stack unbalanced.  The dominant shape in real code — a balanced run ending
+// in `fstp m32/m64`, with no compare and no residue — reads none of them, and
+// paid 4 dead instructions per run (in `fld m64; fstp m64` loops that was 4 of
+// 8 instructions).  This walk decides what to materialize.
+//
+// Deliberately conservative: over-claiming a register only restores the old
+// behavior, while under-claiming would hand a -1 to an emitter.  It mirrors
+// the GENERIC body (top_known < 0), which is a superset of the TOP=0
+// specialized one, so it stays valid when both bodies are emitted.
+
+struct StateNeeds {
+    bool base = false;      // Xbase
+    bool top = false;       // Wd_top
+    bool st_base = false;   // Xst_base (implies base + top via the ST paths)
+    bool tmp = false;       // Wd_tmp
+};
+
+static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
+                                      int entry_push_count, int entry_pop_count,
+                                      bool top0_specialize) {
+    StateNeeds nd;
+    const bool fast_round = g_rosetta_config && g_rosetta_config->fast_round;
+
+    // ── Node loop ───────────────────────────────────────────────────────────
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        switch (n.op) {
+            case Op::ReadSt:
+                // Generic path: emit_load_st(Xbase, Wd_top, Wd_tmp, Xst_base).
+                nd.base = nd.top = nd.st_base = nd.tmp = true;
+                break;
+            // status_word RMW / AX write.
+            case Op::FCmp: case Op::FTst:
+                nd.base = true;
+                break;
+            case Op::FStsw:
+                nd.base = true;
+                // TOP is patched into the returned word from Wd_top whenever
+                // the snapshot is nonzero or the in-memory TOP is stale.
+                if (static_cast<int16_t>(n.aux >> 16) != 0 || entry_top_dirty)
+                    nd.top = true;
+                break;
+            // control_word traffic.
+            case Op::StoreCW: case Op::LoadCW:
+                nd.base = true;
+                break;
+            case Op::FRndInt:
+                if (!fast_round) nd.base = true;  // RC read from control_word
+                break;
+            case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
+                if (!(n.flags & kTruncate)) {
+                    // RC dispatch: emit_rc_preamble / emit_rcmode_dispatch.
+                    nd.base = true;
+                    nd.tmp = true;
+                }
+                break;
+            // Value calls clear C1 (|C2) in status_word; F2XM1 touches none.
+            case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+            case Op::FSinCosCall: case Op::FScaleCall:
+            case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
+                nd.base = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // ── Epilogue ────────────────────────────────────────────────────────────
+    // Step 1/3: TOP register update and its status_word writeback.
+    if (ctx.top_delta != 0 || entry_top_dirty) {
+        nd.base = nd.top = nd.tmp = true;  // emit_store_top(Xbase, Wd_top, Wd_tmp)
+    }
+    // Step 2: stack-slot writeback (same skip rules as lower()'s epilogue; a
+    // dead value is what makes fprs.get() return -1 there).
+    for (int d = 0; d < 8; d++) {
+        const int16_t val = ctx.slot_val[d];
+        if (val < 0 || val >= ctx.num_nodes) continue;
+        const auto& vn = ctx.nodes[val];
+        if (vn.flags & kDead) continue;
+        if (vn.op == Op::ReadSt && vn.initial_depth == d + ctx.top_delta) continue;
+        nd.base = nd.top = nd.st_base = nd.tmp = true;
+        break;
+    }
+    // Step 4: tag-word batches (generic form indexes by Wd_top via Wd_tmp).
+    {
+        const int set_valid = (entry_push_count - ctx.top_delta > 0)
+                                  ? entry_push_count - ctx.top_delta : 0;
+        const int set_empty = (ctx.top_delta + entry_pop_count - entry_push_count > 0)
+                                  ? ctx.top_delta + entry_pop_count - entry_push_count : 0;
+        if (set_valid > 0 || set_empty > 0) nd.base = nd.top = nd.tmp = true;
+    }
+    // The TOP=0 guard branches on Wd_top.
+    if (top0_specialize) nd.base = nd.top = true;
+
+    if (nd.st_base || nd.top) nd.base = true;
+    return nd;
+}
+
 // ── Main lowering ───────────────────────────────────────────────────────────
 
 void lower(Context& ctx, TranslationResult* result) {
     auto& buf = result->insn_buf;
-
-    // ── Preamble: acquire base, TOP, and st_base ────────────────────────────
-    auto [Xbase, Wd_top] = TranslatorX87::x87_begin(*result, buf);
-    int Xst_base = TranslatorX87::x87_get_st_base(*result);
-    int Wd_tmp = alloc_gpr(*result, 2);
 
     // Carried-in deferred cache state (mid-run entry). The epilogue folds
     // these into its TOP/tag writeback; step 6 then clears the flags.
@@ -940,6 +1061,27 @@ void lower(Context& ctx, TranslationResult* result) {
     // TOP update becomes MOVZ, tag batch masks become constants.
     if (ctx.top_delta != 0) top0_benefit += 3;
     const bool top0_specialize = top0_benefit >= 4;
+
+    // ── Preamble: acquire only the x87-state registers this run reads ───────
+    // Emitted here (not at function entry) because the demand walk needs
+    // top0_specialize; nothing above emits instructions, so the preamble still
+    // precedes the whole body.
+    //
+    // When the run cache outlives this run, materialize everything regardless:
+    // the following run reads all three through the cache, and paying for them
+    // once here is strictly cheaper than a partial set that forces the next run
+    // to redo the lot.
+    StateNeeds nd = compute_state_needs(ctx, entry_top_dirty, entry_push_count,
+                                        entry_pop_count, top0_specialize);
+    if (result->x87_cache.run_remaining > ctx.consumed)
+        nd.base = nd.top = nd.st_base = nd.tmp = true;
+
+    const auto x87r =
+        TranslatorX87::x87_begin_sel(*result, buf, nd.base, nd.top, nd.st_base);
+    const int Xbase = x87r.base;
+    const int Wd_top = x87r.top;
+    const int Xst_base = x87r.st_base;
+    const int Wd_tmp = nd.tmp ? alloc_gpr(*result, 2) : -1;
 
     // ── Base-address cache: materialize planned guest bases ────────────────
     // OPT-BC: a planned base whose key matches a carried entry reuses the
@@ -1168,9 +1310,11 @@ void lower(Context& ctx, TranslationResult* result) {
                 break;
             }
             if (!emit_cached_access(n, size, /*is_load=*/1, Dd)) {
-                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-                emit_fldr_imm(buf, size, Dd, addr, 0);
-                free_gpr(*result, addr);
+                // Not through a cached base — still fold the displacement into
+                // the addressing mode rather than materializing the full EA
+                // (emit_fp_mem_access, same helper LoadI64 already uses).
+                emit_fp_mem_access(*result, /*is_64bit=*/1, n.mem_operand, size,
+                                   /*is_load=*/1, Dd);
             }
             break;
         }
@@ -1455,9 +1599,10 @@ void lower(Context& ctx, TranslationResult* result) {
                 break;
             }
             if (!emit_cached_access(n, size, /*is_load=*/0, Dd_val)) {
-                int addr = compute_operand_address(*result, true, n.mem_operand, GPR::XZR);
-                emit_fstr_imm(buf, size, Dd_val, addr, 0);
-                free_gpr(*result, addr);
+                // See LoadF64/LoadF32Raw: fold the disp instead of building
+                // the effective address in a scratch GPR.
+                emit_fp_mem_access(*result, /*is_64bit=*/1, n.mem_operand, size,
+                                   /*is_load=*/0, Dd_val);
             }
             break;
         }
@@ -2045,7 +2190,7 @@ void lower(Context& ctx, TranslationResult* result) {
         if (Wd_rc_cached >= 0 && !rc_carried)
             free_gpr(*result, Wd_rc_cached);
     }
-    free_gpr(*result, Wd_tmp);
+    if (Wd_tmp >= 0) free_gpr(*result, Wd_tmp);
 
     // 8. If cache is about to expire (run_remaining will hit 0 after ticks),
     //    free the cache GPRs. Otherwise, leave them pinned for the next run.
