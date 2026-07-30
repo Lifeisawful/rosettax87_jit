@@ -557,18 +557,49 @@ static void plan_fcomi_raw(Context& ctx) {
 // only on 32-bit pointer wraparound, impossible for valid pointers with
 // |disp| ≤ 32 KB.
 
+// Immediate (text-base + N) operand whose full address is baked into the
+// ADRP/ADD fixup target (see compute_operand_address): mem_flags bit0 set, or
+// the addend is bake-eligible.  Only these participate in the anchor cache —
+// the runtime-addend form materializes part of the address after the fixup,
+// so value differences are not LDR-foldable displacements.
+static bool addr_imm_direct(const IROperand* op) {
+    return (op->imm.mem_flags & 1) != 0 ||
+           (op->imm.mem_flags == 0 && op->imm.value >= 0 &&
+            op->imm.value <= INT32_MAX);
+}
+
 static bool addr_operand_base_cacheable(const IROperand* op) {
+    if (op->kind == IROperandKind::Immediate) return addr_imm_direct(op);
     return op->kind == IROperandKind::MemRef && op->mem.seg_override == 0 &&
            (op->mem.mem_flags & 1) != 0;  // has_base
 }
 
-// Same address computation modulo displacement.
+// Same address computation modulo displacement.  For Immediate operands the
+// shared "base" is the guest text base itself — every direct Immediate in the
+// run resolves to text+value, so the key is just the encoding fields and the
+// value acts as the displacement (mem_flags must match for the values to be
+// comparable, mirroring mem_operand_equal).
 static bool addr_base_key_equal(const IROperand* a, const IROperand* b) {
+    if (a->kind != b->kind) return false;
+    if (a->kind == IROperandKind::Immediate)
+        return a->imm.addr_size == b->imm.addr_size &&
+               a->imm.mem_flags == b->imm.mem_flags;
     return a->mem.addr_size == b->mem.addr_size &&
            a->mem.mem_flags == b->mem.mem_flags &&
            a->mem.base_reg == b->mem.base_reg &&
            a->mem.index_reg == b->mem.index_reg &&
            a->mem.shift_amount == b->mem.shift_amount;
+}
+
+// Displacement of an access relative to its cached base register.  A MemRef
+// rep is materialized with disp forced to 0, so the access's own disp applies;
+// an Immediate rep is materialized at text+rep.value, so the displacement is
+// the value difference (plan_addr_cache anchors at the minimum value, keeping
+// deltas non-negative for the scaled-imm12 form).
+static int64_t addr_cached_disp(const IROperand* op, const IROperand* rep) {
+    if (op->kind == IROperandKind::Immediate)
+        return op->imm.value - rep->imm.value;
+    return op->mem.disp;
 }
 
 static bool addr_disp_foldable(const IROperand* op, bool is_f64) {
@@ -601,8 +632,9 @@ static bool addr_uses_written_reg(const IROperand* op, uint16_t written_mask) {
 
 // Access width of a Guest load/store node's memory operand.
 static int guest_mem_size_log2(const IROperand* m) {
-    const IROperandSize s =
-        m->kind == IROperandKind::AbsMem ? m->abs_mem.size : m->mem.size;
+    const IROperandSize s = m->kind == IROperandKind::AbsMem ? m->abs_mem.size
+                          : m->kind == IROperandKind::Immediate ? m->imm.size
+                                                                : m->mem.size;
     switch (s) {
         case IROperandSize::S8: return 0;
         case IROperandSize::S16: return 1;
@@ -695,13 +727,19 @@ static void compute_pairs(const Context& ctx, IROperand* const* reps, int nreps,
         if (!pair_class(n.op, &is_load, &scale)) continue;
         const IROperand* mo = n.mem_operand;
         if (!addr_operand_base_cacheable(mo)) continue;
+        // Displacement reference: the planned rep, or (reps == nullptr,
+        // pressure-model superset mode) the lead operand itself — for an
+        // Immediate lead that makes d1 = 0, admitting any element-apart
+        // partner, a superset of what any anchor choice would form.
+        const IROperand* rp = mo;
         if (reps) {
             int k = 0;
             for (; k < nreps; k++)
                 if (addr_base_key_equal(mo, reps[k])) break;
             if (k == nreps) continue;
+            rp = reps[k];
         }
-        const int64_t d1 = mo->mem.disp;
+        const int64_t d1 = addr_cached_disp(mo, rp);
         if (!pair_disp_ok(d1, scale)) continue;
 
         int skipped = 0;
@@ -711,7 +749,7 @@ static void compute_pairs(const Context& ctx, IROperand* const* reps, int nreps,
             if (m.op == n.op && !pair_skip[j] && pair_with[j] < 0 &&
                 addr_operand_base_cacheable(m.mem_operand) &&
                 addr_base_key_equal(mo, m.mem_operand)) {
-                const int64_t d2 = m.mem_operand->mem.disp;
+                const int64_t d2 = addr_cached_disp(m.mem_operand, rp);
                 if (pair_disp_ok(d2, scale) &&
                     (d2 == d1 + scale || d2 == d1 - scale)) {
                     if (is_load) {
@@ -767,33 +805,42 @@ static int plan_addr_cache(Context& ctx) {
     for (int i = 0; i < ctx.num_nodes; i++) {
         const auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
-        bool foldable;
+        bool foldable = false;
+        int size_log2;  // access width — Immediate foldability is delta-based
         switch (n.op) {
             case Op::LoadF64: case Op::StoreF64:
-                foldable = addr_disp_foldable(n.mem_operand, /*is_f64=*/true);
+                size_log2 = 3;
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           addr_disp_foldable(n.mem_operand, /*is_f64=*/true);
                 break;
             case Op::LoadF32Raw: case Op::StoreF32Raw:
-                foldable = addr_disp_foldable(n.mem_operand, /*is_f64=*/false);
+                size_log2 = 2;
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           addr_disp_foldable(n.mem_operand, /*is_f64=*/false);
                 break;
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
             case Op::GuestRmwR:
                 // Width varies (8/16/32/64) — classify at the exact size so a
                 // counted access is one the cached path can actually emit.
+                size_log2 = guest_mem_size_log2(n.mem_operand);
                 foldable = n.mem_operand->kind == IROperandKind::MemRef &&
                            classify_ldst_disp(n.mem_operand->mem.disp,
-                                              guest_mem_size_log2(n.mem_operand)) != 0;
+                                              size_log2) != 0;
                 break;
             // Integer x87 nodes: classify at the access width.
             case Op::LoadI16: case Op::StoreI16:
             case Op::StoreCW: case Op::LoadCW:
+                size_log2 = 1;
                 foldable = n.mem_operand->kind == IROperandKind::MemRef &&
                            classify_ldst_disp(n.mem_operand->mem.disp, 1) != 0;
                 break;
             case Op::LoadI32: case Op::StoreI32:
+                size_log2 = 2;
                 foldable = n.mem_operand->kind == IROperandKind::MemRef &&
                            classify_ldst_disp(n.mem_operand->mem.disp, 2) != 0;
                 break;
             case Op::LoadI64: case Op::StoreI64:
+                size_log2 = 3;
                 foldable = n.mem_operand->kind == IROperandKind::MemRef &&
                            classify_ldst_disp(n.mem_operand->mem.disp, 3) != 0;
                 break;
@@ -801,6 +848,33 @@ static int plan_addr_cache(Context& ctx) {
         }
         const IROperand* mo = n.mem_operand;
         if (!addr_operand_base_cacheable(mo)) continue;
+        if (mo->kind == IROperandKind::Immediate) {
+            // Text-base anchor: one key per (addr_size, mem_flags); the rep is
+            // re-anchored at the lowest value seen so final deltas are all
+            // non-negative (scaled-imm12 territory).  A node counted foldable
+            // against an earlier, higher anchor may drift out of range — the
+            // count only ranks slots; emit_cached_access re-checks and falls
+            // back per access.
+            int k = 0;
+            for (; k < nkeys; k++) {
+                const IROperand* rep = ctx.nodes[keys[k].node].mem_operand;
+                if (!addr_base_key_equal(rep, mo)) continue;
+                if (mo->imm.value < rep->imm.value) {
+                    keys[k].node = static_cast<int16_t>(i);
+                    rep = mo;
+                }
+                if (classify_ldst_disp(mo->imm.value - rep->imm.value,
+                                       size_log2) != 0)
+                    keys[k].count++;
+                break;
+            }
+            if (k == nkeys && nkeys < 6) {
+                keys[nkeys].node = static_cast<int16_t>(i);
+                keys[nkeys].count = 1;
+                nkeys++;
+            }
+            continue;
+        }
         if (has_fstsw && addr_uses_rax(mo)) continue;
         if (addr_uses_written_reg(mo, ctx.guest_written_mask)) continue;
         if (!foldable) continue;
@@ -1077,8 +1151,11 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
 
 // ── OPT-BC: carried-entry key match ─────────────────────────────────────────
 // Same identity as addr_base_key_equal, against a CarriedBase snapshot.
+// MemRef only: Immediate anchors are never carried (the snapshot has no field
+// for the anchor value), and their union bytes must not be read as mem fields.
 static bool carried_key_match(const X87Cache::CarriedBase& c, const IROperand* op) {
-    return c.addr_size == static_cast<uint8_t>(op->mem.addr_size) &&
+    return op->kind == IROperandKind::MemRef &&
+           c.addr_size == static_cast<uint8_t>(op->mem.addr_size) &&
            c.mem_flags == op->mem.mem_flags &&
            c.base_reg == op->mem.base_reg &&
            c.index_reg == op->mem.index_reg &&
@@ -1287,7 +1364,10 @@ void lower(Context& ctx, TranslationResult* result) {
             }
         }
         IROperand base_op = *addr_rep[k];
-        base_op.mem.disp = 0;
+        // MemRef: materialize base+index only, displacements fold per access.
+        // Immediate: materialize the full anchor address (ADRP/ADD with the
+        // rep's baked fixup target); other operands fold their value-delta.
+        if (base_op.kind == IROperandKind::MemRef) base_op.mem.disp = 0;
         addr_reg[k] = compute_operand_address(*result, true, &base_op, GPR::XZR);
         // The 64-bit no-disp path returns the guest register itself (nothing
         // allocated); only scratch-pool registers are ours to free.
@@ -1301,20 +1381,23 @@ void lower(Context& ctx, TranslationResult* result) {
         for (int k = 0; k < addr_n; k++) {
             if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
             if (try_emit_fp_ldst_disp(buf, size, is_load, Vt, addr_reg[k],
-                                      n.mem_operand->mem.disp))
+                                      addr_cached_disp(n.mem_operand, addr_rep[k])))
                 return true;
         }
         return false;
     };
 
     // GPR counterpart for Guest load/store nodes. The kind guard matters:
-    // an AbsMem operand's bytes must not be compared as MemRef fields.
+    // an AbsMem operand's bytes must not be compared as MemRef fields
+    // (addr_base_key_equal handles MemRef/Immediate kind dispatch itself).
     auto emit_cached_gpr_access = [&](const Node& n, int size_log2, int is_load,
                                       int Rt) -> bool {
-        if (n.mem_operand->kind != IROperandKind::MemRef) return false;
+        if (n.mem_operand->kind != IROperandKind::MemRef &&
+            n.mem_operand->kind != IROperandKind::Immediate)
+            return false;
         for (int k = 0; k < addr_n; k++) {
             if (!addr_base_key_equal(n.mem_operand, addr_rep[k])) continue;
-            const int64_t disp = n.mem_operand->mem.disp;
+            const int64_t disp = addr_cached_disp(n.mem_operand, addr_rep[k]);
             const int cls = classify_ldst_disp(disp, size_log2);
             if (cls == 1) {
                 emit_ldr_str_imm(buf, size_log2, /*is_fp=*/0, /*opc=*/is_load,
@@ -1346,8 +1429,8 @@ void lower(Context& ctx, TranslationResult* result) {
         int k = 0;
         for (; k < addr_n; k++)
             if (addr_base_key_equal(a.mem_operand, addr_rep[k])) break;
-        const int64_t d1 = a.mem_operand->mem.disp;
-        const int64_t d2 = b.mem_operand->mem.disp;
+        const int64_t d1 = addr_cached_disp(a.mem_operand, addr_rep[k]);
+        const int64_t d2 = addr_cached_disp(b.mem_operand, addr_rep[k]);
         const int64_t lo = d1 < d2 ? d1 : d2;
         const int Vt1 = d1 < d2 ? Va : Vb;
         const int Vt2 = d1 < d2 ? Vb : Va;
@@ -2587,7 +2670,10 @@ void lower(Context& ctx, TranslationResult* result) {
             int nbase = 0;
             // This run's planned reps: plan_addr_cache already excluded
             // guest-written and FSTSW/RAX operands, so every rep qualifies.
+            // Immediate anchors are not carried — CarriedBase has no field
+            // for the anchor value, so the next run couldn't key against it.
             for (int k = 0; k < addr_n && nbase < X87Cache::kMaxCarried; k++) {
+                if (addr_rep[k]->kind != IROperandKind::MemRef) continue;
                 if (!gpr_carryable(addr_reg[k])) continue;
                 auto& c = next[nbase];
                 c.addr_size = static_cast<uint8_t>(addr_rep[k]->mem.addr_size);
@@ -3159,6 +3245,14 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
             int c = 0;
             for (int k = 0; k < n; k++) {
                 const IROperand* mo = ctx.nodes[ctx.addr_cache_rep[k]].mem_operand;
+                // Immediate anchor: always allocates one scratch for the
+                // ADRP/ADD result, and is never carried — full charge. (The
+                // kind check also keeps the MemRef bypass below from reading
+                // imm union bytes as mem fields.)
+                if (mo->kind == IROperandKind::Immediate) {
+                    c++;
+                    continue;
+                }
                 // 64-bit base-only operand: compute_operand_address returns
                 // the guest register itself — nothing is pinned.
                 if (mo->mem.addr_size == IROperandSize::S64 &&
