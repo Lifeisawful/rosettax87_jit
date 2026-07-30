@@ -308,15 +308,42 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
 void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
                             int Xbase, int Wd_packed);
 
+// =============================================================================
+// status_word store with NO load — the compare's CC write.
+//
+//   status_word bit: 15   14  13 12 11  10  9  8 | 7  6  5  4  3  2  1  0
+//                     B   C3   <- TOP ->  C2 C1 C0| ES SF PE UE OE ZE DE IE
+//
+// Every bit from 8 up is known to the JIT (C0/C2/C3 from the compare, C1
+// architecturally cleared by FCOM, TOP tracked by the run), so the halfword is
+// built in a register and stored outright rather than read-modify-written.
+//
+// The point is not the saved instructions but the removed dependency: every
+// run's emit_load_top reads this halfword and every compare writes it, so the
+// RMW chained iterations together through memory
+// (STRH -> LDRH -> UBFX -> ORR -> STRH). Breaking it is worth ~46% on the
+// fcom/ftst family — but ONLY when Wd_top is a translate-time constant, which
+// is why compile_run specializes compare-bearing runs on TOP == 0. Passing a
+// loaded Wd_top here reinstates the chain and measures ~2% SLOWER than the RMW.
+//
+// The store must stay halfword-wide: a byte store cannot forward to
+// emit_load_top's LDRH and measured 2.7x slower than the RMW.
+//
+// FIDELITY: the low byte (exception flags IE/DE/ZE/OE/UE/PE, SF, ES) and bit 15
+// (B) are written as 0 rather than preserved. This pipeline models no FP
+// exceptions and nothing in this tree ever sets those bits, so they are already
+// 0 in every reachable state — but a value placed there from outside (e.g. a
+// state restore) would be cleared by the next compare.
+//
+// Wd_cc: packed CC from emit_fcom_cc_pack; overwritten with the merged
+// halfword. Wd_top: TOP value in bits [2:0] (XZR when TOP is known to be 0).
+void emit_fcom_cc_store_sw(AssemblerBuffer& buf, int Xbase, int Wd_cc, int Wd_top);
+
 // Same RMW, but returns the GPR holding the merged status_word instead of
 // freeing it — lets the caller reuse the value (e.g. FSTSW AX) without
 // reloading the halfword it just stored. Caller frees the returned GPR.
-//
-// `store` = false emits the load/merge but NOT the STRH, leaving the caller to
-// store the register once it has finished patching it (the IR FSTSW path folds
-// the run's final TOP in first, so the halfword is written exactly once).
 int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
-                                int Xbase, int Wd_packed, bool store = true);
+                                int Xbase, int Wd_packed);
 
 // =============================================================================
 // RC dispatch — binary tree over the x87 RC field (control_word bits [11:10],

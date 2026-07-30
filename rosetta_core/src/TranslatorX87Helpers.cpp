@@ -841,12 +841,26 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
 }
 
 // =============================================================================
+// status_word store with NO load — see the header for the bit layout, why the
+// removed dependency (not the instruction count) is the win, and the fidelity
+// note on the low byte.
+// =============================================================================
+void emit_fcom_cc_store_sw(AssemblerBuffer& buf, int Xbase, int Wd_cc, int Wd_top) {
+    // ORR Wd_cc, Wd_cc, Wd_top, LSL #11   — merge the TOP field
+    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_top, kX87TopShift,
+                             Wd_cc, Wd_cc);
+    // STRH Wd_cc, [Xbase, #kX87StatusWordOff]
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
+                     kX87StatusWordImm12, Xbase, Wd_cc);
+}
+
+// =============================================================================
 // OPT-L: RMW status_word — clear C0/C1/C2/C3, OR in packed CC bits, store.
 //
 // C1 (bit 9) is cleared per Intel SDM for all FCOM variants.
 // =============================================================================
 int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
-                                int Xbase, int Wd_packed, bool store) {
+                                int Xbase, int Wd_packed) {
     static constexpr int16_t kX87StatusWordImm12 = kX87StatusWordOff / 2;
 
     const int Wd_sw = alloc_free_gpr(a1);
@@ -861,8 +875,8 @@ int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
     // ORR Wd_sw, Wd_sw, Wd_packed
     emit_logical_shifted_reg(buf, 0, 1, 0, 0, Wd_packed, 0, Wd_sw, Wd_sw);
 
-    // STRH Wd_sw, [Xbase, #0x02]  — deferred to the caller when !store.
-    if (store) emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
+    // STRH Wd_sw, [Xbase, #0x02]
+    emit_ldr_str_imm(buf, 1, 0, 0, kX87StatusWordImm12, Xbase, Wd_sw);
 
     return Wd_sw;
 }

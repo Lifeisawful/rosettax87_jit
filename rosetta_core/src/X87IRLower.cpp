@@ -960,14 +960,14 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
                 break;
             // status_word RMW / AX write.
             case Op::FCmp: case Op::FTst:
-                nd.base = true;
+                // The CC store merges TOP in from Wd_top.
+                nd.base = nd.top = true;
                 break;
             case Op::FStsw:
-                nd.base = true;
-                // TOP is patched into the returned word from Wd_top whenever
-                // the snapshot is nonzero or the in-memory TOP is stale.
-                if (static_cast<int16_t>(n.aux >> 16) != 0 || entry_top_dirty)
-                    nd.top = true;
+                // TOP is merged into the stored halfword and patched into
+                // the returned word; both read Wd_top unless it is a
+                // translate-time constant, which only the specialized body has.
+                nd.base = nd.top = true;
                 break;
             // control_word traffic.
             case Op::StoreCW: case Op::LoadCW:
@@ -1060,6 +1060,18 @@ void lower(Context& ctx, TranslationResult* result) {
     }
     // TOP update becomes MOVZ, tag batch masks become constants.
     if (ctx.top_delta != 0) top0_benefit += 3;
+    // A compare's status_word store merges the TOP field. With TOP known at
+    // translate time that operand is a constant; otherwise it comes from the
+    // preamble's LDRH of status_word — the very halfword the store writes —
+    // putting a full memory round-trip on the loop-carried dependency chain
+    // (STRH -> LDRH -> UBFX -> ORR -> STRH). Specializing breaks it, and the
+    // guard branch is a control dependency the predictor hides. Measured ~46%
+    // on the fcom/ftst family, so any compare alone justifies the second body.
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op == Op::FCmp || n.op == Op::FTst) { top0_benefit += 4; break; }
+    }
     const bool top0_specialize = top0_benefit >= 4;
 
     // ── Preamble: acquire only the x87-state registers this run reads ───────
@@ -1713,8 +1725,12 @@ void lower(Context& ctx, TranslationResult* result) {
                 // Store the GPR number in node_fpr[] (repurposed for GPR tracking).
                 fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
             } else {
-                // Non-fused: write CC to status_word now.
-                emit_fcom_cc_write_sw(buf, *result, Xbase, Wd_packed);
+                // Non-fused: write CC to status_word now, with no LDRH. TOP
+                // is the value memory holds at this point — a constant in the
+                // specialized body, which is what keeps the store off the
+                // loop-carried chain.
+                emit_fcom_cc_store_sw(buf, Xbase, Wd_packed,
+                                      (top_known == 0) ? GPR::XZR : Wd_top);
                 free_gpr(*result, Wd_packed);
             }
             break;
@@ -1747,7 +1763,8 @@ void lower(Context& ctx, TranslationResult* result) {
             if (n.flags & kFcomFused) {
                 fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
             } else {
-                emit_fcom_cc_write_sw(buf, *result, Xbase, Wd_packed);
+                emit_fcom_cc_store_sw(buf, Xbase, Wd_packed,
+                                      (top_known == 0) ? GPR::XZR : Wd_top);
                 free_gpr(*result, Wd_packed);
             }
             break;
@@ -1912,84 +1929,82 @@ void lower(Context& ctx, TranslationResult* result) {
         // ── FSTSW AX ───────────────────────────────────────────────────
         case Op::FStsw: {
             static constexpr int16_t kSwImm12 = kX87StatusWordOff / 2;  // = 1
+            const int16_t td = static_cast<int16_t>(n.aux >> 16);  // top_delta snapshot
+            const int W_ax = static_cast<int>(n.aux & 0xF);  // dest reg (usually W0)
 
             // Absorb the epilogue's TOP writeback into this FSTSW's own
             // status_word store (see sw_sink_node): the halfword is written
             // once, with the final TOP already folded in.
             const bool sink = (i == sw_sink_node);
 
-            int Wd_sw;
-            if (n.flags & kFcomFused) {
-                // Fused: RMW status_word with the packed CC held from the
-                // FCmp, keeping the merged value in a GPR — skips the LDRH
-                // reload of the halfword just stored (a store→load hazard).
-                int16_t fcmp_id = n.inputs[0];
-                int Wd_packed = fprs.get(fcmp_id);
-
-                // When sinking, the STRH moves below the TOP patch.
-                Wd_sw = emit_fcom_cc_write_sw_keep(buf, *result, Xbase, Wd_packed,
-                                                   /*store=*/!sink);
-                free_gpr(*result, Wd_packed);
-                fprs.node_fpr[fcmp_id] = -1;
+            // TOP as of this FSTSW, in a register (value in bits [2:0]).
+            // Nonzero snapshot => adjust the entry TOP; otherwise Wd_top already
+            // holds it (and it is the guard constant 0 in the specialized body,
+            // where XZR is both correct and free).
+            int Wd_topval;
+            bool own_topval = false;
+            if (td != 0) {
+                Wd_topval = alloc_free_gpr(*result);
+                own_topval = true;
+                if (top_known >= 0) {
+                    emit_movn(buf, 0, /*MOVZ*/2, 0,
+                              (uint16_t)((top_known + td) & 7), Wd_topval);
+                } else {
+                    if (td < 0)
+                        emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -td, Wd_top, Wd_topval);
+                    else
+                        emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, td, Wd_top, Wd_topval);
+                    emit_and_imm(buf, 0, Wd_topval, 0, 0, 2, Wd_topval);
+                }
             } else {
-                // Non-fused: load status_word (CC already written by FCmp).
-                Wd_sw = alloc_free_gpr(*result);
+                Wd_topval = (top_known == 0) ? GPR::XZR : Wd_top;
+            }
+            // The TOP currently in memory / expected there by the epilogue.
+            const int Wd_top_entry = (top_known == 0) ? GPR::XZR : Wd_top;
+
+            if (n.flags & kFcomFused) {
+                // Fused: the CC bits are still in the register the FCmp left
+                // them in, so status_word is never read back.
+                const int16_t fcmp_id = n.inputs[0];
+                const int Wd_sw = fprs.get(fcmp_id);  // packed CC, sw positions
+                fprs.node_fpr[fcmp_id] = -1;
+
+                // MEMORY gets the TOP the run leaves behind, which is NOT
+                // this FSTSW's snapshot: with the snapshot stored and the
+                // epilogue's writeback suppressed (top_delta == 0), a
+                // mid-run pop would be baked into status_word permanently.
+                // Sinking means snapshot == final, so it is stored directly;
+                // otherwise store the entry TOP the epilogue expects to find
+                // (exactly what the old read-modify-write preserved).
+                emit_fcom_cc_store_sw(buf, Xbase, Wd_sw,
+                                      sink ? Wd_topval : Wd_top_entry);
+
+                // AX gets the snapshot TOP. Identical to the stored value
+                // whenever the two TOPs agree, so patch only when they differ.
+                if (!sink && td != 0)
+                    emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                                  Wd_topval, Wd_sw);
+                // BFI W_ax, Wd_sw, #0, #16
+                emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/0, /*imms=*/15,
+                              Wd_sw, W_ax);
+                free_gpr(*result, Wd_sw);
+            } else {
+                // Non-fused: the CC bits already reached memory via an earlier
+                // compare's store, so the halfword must be read back.
+                const int Wd_sw = alloc_free_gpr(*result);
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1,
                                  kSwImm12, Xbase, Wd_sw);
-            }
-            {
-                // Patch TOP if pops occurred before this FSTSW, or if the
-                // in-memory TOP was already stale on entry (carried top_dirty).
-                const int16_t td =
-                    static_cast<int16_t>(n.aux >> 16);  // top_delta snapshot
-                if (td != 0) {
-                    if (top_known >= 0) {
-                        const int k = (top_known + td) & 7;
-                        int Wd_adj = alloc_free_gpr(*result);
-                        emit_movn(buf, 0, /*MOVZ*/2, 0, (uint16_t)k, Wd_adj);
-                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                      Wd_adj, Wd_sw);
-                        free_gpr(*result, Wd_adj);
-                    } else {
-                        int Wd_adj = alloc_free_gpr(*result);
-                        if (td < 0)
-                            emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -td, Wd_top, Wd_adj);
-                        else
-                            emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, td, Wd_top, Wd_adj);
-                        emit_and_imm(buf, 0, Wd_adj, 0, 0, 2, Wd_adj);
-                        // BFI Wd_sw, Wd_adj, #11, #3 — patch TOP field
-                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                      Wd_adj, Wd_sw);
-                        free_gpr(*result, Wd_adj);
-                    }
-                } else if (entry_top_dirty) {
-                    // BFI Wd_sw, Wd_top, #11, #3 — memory TOP is stale;
-                    // Wd_top already holds the correct masked value (which is
-                    // the guard constant in the specialized body, so BFI from
-                    // XZR clears the field when top_known == 0).
-                    if (top_known == 0)
-                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                      GPR::XZR, Wd_sw);
-                    else
-                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                      Wd_top, Wd_sw);
-                }
-
-                // Sinking: Wd_sw now holds CC + the run's FINAL TOP, so this
-                // single STRH replaces the epilogue's LDRH/BFI/STRH (step 3 is
-                // suppressed). Emitted before the AX write purely for clarity;
-                // the two are independent.
+                // BFI Wd_sw, Wd_topval, #11, #3 — patch the TOP field
+                emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
+                              Wd_topval, Wd_sw);
                 if (sink)
                     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
                                      kSwImm12, Xbase, Wd_sw);
-
-                // BFI W_ax, Wd_sw, #0, #16 — write status_word into x86 AX
-                const int W_ax =
-                    static_cast<int>(n.aux & 0xF);  // dest reg (usually 0 = W0)
                 emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/0, /*imms=*/15,
                               Wd_sw, W_ax);
                 free_gpr(*result, Wd_sw);
             }
+            if (own_topval) free_gpr(*result, Wd_topval);
             break;
         }
 
