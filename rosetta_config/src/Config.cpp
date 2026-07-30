@@ -257,6 +257,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FCMOV_RAW"))
         cfg.disable_fcmov_raw = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: end the run at cmp/test instead of consuming them as
+    // in-run guest flag definers.
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_GUEST_CMP"))
+        cfg.disable_guest_cmp = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

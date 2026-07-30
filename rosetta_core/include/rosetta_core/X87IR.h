@@ -160,6 +160,19 @@ enum class Op : uint8_t {
     GuestPushR,     // push r32/r64: [rsp -= slot] = r  (payload in imm_bits)
     GuestPushI,     // push imm: [rsp -= slot] = imm (sign-extended for 64-bit)
     GuestPop,       // pop r32/r64: r = [rsp], rsp += slot
+
+    // Guest flag DEFINER (opt-in via TRANSPARENT_FLAGS): cmp/test r32/r64
+    // with register or immediate rhs, lowered to SUBS/ANDS — the same NZCV
+    // guest state Rosetta's own translation of these opcodes leaves behind.
+    // The one deliberate exception to the "Guest nodes are flag-free" rule:
+    // this node REDEFINES the guest EFLAGS at its program position (that is
+    // its whole architectural effect), which is exactly what lets an FCSel
+    // consume a plain `cmp reg, imm` without ending the run. Build gates on
+    // flag_liveness proving the unmaterialized flags dead (PF, and AF for
+    // cmp — NZCV carries only SF/ZF/CF/OF). Payload in imm_bits
+    // (GuestPayload: dst = lhs reg, src = rhs reg, imm, is64); aux bit0 =
+    // test (ANDS) vs cmp (SUBS), bit1 = register rhs.
+    GuestCmpF,
 };
 
 // ALU sub-op selector for GuestAluRI (whole aux) and GuestRmwR (aux[6:4]).
@@ -308,6 +321,10 @@ struct Context {
 
     // NZCV tracking for FCMOV safety gate.
     int16_t last_fcomi;             // most recent FComI node ID, or -1
+    int16_t last_guest_flagdef;     // most recent GuestCmpF node ID, or -1
+                                    // (an alternative NZCV producer for FCSel:
+                                    // whichever of the two is LATER owns the
+                                    // flags an FCSel reads)
 
     // How many x87 instructions were successfully consumed.
     int16_t consumed;
@@ -340,6 +357,7 @@ struct Context {
         consumed = 0;
         last_fcmp = -1;
         last_fcomi = -1;
+        last_guest_flagdef = -1;
         for (int i = 0; i < kAddrCacheSlots; i++) addr_cache_rep[i] = -1;
         addr_cache_n = 0;
         nzcv_dead = 0;

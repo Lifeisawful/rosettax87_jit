@@ -399,6 +399,165 @@ static void test_branchless_min(void) {
     check_d("D/branchless min(30, 15) = 15.0", result, 15.0);
 }
 
+/* ── Section E: guest CMP/TEST as the FCMOV flag source (GuestCmpF) ─────── */
+/*
+ * No FCOMI anywhere: the flags come from an integer cmp/test between the
+ * x87 loads and the FCMOV — the exact shape of branchless-select loops.
+ * With TRANSPARENT_FLAGS the IR consumes the cmp/test as a GuestCmpF node
+ * (SUBS/ANDS) and keeps the whole thing one run; without it, the run splits
+ * and the classic paths handle it. Results must be identical either way.
+ * The trailing `xor %%edx,%%edx` kills PF/AF inside the block so the
+ * consumption gate (PF/AF-dead via flag_liveness) can pass in production,
+ * mirroring real loops where the counter update follows the select.
+ */
+static void test_cmp_imm_fcmov(const char *name, int lhs, double a, double b,
+                               double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"           /* ST(0)=b                     */
+        "fldl  %1\n\t"           /* ST(0)=a ST(1)=b             */
+        "cmpl  $5, %5\n\t"       /* CF = (lhs <u 5)             */
+        "fcmovb %%st(1), %%st\n\t" /* below → ST(0)=b           */
+        "xorl  %%edx, %%edx\n\t" /* full flag definer: PF/AF die here */
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (lhs)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
+static void test_cmp_reg_fcmov(const char *name, int lhs, int rhs, double a,
+                               double b, double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "cmpl  %6, %5\n\t"       /* CF = (lhs <u rhs)           */
+        "fcmovnb %%st(1), %%st\n\t" /* not-below → ST(0)=b      */
+        "xorl  %%edx, %%edx\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (lhs), "r" (rhs)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
+static void test_test_self_fcmov(const char *name, int val, double a, double b,
+                                 double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "testl %5, %5\n\t"       /* ZF = (val == 0)             */
+        "fcmove %%st(1), %%st\n\t" /* zero → ST(0)=b            */
+        "xorl  %%edx, %%edx\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (val)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
+static void test_test_imm_fcmov(const char *name, int val, double a, double b,
+                                double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "testl $0x4500, %5\n\t"  /* non-bitmask imm: scratch ANDS path */
+        "fcmovne %%st(1), %%st\n\t" /* any bit set → ST(0)=b    */
+        "xorl  %%edx, %%edx\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (val)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
+static void test_cmp_big_imm_fcmov(const char *name, int lhs, double a,
+                                   double b, double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "cmpl  $0x123456, %5\n\t" /* fits no imm12 form: scratch SUBS  */
+        "fcmovb %%st(1), %%st\n\t"
+        "xorl  %%edx, %%edx\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (lhs)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
+static void test_cmp_neg_imm_fcmov(const char *name, int lhs, double a,
+                                   double b, double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "cmpl  $-16, %5\n\t"     /* negative imm: CMN alias path       */
+        "fcmovb %%st(1), %%st\n\t" /* CF = (lhs <u 0xFFFFFFF0)         */
+        "xorl  %%edx, %%edx\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (lhs)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
+/* No flag-killer before block end: PF/AF stay live out of the cmp, so the
+ * IR must DECLINE the cmp (conservative) and still produce correct results
+ * through the split-run path. */
+static void test_cmp_fcmov_no_killer(const char *name, int lhs, double a,
+                                     double b, double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "cmpl  $5, %5\n\t"
+        "fcmovb %%st(1), %%st\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (lhs)
+        : "cc", "st"
+    );
+    check_d(name, result, expected);
+}
+
+/* fcomi THEN cmp: the cmp's flags must win (the FComI pack is dead). */
+static void test_fcomi_then_cmp_fcmov(const char *name, int lhs, double a,
+                                      double b, double expected) {
+    double result = 0.0;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "fcomi %%st(1)\n\t"      /* flags from a vs b — then overwritten */
+        "cmpl  $5, %5\n\t"
+        "fcmovb %%st(1), %%st\n\t" /* must test lhs<5, NOT a vs b        */
+        "xorl  %%edx, %%edx\n\t"
+        "fstp  %%st(1)\n\t"
+        "fstpl %0\n"
+        : "=m" (result), "=m" (a), "=m" (b)
+        : "m" (a), "m" (b), "r" (lhs)
+        : "cc", "st", "edx"
+    );
+    check_d(name, result, expected);
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -425,6 +584,23 @@ int main(void) {
     /* Section D: real-world patterns */
     test_branchless_max();
     test_branchless_min();
+
+    /* Section E: guest CMP/TEST as the FCMOV flag source (GuestCmpF) */
+    test_cmp_imm_fcmov("E/cmp $5, 3: below -> b", 3, 7.0, 9.0, 9.0);
+    test_cmp_imm_fcmov("E/cmp $5, 8: not below -> a", 8, 7.0, 9.0, 7.0);
+    test_cmp_reg_fcmov("E/cmp r,r 9 vs 4: nb fires -> b", 9, 4, 7.0, 9.0, 9.0);
+    test_cmp_reg_fcmov("E/cmp r,r 2 vs 4: nb holds -> a", 2, 4, 7.0, 9.0, 7.0);
+    test_test_self_fcmov("E/test r,r zero: e fires -> b", 0, 7.0, 9.0, 9.0);
+    test_test_self_fcmov("E/test r,r nonzero: e holds -> a", 3, 7.0, 9.0, 7.0);
+    test_test_imm_fcmov("E/test $0x4500 hit: ne fires -> b", 0x400, 7.0, 9.0, 9.0);
+    test_test_imm_fcmov("E/test $0x4500 miss: ne holds -> a", 0xBA, 7.0, 9.0, 7.0);
+    test_cmp_big_imm_fcmov("E/cmp $0x123456, 5: below -> b", 5, 7.0, 9.0, 9.0);
+    test_cmp_neg_imm_fcmov("E/cmp $-16, 5: below -> b", 5, 7.0, 9.0, 9.0);
+    test_cmp_neg_imm_fcmov("E/cmp $-16, -8: not below -> a", -8, 7.0, 9.0, 7.0);
+    test_cmp_fcmov_no_killer("E/no flag killer: below -> b", 3, 7.0, 9.0, 9.0);
+    test_cmp_fcmov_no_killer("E/no flag killer: not below -> a", 8, 7.0, 9.0, 7.0);
+    test_fcomi_then_cmp_fcmov("E/fcomi then cmp: cmp wins -> b", 3, 7.0, 9.0, 9.0);
+    test_fcomi_then_cmp_fcmov("E/fcomi then cmp: cmp wins -> a", 8, 7.0, 9.0, 7.0);
 
     if (failures == 0)
         printf("\nAll tests passed.\n");

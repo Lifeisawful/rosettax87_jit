@@ -524,6 +524,15 @@ static void plan_fcomi_raw(Context& ctx) {
             cur = i;
             cur_sink = -1;
             cur_has_eqne = false;
+        } else if (n.op == Op::GuestCmpF) {
+            // A consumed guest cmp/test redefines the guest EFLAGS at its
+            // position: the pending FComI's pack becomes dead (its PF slots
+            // included — the GuestCmpF build gate proved PF dead out of it,
+            // and any in-run fcmovu before here reads the raw VS), and later
+            // FCSels read the SUBS/ANDS flags with their stored x86
+            // convention, unmapped.
+            finalize(/*overwritten=*/true);
+            cur = -1;
         } else if (n.op == Op::FCSel && cur >= 0) {
             n.flags |= kFCSelRaw;
             cur_sink = i;
@@ -827,9 +836,11 @@ static int plan_addr_cache(Context& ctx) {
 //
 // Flag-free encodings only: Guest nodes may sit between an FCmp/FComI and its
 // NZCV consumer (hoisted saves, FCSel, the TestFused TST), so nothing here
-// may write NZCV. They write guest GPRs (x0–x15) directly — disjoint from
-// the scratch pool (x22–x29), so pinned cache GPRs and held values (packed
-// CC, hoisted NZCV) are never clobbered.
+// may write NZCV — with ONE deliberate exception, GuestCmpF, whose entire
+// architectural effect is redefining the guest EFLAGS (its safety rules live
+// in plan_fcomi_raw and the nzcv_hoist gate). They write guest GPRs (x0–x15)
+// directly — disjoint from the scratch pool (x22–x29), so pinned cache GPRs
+// and held values (packed CC, hoisted NZCV) are never clobbered.
 
 static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                             const Node& n) {
@@ -955,6 +966,63 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                                              /*LSL*/0, p.dst, 0, GPR::XZR,
                                              p.dst);
                     break;
+            }
+            break;
+        }
+        case Op::GuestCmpF: {
+            // cmp → SUBS ZR / test → ANDS ZR: the exact NZCV Rosetta's own
+            // translation of these opcodes produces. The deliberate exception
+            // to the flag-free Guest-node rule — redefining guest EFLAGS here
+            // IS the instruction's architectural effect (see X87IR.h).
+            const int is64 = p.is64 ? 1 : 0;
+            const bool is_test = n.aux & 1;
+            if (n.aux & 2) {  // register rhs
+                if (is_test)
+                    emit_logical_shifted_reg(buf, is64, /*ANDS*/3, 0, /*LSL*/0,
+                                             p.src, 0, p.dst, GPR::XZR);
+                else
+                    emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/1, /*S=*/1,
+                                             /*LSL*/0, p.src, 0, p.dst,
+                                             GPR::XZR);
+                break;
+            }
+            // Immediate rhs; r64 forms sign-extend the imm32 (x86 semantics).
+            const int64_t sv = static_cast<int64_t>(static_cast<int32_t>(p.imm));
+            const uint64_t v =
+                is64 ? static_cast<uint64_t>(sv) : static_cast<uint64_t>(p.imm);
+            if (is_test) {
+                LogicalImmEncoding enc;
+                if (is_bitmask_immediate(is64 != 0, v, enc)) {
+                    emit_logical_imm(buf, is64, /*ANDS*/3, enc.N ? 1 : 0,
+                                     static_cast<int8_t>(enc.immr),
+                                     static_cast<int8_t>(enc.imms),
+                                     p.dst, GPR::XZR);
+                } else {
+                    // XZR hint: imm 0 comes back as ZR (test r,0 → flags of 0).
+                    const int Rt = emit_load_immediate(result, is64, v, GPR::XZR);
+                    emit_logical_shifted_reg(buf, is64, /*ANDS*/3, 0, /*LSL*/0,
+                                             Rt, 0, p.dst, GPR::XZR);
+                    free_gpr(result, Rt);
+                }
+            } else {
+                // CMP #imm / CMN #-imm are flag-exact aliases of the x86
+                // subtraction for either sign (same addition, same NZCV).
+                if (sv >= 0 && sv <= 0xFFF) {
+                    emit_add_imm(buf, is64, /*is_sub=*/1, /*S=*/1, 0,
+                                 static_cast<int32_t>(sv), p.dst, GPR::XZR);
+                } else if (sv < 0 && -sv <= 0xFFF) {
+                    emit_add_imm(buf, is64, /*is_sub=*/0, /*S=*/1, 0,
+                                 static_cast<int32_t>(-sv), p.dst, GPR::XZR);
+                } else if (sv > 0 && (sv & 0xFFF) == 0 && (sv >> 12) <= 0xFFF) {
+                    emit_add_imm(buf, is64, /*is_sub=*/1, /*S=*/1, /*shift=*/1,
+                                 static_cast<int32_t>(sv >> 12), p.dst,
+                                 GPR::XZR);
+                } else {
+                    const int Rt = emit_load_immediate(result, is64, v, GPR::XZR);
+                    emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/1, /*S=*/1,
+                                             /*LSL*/0, Rt, 0, p.dst, GPR::XZR);
+                    free_gpr(result, Rt);
+                }
             }
             break;
         }
@@ -1317,10 +1385,12 @@ void lower(Context& ctx, TranslationResult* result) {
     {
         int cmp_count = 0;
         bool has_nzcv_user = false;
+        bool has_guest_cmp = false;
         for (int i = 0; i < ctx.num_nodes; i++) {
             auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
+            if (n.op == Op::GuestCmpF) has_guest_cmp = true;
             if (n.op == Op::FCmp || n.op == Op::FTst) {
                 if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
                 nzcv_last_cmp = i;
@@ -1328,7 +1398,13 @@ void lower(Context& ctx, TranslationResult* result) {
             }
         }
         nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
-        nzcv_hoist = !nzcv_skip && !has_nzcv_user && cmp_count >= 2;
+        // No hoisting across a GuestCmpF: the deferred restore would put the
+        // ENTRY flags back on top of the cmp/test's freshly defined ones.
+        // Per-compare save/restore round-trips the CURRENT flags and stays
+        // correct on either side of it. (nzcv_skip is unaffected: it needs
+        // nzcv_dead and no FCSel, so nothing reads what a compare clobbers.)
+        nzcv_hoist = !nzcv_skip && !has_nzcv_user && !has_guest_cmp &&
+                     cmp_count >= 2;
     }
 
     // ── FSTSW / epilogue status_word merge ──────────────────────────────────
@@ -2041,6 +2117,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::GuestPushR:
         case Op::GuestPushI:
         case Op::GuestPop:
+        case Op::GuestCmpF:
             emit_guest_node(*result, buf, n);
             break;
 
@@ -2606,10 +2683,12 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
     {
         int cmp_count = 0;
         bool has_nzcv_user = false;
+        bool has_guest_cmp = false;
         for (int i = 0; i < ctx.num_nodes; i++) {
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
+            if (n.op == Op::GuestCmpF) has_guest_cmp = true;
             if (n.op == Op::FCmp || n.op == Op::FTst) {
                 if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
                 nzcv_last_cmp = i;
@@ -2617,7 +2696,9 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             }
         }
         nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
-        nzcv_hoist = !nzcv_skip && !has_nzcv_user && cmp_count >= 2;
+        // Mirrors lower(): no hoisting across a GuestCmpF.
+        nzcv_hoist = !nzcv_skip && !has_nzcv_user && !has_guest_cmp &&
+                     cmp_count >= 2;
     }
 
     // Simulate GPR pressure across IR nodes.
@@ -2756,6 +2837,11 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         case Op::GuestPushR: case Op::GuestPop:
             break;
         case Op::GuestPushI:
+            transient = 1;
+            break;
+
+        // cmp/test: one scratch when the immediate fits no SUBS/ANDS form.
+        case Op::GuestCmpF:
             transient = 1;
             break;
         }

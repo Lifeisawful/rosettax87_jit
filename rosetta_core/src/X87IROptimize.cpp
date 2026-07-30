@@ -229,6 +229,7 @@ static void pass_dse(Context& ctx) {
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
             case Op::GuestAluRI: case Op::GuestRmwR:
             case Op::GuestPushR: case Op::GuestPushI: case Op::GuestPop:
+            case Op::GuestCmpF:   // defines live guest flags
                 continue;
             default: break;
         }

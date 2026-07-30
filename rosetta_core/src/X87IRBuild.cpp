@@ -601,9 +601,12 @@ static bool build_fcomi(Context& ctx, IRInstr* instr, bool is_popping) {
 // ── FCMOV family (conditional move to ST(0)) ────────────────────────────────
 
 static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
-    // Safety: FCMOV reads NZCV set by a prior FCOMI. If no FComI
-    // was built in this run, we cannot guarantee NZCV state → bail.
-    if (ctx.last_fcomi < 0) return false;
+    // Safety: FCMOV reads NZCV. Admissible when a prior node in THIS run
+    // installed known guest flags — an FComI, or a consumed guest cmp/test
+    // (GuestCmpF, whose SUBS/ANDS flags are exactly what x86 fcmovcc tests
+    // after cmp). Whichever is later owns the flags; plan_fcomi_raw resolves
+    // which convention the FCSel condition reads. No definer → bail.
+    if (ctx.last_fcomi < 0 && ctx.last_guest_flagdef < 0) return false;
 
     int16_t st0 = ctx.resolve(0);
     if (st0 < 0) return false;
@@ -932,6 +935,61 @@ static bool build_guest_pushpop(Context& ctx, IRInstr* instr, uint16_t op) {
     ctx.mem_cse_next = 0;
     ctx.guest_written_mask |= static_cast<uint16_t>(1u << 4);
     mem_cse_evict_reg(ctx, 4);
+    return true;
+}
+
+// ── Guest flag definers: cmp/test r32/r64 (TRANSPARENT_FLAGS tier) ─────────
+//
+// Unlike every other Guest* form these DEFINE live guest flags — that is
+// their entire architectural effect. The SUBS/ANDS lowering leaves the exact
+// NZCV Rosetta's own translation of cmp/test leaves, so downstream readers
+// (an in-run FCSel via build_fcmov's relaxed gate, or post-run jcc/setcc)
+// see correct guest state. What NZCV cannot carry is gated dead via
+// flag_liveness: PF always (no NZCV slot), and AF for cmp (cmp defines AF
+// architecturally; test leaves it undefined, so no correct reader exists).
+//
+// Form restrictions: register lhs, register or non-fixup immediate rhs,
+// 32/64-bit only (8/16-bit flags come from partial-width results — the
+// W-form SUBS/ANDS would put SF/ZF in the wrong bits). Memory forms decline.
+static bool build_guest_cmp(Context& ctx, IRInstr* instr, uint16_t op) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
+    if (g_rosetta_config->disable_guest_cmp) return false;
+    if (instr->num_operands < 2) return false;
+    const bool is_test = (op == kOpcodeName_test);
+    const uint8_t unmaterialized =
+        is_test ? FLAG_PF : static_cast<uint8_t>(FLAG_PF | FLAG_AF);
+    if (instr->flag_liveness & unmaterialized) return false;
+
+    const IROperand& lhs = instr->operands[0];
+    const IROperand& rhs = instr->operands[1];
+    if (lhs.kind != IROperandKind::Register || !lhs.reg.reg.is_gpr())
+        return false;
+    const bool is64 = lhs.reg.size == IROperandSize::S64;
+    if (!is64 && lhs.reg.size != IROperandSize::S32) return false;
+
+    GuestPayload p = {};
+    p.dst = lhs.reg.reg.index();
+    p.is64 = is64;
+    bool reg_rhs;
+    if (rhs.kind == IROperandKind::Register) {
+        if (!rhs.reg.reg.is_gpr() || rhs.reg.size != lhs.reg.size) return false;
+        p.src = rhs.reg.reg.index();
+        reg_rhs = true;
+    } else if (rhs.kind == IROperandKind::MemRef ||
+               rhs.kind == IROperandKind::AbsMem) {
+        return false;
+    } else {
+        if (rhs.kind == IROperandKind::Immediate && rhs.imm.mem_flags != 0)
+            return false;  // fixup: payload is the relocation target
+        p.imm = static_cast<uint32_t>(rhs.imm.value);
+        reg_rhs = false;
+    }
+
+    auto id = ctx.add_node(Op::GuestCmpF);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    ctx.nodes[id].aux = (is_test ? 1u : 0u) | (reg_rhs ? 2u : 0u);
+    ctx.last_guest_flagdef = id;
     return true;
 }
 
@@ -1631,6 +1689,12 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_neg:
             case kOpcodeName_not:
                 ok = build_guest_unary(ctx, instr, op);
+                break;
+
+            // ── Guest flag definers: cmp/test (FLAGS tier) ──────────────
+            case kOpcodeName_cmp:
+            case kOpcodeName_test:
+                ok = build_guest_cmp(ctx, instr, op);
                 break;
 
             // ── push/pop (opt-in TRANSPARENT_PUSHPOP) ───────────────────
