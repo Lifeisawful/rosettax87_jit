@@ -1237,6 +1237,8 @@ void lower(Context& ctx, TranslationResult* result) {
     int nzcv_first_cmp = -1, nzcv_last_cmp = -1;
     bool nzcv_hoist = false;
     bool nzcv_skip = false;
+    // OPT-TS: per-node "this value call's status-word clear is dead" (see below).
+    bool sw_clear_dead[kMaxNodes] = {};
     {
         int cmp_count = 0;
         bool has_nzcv_user = false;
@@ -1280,12 +1282,74 @@ void lower(Context& ctx, TranslationResult* result) {
                 return false;
         }
     };
+
+    // ── OPT-TS: dead intermediate C1|C2 clears ──────────────────────────────
+    // Each trig/pow value call clears C1 (|C2) with an LDRH/AND/STRH RMW at its
+    // program position. That RMW is unobservable — and so can be dropped
+    // outright — when a later node in the same run overwrites the whole
+    // halfword before anything reads it back. Runs are straight-line, so a
+    // later node is reached unconditionally; this is a pure dead-store
+    // elimination, not a fidelity trade (unlike the FSTSW sink below, nothing
+    // architecturally visible changes).
+    //
+    // Classification of what can follow, all verified against the emitters:
+    //   FCmp/FTst, not fused   emit_fcom_cc_store_sw — STRH only, never reads   -> KILLS
+    //   FCmp/FTst, fused       defers its store to the paired FStsw             -> transparent
+    //   FStsw, fused           stores packed CC from a GPR, never reads         -> KILLS
+    //   FStsw, not fused       LDRH — reads the halfword back                   -> OBSERVES
+    //   another value call     LDRH/AND/STRH; kills only if its mask is a
+    //                          superset (C1|C2 covers C1-only, not vice versa)
+    //   epilogue TOP writeback LDRH/BFI/STRH — preserves C0-C3                  -> neither
+    // Reaching the end of the run without a killer means the clear must stay:
+    // anything at all can read status_word after the run ends.
+    auto sw_clear_mask = [](Op op) -> uint16_t {
+        switch (op) {
+            case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+            case Op::FSinCosCall:
+                return 0x0600;   // C1 | C2
+            case Op::FScaleCall: case Op::FYl2xCall:
+            case Op::FYl2xp1Call: case Op::FPatanCall:
+                return 0x0200;   // C1
+            default:
+                return 0;        // F2XM1Call and everything else
+        }
+    };
+    const bool sw_clear_sink_on =
+        !(g_rosetta_config && g_rosetta_config->disable_trig_sw_sink);
+    for (int i = 0; sw_clear_sink_on && i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        const uint16_t mask = sw_clear_mask(n.op);
+        if (mask == 0) continue;
+        for (int j = i + 1; j < ctx.num_nodes; j++) {
+            const auto& later = ctx.nodes[j];
+            if (later.flags & kDead) continue;
+            if (later.op == Op::FCmp || later.op == Op::FTst) {
+                if (later.flags & kFcomFused) continue;  // stores at its FStsw
+                sw_clear_dead[i] = true;
+                break;
+            }
+            if (later.op == Op::FStsw) {
+                if (later.flags & kFcomFused) sw_clear_dead[i] = true;
+                break;  // non-fused reads it back — observed, keep the clear
+            }
+            const uint16_t later_mask = sw_clear_mask(later.op);
+            if (later_mask == 0) continue;
+            if ((later_mask & mask) == mask) {
+                sw_clear_dead[i] = true;
+                break;
+            }
+            break;  // clears less than we do (C1-only after C1|C2) — keep
+        }
+    }
+
     int sw_sink_node = -1;
     if (ctx.top_delta != 0 || entry_top_dirty) {
         for (int i = ctx.num_nodes - 1; i >= 0; i--) {
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (!writes_status_word(n.op)) continue;
+            if (sw_clear_dead[i]) continue;  // its RMW is gone — not a writer
             if (n.op == Op::FStsw &&
                 static_cast<int16_t>(n.aux >> 16) == ctx.top_delta)
                 sw_sink_node = i;
@@ -1569,7 +1633,7 @@ void lower(Context& ctx, TranslationResult* result) {
             // clears C1|C2 (~0x600: immr=21, imms=29); FScale/FYl2x/FYl2xp1
             // clear C1 (~0x200: immr=22, imms=30); F2XM1 clears nothing
             // (classic helper parity).
-            if (n.op != Op::F2XM1Call) {
+            if (n.op != Op::F2XM1Call && !sw_clear_dead[i]) {
                 const bool c1_only = (n.op == Op::FScaleCall || n.op == Op::FYl2xCall ||
                                       n.op == Op::FYl2xp1Call || n.op == Op::FPatanCall);
                 const int immr = c1_only ? 22 : 21;

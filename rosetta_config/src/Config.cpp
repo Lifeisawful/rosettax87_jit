@@ -247,6 +247,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_NZCV_LIVENESS"))
         cfg.disable_nzcv_liveness = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: keep every trig/pow C1|C2 status_word RMW, including the
+    // ones a later full-halfword writer in the same run makes dead.
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_TRIG_SW_SINK"))
+        cfg.disable_trig_sw_sink = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

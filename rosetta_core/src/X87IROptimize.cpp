@@ -206,10 +206,23 @@ static void pass_dse(Context& ctx) {
         if (n.flags & kDead) continue;
 
         // Side-effect nodes are never dead.
+        //
+        // The trig/pow value calls are listed here despite being modelled as
+        // pure values elsewhere: each one clears C1 (|C2) in status_word, which
+        // survives the result being discarded. Killing the node dropped that
+        // clear, so `fcomp(unordered); fcos; fnstsw` reported the compare's C2
+        // — visible only once a run grew long enough to make the cos result
+        // dead (TRANSPARENT_INT consuming the trailing mov), which is why it
+        // hid until tests/test_trig_status_word.c. F2XM1Call touches no status
+        // bits and stays eligible; FSinCosProjCos is a pure projection of a
+        // call node that is itself pinned here.
         switch (n.op) {
             case Op::StoreF64: case Op::StoreF32Raw:
             case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
             case Op::FCmp: case Op::FTst: case Op::FStsw: case Op::FComI:
+            case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+            case Op::FSinCosCall: case Op::FScaleCall:
+            case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
             case Op::StoreCW: case Op::LoadCW:
             case Op::GuestMovRR: case Op::GuestMovRI:
             case Op::GuestLea: case Op::GuestExt:
@@ -648,6 +661,26 @@ static void pass_f32_fma(Context& ctx) {
 // If a FCmp/FTst node is immediately followed by a FStsw with no intervening
 // CC-modifying node, mark both with kFcomFused. The lowering keeps packed CC
 // in a GPR between the two nodes, avoiding one LDRH in FStsw.
+//
+// "CC-modifying" includes the trig/pow value calls, not just other compares:
+// each of them clears C1 (|C2) in status_word at its own program position, and
+// a fused FStsw stores the compare's packed CC over the whole halfword — which
+// would re-impose the compare's C1/C2 on top of the call's clear. Visible
+// whenever the compare was unordered (C1 set) and a call sits between it and
+// the FSTSW. F2XM1Call touches no status bits and does not break the run.
+// Another FStsw between is harmless: it stores the same packed CC.
+
+static bool clobbers_cc(Op op) {
+    switch (op) {
+        case Op::FCmp: case Op::FTst:
+        case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
+        case Op::FSinCosCall: case Op::FScaleCall:
+        case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static void pass_fcom_fstsw_fusion(Context& ctx) {
     for (int i = 0; i < ctx.num_nodes; i++) {
@@ -665,7 +698,7 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
         for (int j = fcmp_id + 1; j < i; j++) {
             auto& between = ctx.nodes[j];
             if (between.flags & kDead) continue;
-            if (between.op == Op::FCmp || between.op == Op::FTst) {
+            if (clobbers_cc(between.op)) {
                 clean = false;
                 break;
             }

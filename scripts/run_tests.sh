@@ -103,6 +103,7 @@ ALL_TESTS=(
     test_fcos
     test_trig
     test_trig_ir
+    test_trig_status_word
 )
 
 RED='\033[0;31m'
