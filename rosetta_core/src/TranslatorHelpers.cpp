@@ -577,9 +577,16 @@ auto compute_operand_address(TranslationResult& result, int is_64bit, IROperand*
         if (dst_reg == GPR::XZR)
             out_reg = alloc_scratch_gpr(result);
 
-        // fixup_target: use imm.value as the target id when mem_flags != 0,
-        // otherwise 0 (no fixup target — anonymous address).
-        const int32_t fixup_target = op->imm.mem_flags ? (int32_t)op->imm.value : 0;
+        // fixup_target: use imm.value as the target id when mem_flags != 0.
+        // Otherwise imm.value is a runtime addend on the text base — bake it
+        // into the fixup target whenever it fits int32 (same resolution: the
+        // target is a byte offset from the text base), which deletes the
+        // MOVZ(+MOVK)+ADD addend pair after the ADRP/ADD (opt backlog #3:
+        // 42% of some run bodies were this address arithmetic).
+        const bool bake_addend = op->imm.mem_flags == 0 && op->imm.value >= 0 &&
+                                 op->imm.value <= INT32_MAX;
+        const int32_t fixup_target =
+            (op->imm.mem_flags || bake_addend) ? (int32_t)op->imm.value : 0;
 
         // Emit ADRP out_reg, <page>   [patched by Arm64Page21 fixup]
         result.external_fixups.push_back(
@@ -594,7 +601,7 @@ auto compute_operand_address(TranslationResult& result, int is_64bit, IROperand*
         // If bit0 of mem_flags is CLEAR, the immediate also carries a runtime
         // addend in imm.value that must be added to out_reg at run time.
         // (bit0 set means "has_addend is already baked into the fixup target".)
-        if ((op->imm.mem_flags & 1) == 0) {
+        if ((op->imm.mem_flags & 1) == 0 && !bake_addend) {
             const int addend_reg = alloc_scratch_gpr(result);
             emit_load_immediate_no_xzr(result, /*is_64bit=*/1, op->imm.value, addend_reg);
             emit_add_reg(result.insn_buf, addr_size_is_64, out_reg, out_reg, addend_reg);
