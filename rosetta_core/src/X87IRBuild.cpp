@@ -108,6 +108,15 @@ static bool mem_operand_equal(const IROperand* a, const IROperand* b) {
                a->abs_mem.addr_size == b->abs_mem.addr_size &&
                a->abs_mem.value == b->abs_mem.value;
     }
+    if (a->kind == IROperandKind::Immediate) {
+        // Text-base-relative operands: value is the byte offset from the
+        // guest text base (mem_flags selects the target/addend encoding, so
+        // it must match for the values to be comparable).
+        return a->imm.size == b->imm.size &&
+               a->imm.addr_size == b->imm.addr_size &&
+               a->imm.mem_flags == b->imm.mem_flags &&
+               a->imm.value == b->imm.value;
+    }
     return false;
 }
 
@@ -148,6 +157,13 @@ static bool mem_operands_no_alias(const IROperand* a, const IROperand* b) {
         if (a->abs_mem.addr_size == IROperandSize::S32) aa &= 0xFFFFFFFFu;
         if (b->abs_mem.addr_size == IROperandSize::S32) ba &= 0xFFFFFFFFu;
         return aa + aw <= ba || ba + bw <= aa;
+    }
+    if (a->kind == IROperandKind::Immediate &&
+        b->kind == IROperandKind::Immediate &&
+        a->imm.mem_flags == b->imm.mem_flags) {
+        // Same text base, disjoint [offset, offset+width) byte ranges.
+        const int64_t av = a->imm.value, bv = b->imm.value;
+        return av + aw <= bv || bv + bw <= av;
     }
     return false;
 }
@@ -202,7 +218,8 @@ static int16_t mem_cse_lookup(Context& ctx, const IROperand* op, Op kind) {
 }
 
 static void mem_cse_insert(Context& ctx, IROperand* op, Op kind, int16_t val) {
-    if (op->kind != IROperandKind::MemRef && op->kind != IROperandKind::AbsMem)
+    if (op->kind != IROperandKind::MemRef && op->kind != IROperandKind::AbsMem &&
+        op->kind != IROperandKind::Immediate)
         return;
     int slot;
     if (ctx.mem_cse_count < Context::kMemCSESlots) {
