@@ -2001,30 +2001,36 @@ void lower(Context& ctx, TranslationResult* result) {
             // once, with the final TOP already folded in.
             const bool sink = (i == sw_sink_node);
 
-            // TOP as of this FSTSW, in a register (value in bits [2:0]).
-            // Nonzero snapshot => adjust the entry TOP; otherwise Wd_top already
-            // holds it (and it is the guard constant 0 in the specialized body,
-            // where XZR is both correct and free).
-            int Wd_topval;
-            bool own_topval = false;
-            if (td != 0) {
-                Wd_topval = alloc_free_gpr(*result);
-                own_topval = true;
-                if (top_known >= 0) {
-                    emit_movn(buf, 0, /*MOVZ*/2, 0,
-                              (uint16_t)((top_known + td) & 7), Wd_topval);
+            // TOP as of this FSTSW: a translate-time constant in the
+            // specialized body (no register needed — merges fold to
+            // ORR-immediates below), else computed from Wd_top where a
+            // register consumer needs it. Computed values are NOT masked
+            // mod 8: every consumer merges via a 3-bit BFI (or the BFI
+            // inside emit_fcom_cc_store_sw), which masks for free.
+            const int topval_const =
+                (top_known >= 0) ? ((top_known + td) & 7) : -1;
+
+            // ORR-immediate of (top << 11) into a register whose TOP field
+            // is known-zero. Every top in 1..7 except 5 (0x2800, two
+            // separated runs) encodes as a logical immediate; the fallback
+            // materializes and BFIs.
+            auto emit_top_orr_imm = [&](int top, int Wd) {
+                LogicalImmEncoding enc;
+                if (is_bitmask_immediate(false,
+                                         static_cast<uint64_t>(top) << 11,
+                                         enc)) {
+                    emit_logical_imm(buf, 0, /*ORR*/1, enc.N ? 1 : 0,
+                                     static_cast<int8_t>(enc.immr),
+                                     static_cast<int8_t>(enc.imms), Wd, Wd);
                 } else {
-                    if (td < 0)
-                        emit_add_imm(buf, 0, /*is_sub=*/1, 0, 0, -td, Wd_top, Wd_topval);
-                    else
-                        emit_add_imm(buf, 0, /*is_sub=*/0, 0, 0, td, Wd_top, Wd_topval);
-                    emit_and_imm(buf, 0, Wd_topval, 0, 0, 2, Wd_topval);
+                    const int Wd_t = alloc_free_gpr(*result);
+                    emit_movn(buf, 0, /*MOVZ*/2, 0,
+                              static_cast<uint16_t>(top), Wd_t);
+                    emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21,
+                                  /*imms=*/2, Wd_t, Wd);
+                    free_gpr(*result, Wd_t);
                 }
-            } else {
-                Wd_topval = (top_known == 0) ? GPR::XZR : Wd_top;
-            }
-            // The TOP currently in memory / expected there by the epilogue.
-            const int Wd_top_entry = (top_known == 0) ? GPR::XZR : Wd_top;
+            };
 
             if (n.flags & kFcomFused) {
                 // Fused: the CC bits are still in the register the FCmp left
@@ -2040,21 +2046,64 @@ void lower(Context& ctx, TranslationResult* result) {
                 // Sinking means snapshot == final, so it is stored directly;
                 // otherwise store the entry TOP the epilogue expects to find
                 // (exactly what the old read-modify-write preserved).
-                emit_fcom_cc_store_sw(buf, Xbase, Wd_sw,
-                                      sink ? Wd_topval : Wd_top_entry);
-
-                // AX gets the snapshot TOP. Identical to the stored value
-                // whenever the two TOPs agree, so patch only when they differ.
-                if (!sink && td != 0)
-                    emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21, /*imms=*/2,
-                                  Wd_topval, Wd_sw);
+                if (topval_const >= 0) {
+                    // Specialized body: entry TOP is the guard constant 0 and
+                    // the packed CC's TOP field is structurally zero, so the
+                    // merges are ORR-immediates (or nothing for TOP 0).
+                    const int store_top = sink ? topval_const : 0;
+                    if (store_top != 0) emit_top_orr_imm(store_top, Wd_sw);
+                    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
+                                     kSwImm12, Xbase, Wd_sw);
+                    // AX gets the snapshot TOP; the stored merge above was 0
+                    // (or identical when sinking), so ORR still applies.
+                    if (!sink && topval_const != 0)
+                        emit_top_orr_imm(topval_const, Wd_sw);
+                } else {
+                    int Wd_topval = Wd_top;
+                    bool own_topval = false;
+                    if (td != 0) {
+                        Wd_topval = alloc_free_gpr(*result);
+                        own_topval = true;
+                        emit_add_imm(buf, 0, /*is_sub=*/td < 0 ? 1 : 0, 0, 0,
+                                     td < 0 ? -td : td, Wd_top, Wd_topval);
+                    }
+                    emit_fcom_cc_store_sw(buf, Xbase, Wd_sw,
+                                          sink ? Wd_topval : Wd_top);
+                    // AX gets the snapshot TOP. Identical to the stored value
+                    // whenever the two TOPs agree, so patch only on mismatch.
+                    if (!sink && td != 0)
+                        emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/21,
+                                      /*imms=*/2, Wd_topval, Wd_sw);
+                    if (own_topval) free_gpr(*result, Wd_topval);
+                }
                 // BFI W_ax, Wd_sw, #0, #16
                 emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/0, /*imms=*/15,
                               Wd_sw, W_ax);
                 free_gpr(*result, Wd_sw);
             } else {
                 // Non-fused: the CC bits already reached memory via an earlier
-                // compare's store, so the halfword must be read back.
+                // compare's store, so the halfword must be read back and its
+                // TOP field patched with a register BFI (XZR when the
+                // snapshot TOP is the constant 0).
+                int Wd_topval;
+                bool own_topval = false;
+                if (topval_const >= 0) {
+                    if (topval_const == 0) {
+                        Wd_topval = GPR::XZR;
+                    } else {
+                        Wd_topval = alloc_free_gpr(*result);
+                        own_topval = true;
+                        emit_movn(buf, 0, /*MOVZ*/2, 0,
+                                  (uint16_t)topval_const, Wd_topval);
+                    }
+                } else if (td != 0) {
+                    Wd_topval = alloc_free_gpr(*result);
+                    own_topval = true;
+                    emit_add_imm(buf, 0, /*is_sub=*/td < 0 ? 1 : 0, 0, 0,
+                                 td < 0 ? -td : td, Wd_top, Wd_topval);
+                } else {
+                    Wd_topval = Wd_top;
+                }
                 const int Wd_sw = alloc_free_gpr(*result);
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1,
                                  kSwImm12, Xbase, Wd_sw);
@@ -2067,8 +2116,8 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_bitfield(buf, 0, /*BFM*/1, 0, /*immr=*/0, /*imms=*/15,
                               Wd_sw, W_ax);
                 free_gpr(*result, Wd_sw);
+                if (own_topval) free_gpr(*result, Wd_topval);
             }
-            if (own_topval) free_gpr(*result, Wd_topval);
             break;
         }
 
@@ -2163,24 +2212,47 @@ void lower(Context& ctx, TranslationResult* result) {
             int Wd_tagw = alloc_free_gpr(*result);
             if (top_known >= 0) {
                 // Static slot positions → constant tag masks (wrap folded at
-                // translate time): LDRH / MOVZ+ORR / MOVZ+BIC / STRH.
+                // translate time): LDRH / ORR-imm / AND-imm / STRH. Masks are
+                // contiguous 2-bit-group runs unless they wrap the 16-bit
+                // field, so the immediate forms almost always encode; the
+                // MOVZ + register-op pair is the wrap fallback.
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1,
                                  kX87TagWordImm12, Xbase, Wd_tagw);
                 if (set_empty > 0) {
                     uint16_t mask = 0;
                     for (int k = 1; k <= set_empty; k++)
                         mask |= (uint16_t)(0x3u << (((final_top_known - k) & 7) * 2));
-                    emit_movn(buf, 0, /*MOVZ*/2, 0, mask, Wd_tmp2);
-                    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, 0, Wd_tmp2, 0,
-                                             Wd_tagw, Wd_tagw);
+                    LogicalImmEncoding enc;
+                    if (is_bitmask_immediate(false, mask, enc)) {
+                        emit_logical_imm(buf, 0, /*ORR*/1, enc.N ? 1 : 0,
+                                         static_cast<int8_t>(enc.immr),
+                                         static_cast<int8_t>(enc.imms),
+                                         Wd_tagw, Wd_tagw);
+                    } else {
+                        emit_movn(buf, 0, /*MOVZ*/2, 0, mask, Wd_tmp2);
+                        emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, 0, Wd_tmp2,
+                                                 0, Wd_tagw, Wd_tagw);
+                    }
                 }
                 if (set_valid > 0) {
                     uint16_t mask = 0;
                     for (int k = 0; k < set_valid; k++)
                         mask |= (uint16_t)(0x3u << (((final_top_known + k) & 7) * 2));
-                    emit_movn(buf, 0, /*MOVZ*/2, 0, mask, Wd_tmp2);
-                    emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=BIC*/1, 0, Wd_tmp2,
-                                             0, Wd_tagw, Wd_tagw);
+                    // Clear = AND with the complement (BIC has no imm form).
+                    // The upper half of Wd_tagw is zero after the LDRH, and
+                    // ~mask keeps it zero.
+                    LogicalImmEncoding enc;
+                    if (is_bitmask_immediate(false, 0xFFFFFFFFu & ~(uint32_t)mask,
+                                             enc)) {
+                        emit_logical_imm(buf, 0, /*AND*/0, enc.N ? 1 : 0,
+                                         static_cast<int8_t>(enc.immr),
+                                         static_cast<int8_t>(enc.imms),
+                                         Wd_tagw, Wd_tagw);
+                    } else {
+                        emit_movn(buf, 0, /*MOVZ*/2, 0, mask, Wd_tmp2);
+                        emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=BIC*/1, 0,
+                                                 Wd_tmp2, 0, Wd_tagw, Wd_tagw);
+                    }
                 }
                 emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
                                  kX87TagWordImm12, Xbase, Wd_tagw);

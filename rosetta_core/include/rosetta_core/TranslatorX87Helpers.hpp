@@ -336,7 +336,9 @@ void emit_fcom_cc_write_sw(AssemblerBuffer& buf, TranslationResult& a1,
 // state restore) would be cleared by the next compare.
 //
 // Wd_cc: packed CC from emit_fcom_cc_pack; overwritten with the merged
-// halfword. Wd_top: TOP value in bits [2:0] (XZR when TOP is known to be 0).
+// halfword. Wd_top: TOP in bits [2:0] — upper bits are ignored (the merge is
+// a 3-bit BFI, so unmasked ±delta values work); XZR (TOP known 0) skips the
+// merge entirely.
 void emit_fcom_cc_store_sw(AssemblerBuffer& buf, int Xbase, int Wd_cc, int Wd_top);
 
 // Same RMW, but returns the GPR holding the merged status_word instead of

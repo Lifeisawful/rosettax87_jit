@@ -846,9 +846,15 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
 // note on the low byte.
 // =============================================================================
 void emit_fcom_cc_store_sw(AssemblerBuffer& buf, int Xbase, int Wd_cc, int Wd_top) {
-    // ORR Wd_cc, Wd_cc, Wd_top, LSL #11   — merge the TOP field
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_top, kX87TopShift,
-                             Wd_cc, Wd_cc);
+    // BFI Wd_cc, Wd_top, #11, #3 — merge the TOP field. BFI (not ORR) so the
+    // source needn't be pre-masked: the insert takes bits [2:0], which is
+    // exactly mod-8 for any Wd_top ± delta the callers compute. The packed CC
+    // has zeros at [13:11], so the insert is equivalent to the old ORR for
+    // masked inputs. XZR means TOP == 0 (specialized body): the field is
+    // already zero in the packed value, so nothing is emitted.
+    if (Wd_top != GPR::XZR)
+        emit_bitfield(buf, /*is_64=*/0, /*BFM*/1, /*N=*/0, /*immr=*/21,
+                      /*imms=*/2, Wd_top, Wd_cc);
     // STRH Wd_cc, [Xbase, #kX87StatusWordOff]
     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0,
                      kX87StatusWordImm12, Xbase, Wd_cc);
