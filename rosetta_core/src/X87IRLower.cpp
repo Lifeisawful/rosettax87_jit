@@ -976,6 +976,27 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             // IS the instruction's architectural effect (see X87IR.h).
             const int is64 = p.is64 ? 1 : 0;
             const bool is_test = n.aux & 1;
+            const int wclass = static_cast<int>((n.aux >> 2) & 3);
+            if (wclass != 0) {
+                // Sub-32 test-imm: ANDS of both operands shifted to the top
+                // of the W register. Z is the partial-width Z, N (bit 31) is
+                // the partial result's sign bit, C=V=0 — exactly the x86
+                // TEST flag state for the 16/8-bit width.
+                //   r16 (wclass 1): imm<<16      & (reg << 16)
+                //   r8lo (2):       imm<<24      & (reg << 24)
+                //   r8hi (3):       imm<<24      & (reg << 16)   (AH at [15:8])
+                const int lhs_shift = (wclass == 2) ? 24 : 16;
+                const uint32_t immv = (wclass == 1) ? p.imm : (p.imm << 8);
+                const int Rt = alloc_free_gpr(result);
+                // MOVZ Rt, #immv, LSL #16  (immv ≤ 0xFFFF by construction)
+                emit_movn(buf, 0, /*MOVZ*/2, /*hw=*/1,
+                          static_cast<uint16_t>(immv), Rt);
+                emit_logical_shifted_reg(buf, 0, /*ANDS*/3, 0, /*LSL*/0,
+                                         p.dst, static_cast<int8_t>(lhs_shift),
+                                         Rt, GPR::XZR);
+                free_gpr(result, Rt);
+                break;
+            }
             if (n.aux & 2) {  // register rhs
                 if (is_test)
                     emit_logical_shifted_reg(buf, is64, /*ANDS*/3, 0, /*LSL*/0,
@@ -1386,23 +1407,32 @@ void lower(Context& ctx, TranslationResult* result) {
         int cmp_count = 0;
         bool has_nzcv_user = false;
         bool has_guest_cmp = false;
+        int last_flagdef = -1;
         for (int i = 0; i < ctx.num_nodes; i++) {
             auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
-            if (n.op == Op::GuestCmpF) has_guest_cmp = true;
+            if (n.op == Op::GuestCmpF) { has_guest_cmp = true; last_flagdef = i; }
             if (n.op == Op::FCmp || n.op == Op::FTst) {
                 if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
                 nzcv_last_cmp = i;
                 cmp_count++;
             }
         }
-        nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
+        // Elision fires when the guest flags a compare would clobber are
+        // provably dead — either after the run (nzcv_dead), or at an in-run
+        // GuestCmpF that FOLLOWS every compare (it fully redefines the
+        // NZCV-carried flags, its own PF/AF gate ran at build, and nothing
+        // between reads NZCV: no FComI/FCSel here, FStsw reads status_word
+        // only, the trig stubs preserve flags). This is what makes the
+        // `fcomp; fnstsw; test` idiom drop its MRS/MSR pair even when
+        // post-run liveness is unknown — the consumed test IS the proof.
+        nzcv_skip = (ctx.nzcv_dead || last_flagdef > nzcv_last_cmp) &&
+                    !has_nzcv_user && cmp_count >= 1;
         // No hoisting across a GuestCmpF: the deferred restore would put the
         // ENTRY flags back on top of the cmp/test's freshly defined ones.
         // Per-compare save/restore round-trips the CURRENT flags and stays
-        // correct on either side of it. (nzcv_skip is unaffected: it needs
-        // nzcv_dead and no FCSel, so nothing reads what a compare clobbers.)
+        // correct on either side of it.
         nzcv_hoist = !nzcv_skip && !has_nzcv_user && !has_guest_cmp &&
                      cmp_count >= 2;
     }
@@ -2684,19 +2714,22 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         int cmp_count = 0;
         bool has_nzcv_user = false;
         bool has_guest_cmp = false;
+        int last_flagdef = -1;
         for (int i = 0; i < ctx.num_nodes; i++) {
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
-            if (n.op == Op::GuestCmpF) has_guest_cmp = true;
+            if (n.op == Op::GuestCmpF) { has_guest_cmp = true; last_flagdef = i; }
             if (n.op == Op::FCmp || n.op == Op::FTst) {
                 if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
                 nzcv_last_cmp = i;
                 cmp_count++;
             }
         }
-        nzcv_skip = ctx.nzcv_dead && !has_nzcv_user && cmp_count >= 1;
-        // Mirrors lower(): no hoisting across a GuestCmpF.
+        // Mirrors lower(): in-run flag definer after every compare also
+        // proves the compares' NZCV dead; no hoisting across a GuestCmpF.
+        nzcv_skip = (ctx.nzcv_dead || last_flagdef > nzcv_last_cmp) &&
+                    !has_nzcv_user && cmp_count >= 1;
         nzcv_hoist = !nzcv_skip && !has_nzcv_user && !has_guest_cmp &&
                      cmp_count >= 2;
     }

@@ -417,5 +417,14 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
         count += gap;
         i = j;
     }
+    // NOTE (2026-07-30): a TRAILING cmp/test extension (count the test after
+    // the last member so the run consumes the `fcomp; fnstsw; test` tail)
+    // was implemented here and reverted after measurement: +1.2% on
+    // bench_fcomp_fnstsw_test. When the test trails the run, the forward
+    // NZCV-deadness walk already elides the compare's save/restore, so
+    // consumption only duplicates the test into both dual-body copies for
+    // zero structural gain. cmp/test still enter windows MID-run (bridge gap
+    // followed by more x87), where GuestCmpF consumption avoids a run break
+    // and wins big (bench_fcmov −88%).
     return count;
 }

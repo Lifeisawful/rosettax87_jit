@@ -558,6 +558,130 @@ static void test_fcomi_then_cmp_fcmov(const char *name, int lhs, double a,
     check_d(name, result, expected);
 }
 
+/* ── Section F: fcomp/fnstsw/test — the classic compare-branch idiom ────── */
+/*
+ * `fcompp; fnstsw %ax; test {ax,ah,al}, imm; jcc` — the dominant x87
+ * compare shape in 32-bit game code. With TRANSPARENT_FLAGS the sub-32
+ * test-imm forms are consumed as GuestCmpF (shifted ANDS), keeping the run
+ * alive through the test and letting the compares elide their NZCV
+ * save/restore (the consumed test proves the flags dead). The trailing
+ * `xorl %%edx,%%edx` at the join kills PF so the consumption gate can pass.
+ */
+static void check_i(const char *name, int got, int expected) {
+    if (got != expected) {
+        printf("FAIL  %-70s  got=%d  expected=%d\n", name, got, expected);
+        failures++;
+    } else {
+        printf("PASS  %s\n", name);
+    }
+}
+
+/* testw $0x4500, %ax: ZF=1 iff C0=C2=C3=0 iff ST(0) > ST(1) ordered. */
+static void test_fnstsw_testw_gt(const char *name, double x, double y,
+                                 int expected) {
+    int r;
+    __asm__ volatile (
+        "fldl  %2\n\t"           /* y                         */
+        "fldl  %1\n\t"           /* x; ST(0)=x ST(1)=y        */
+        "fcompp\n\t"             /* compare x vs y, pop both  */
+        "fnstsw %%ax\n\t"
+        "testw $0x4500, %%ax\n\t"
+        "jz    1f\n\t"
+        "movl  $0, %0\n\t"       /* not greater               */
+        "jmp   2f\n"
+        "1:\n\t"
+        "movl  $1, %0\n"         /* greater                   */
+        "2:\n\t"
+        "xorl  %%edx, %%edx\n"
+        : "=r" (r), "=m" (x), "=m" (y)
+        : "m" (x), "m" (y)
+        : "cc", "st", "ax", "edx"
+    );
+    check_i(name, r, expected);
+}
+
+/* test %ah, $0x45 — the sahf-free byte variant of the same predicate.
+ * The fldz/fstp after the test keeps the run window open THROUGH it, so
+ * this variant exercises the mid-run GuestCmpF consumption of the sub-32
+ * test (x87 ops between the test and the jcc don't touch EFLAGS). */
+static void test_fnstsw_testb_ah(const char *name, double x, double y,
+                                 int expected) {
+    int r;
+    double dummy;
+    __asm__ volatile (
+        "fldl  %3\n\t"
+        "fldl  %1\n\t"
+        "fcompp\n\t"
+        "fnstsw %%ax\n\t"
+        "testb $0x45, %%ah\n\t"
+        "fldz\n\t"
+        "fstpl %2\n\t"
+        "jz    1f\n\t"
+        "movl  $0, %0\n\t"
+        "jmp   2f\n"
+        "1:\n\t"
+        "movl  $1, %0\n"
+        "2:\n\t"
+        "xorl  %%edx, %%edx\n"
+        : "=r" (r), "=m" (x), "=m" (dummy), "=m" (y)
+        : "m" (x), "m" (y)
+        : "cc", "st", "ax", "edx"
+    );
+    check_i(name, r, expected);
+}
+
+/* testw $0x4000, %ax: ZF=0 iff C3 set iff equal (or unordered's C3=0 no). */
+static void test_fnstsw_testw_eq(const char *name, double x, double y,
+                                 int expected) {
+    int r;
+    __asm__ volatile (
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "fcompp\n\t"
+        "fnstsw %%ax\n\t"
+        "testw $0x4000, %%ax\n\t"
+        "jnz   1f\n\t"
+        "movl  $0, %0\n\t"       /* C3=0: not equal           */
+        "jmp   2f\n"
+        "1:\n\t"
+        "movl  $1, %0\n"         /* C3=1: equal               */
+        "2:\n\t"
+        "xorl  %%edx, %%edx\n"
+        : "=r" (r), "=m" (x), "=m" (y)
+        : "m" (x), "m" (y)
+        : "cc", "st", "ax", "edx"
+    );
+    check_i(name, r, expected);
+}
+
+/* test %al low-byte form: fnstsw's low byte is exception flags — cleared
+ * with FNCLEX first (earlier sections' NaN FCOMIs leave sticky IE on real
+ * hardware; the JIT doesn't model exceptions) — so test $0xFF, %al must
+ * take the ZF=1 arm. Checks the r8lo shift path. */
+static void test_fnstsw_testb_al(const char *name) {
+    int r;
+    double x = 1.0, y = 2.0;
+    __asm__ volatile (
+        "fnclex\n\t"
+        "fldl  %2\n\t"
+        "fldl  %1\n\t"
+        "fcompp\n\t"
+        "fnstsw %%ax\n\t"
+        "testb $0xFF, %%al\n\t"
+        "jz    1f\n\t"
+        "movl  $0, %0\n\t"
+        "jmp   2f\n"
+        "1:\n\t"
+        "movl  $1, %0\n"
+        "2:\n\t"
+        "xorl  %%edx, %%edx\n"
+        : "=r" (r), "=m" (x), "=m" (y)
+        : "m" (x), "m" (y)
+        : "cc", "st", "ax", "edx"
+    );
+    check_i(name, r, 1);
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -601,6 +725,19 @@ int main(void) {
     test_cmp_fcmov_no_killer("E/no flag killer: not below -> a", 8, 7.0, 9.0, 7.0);
     test_fcomi_then_cmp_fcmov("E/fcomi then cmp: cmp wins -> b", 3, 7.0, 9.0, 9.0);
     test_fcomi_then_cmp_fcmov("E/fcomi then cmp: cmp wins -> a", 8, 7.0, 9.0, 7.0);
+
+    /* Section F: fcomp/fnstsw/test idiom (sub-32 GuestCmpF widths) */
+    test_fnstsw_testw_gt("F/testw 0x4500: 5>3 -> greater", 5.0, 3.0, 1);
+    test_fnstsw_testw_gt("F/testw 0x4500: 2<9 -> not greater", 2.0, 9.0, 0);
+    test_fnstsw_testw_gt("F/testw 0x4500: 4==4 -> not greater", 4.0, 4.0, 0);
+    test_fnstsw_testw_gt("F/testw 0x4500: NaN -> not greater",
+                         __builtin_nan(""), 1.0, 0);
+    test_fnstsw_testb_ah("F/test ah,0x45: 5>3 -> greater", 5.0, 3.0, 1);
+    test_fnstsw_testb_ah("F/test ah,0x45: 2<9 -> not greater", 2.0, 9.0, 0);
+    test_fnstsw_testw_eq("F/testw 0x4000: 4==4 -> equal", 4.0, 4.0, 1);
+    test_fnstsw_testw_eq("F/testw 0x4000: 5>3 -> not equal", 5.0, 3.0, 0);
+    test_fnstsw_testw_eq("F/testw 0x4000: 2<9 -> not equal", 2.0, 9.0, 0);
+    test_fnstsw_testb_al("F/test al,0xFF: exception byte clear");
 
     if (failures == 0)
         printf("\nAll tests passed.\n");

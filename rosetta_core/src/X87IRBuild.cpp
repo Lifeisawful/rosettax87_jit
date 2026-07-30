@@ -964,31 +964,58 @@ static bool build_guest_cmp(Context& ctx, IRInstr* instr, uint16_t op) {
     const IROperand& rhs = instr->operands[1];
     if (lhs.kind != IROperandKind::Register || !lhs.reg.reg.is_gpr())
         return false;
-    const bool is64 = lhs.reg.size == IROperandSize::S64;
-    if (!is64 && lhs.reg.size != IROperandSize::S32) return false;
 
     GuestPayload p = {};
     p.dst = lhs.reg.reg.index();
-    p.is64 = is64;
-    bool reg_rhs;
-    if (rhs.kind == IROperandKind::Register) {
-        if (!rhs.reg.reg.is_gpr() || rhs.reg.size != lhs.reg.size) return false;
-        p.src = rhs.reg.reg.index();
-        reg_rhs = true;
-    } else if (rhs.kind == IROperandKind::MemRef ||
-               rhs.kind == IROperandKind::AbsMem) {
-        return false;
-    } else {
+    bool reg_rhs = false;
+    uint32_t wclass = 0;  // aux[3:2]: 0 = 32/64 (p.is64), 1 = r16, 2/3 = r8 lo/hi
+
+    if (lhs.reg.size == IROperandSize::S64 ||
+        lhs.reg.size == IROperandSize::S32) {
+        p.is64 = lhs.reg.size == IROperandSize::S64;
+        if (rhs.kind == IROperandKind::Register) {
+            if (!rhs.reg.reg.is_gpr() || rhs.reg.size != lhs.reg.size)
+                return false;
+            p.src = rhs.reg.reg.index();
+            reg_rhs = true;
+        } else if (rhs.kind == IROperandKind::MemRef ||
+                   rhs.kind == IROperandKind::AbsMem) {
+            return false;
+        } else {
+            if (rhs.kind == IROperandKind::Immediate && rhs.imm.mem_flags != 0)
+                return false;  // fixup: payload is the relocation target
+            p.imm = static_cast<uint32_t>(rhs.imm.value);
+        }
+    } else if (is_test && rhs.kind != IROperandKind::Register &&
+               rhs.kind != IROperandKind::MemRef &&
+               rhs.kind != IROperandKind::AbsMem) {
+        // Sub-32 TEST with an immediate — the fnstsw idiom's
+        // `test ax/ah/al, imm`. Flags come from an ANDS of both operands
+        // shifted to the top of the W register (see the lowering), which is
+        // flag-exact for the partial width: Z matches, N is the partial
+        // result's sign bit, C=V=0 as x86 demands. cmp stays 32/64-only
+        // (both operands would need pre-shifting — three instructions).
         if (rhs.kind == IROperandKind::Immediate && rhs.imm.mem_flags != 0)
-            return false;  // fixup: payload is the relocation target
-        p.imm = static_cast<uint32_t>(rhs.imm.value);
-        reg_rhs = false;
+            return false;
+        if (lhs.reg.size == IROperandSize::S16) {
+            wclass = 1;
+            p.imm = static_cast<uint32_t>(rhs.imm.value) & 0xFFFF;
+        } else if (lhs.reg.size == IROperandSize::S8) {
+            // Register-byte class nibble: 0x0X = low byte, 0x1X = AH/CH/DH/BH.
+            if ((lhs.reg.reg.value & 0xF0) > 0x10) return false;
+            wclass = ((lhs.reg.reg.value & 0xF0) == 0x10) ? 3u : 2u;
+            p.imm = static_cast<uint32_t>(rhs.imm.value) & 0xFF;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
     }
 
     auto id = ctx.add_node(Op::GuestCmpF);
     if (id < 0) return false;
     ctx.nodes[id].imm_bits = guest_pack(p);
-    ctx.nodes[id].aux = (is_test ? 1u : 0u) | (reg_rhs ? 2u : 0u);
+    ctx.nodes[id].aux = (is_test ? 1u : 0u) | (reg_rhs ? 2u : 0u) | (wclass << 2);
     ctx.last_guest_flagdef = id;
     return true;
 }
