@@ -129,6 +129,7 @@ struct RosettaConfig {
     uint8_t  disable_stack_ops;      // ROSETTA_X87_DISABLE_STACKOPS=1 — family gate for fdecstp/fincstp/ffree inline translation (no OpcodeId bits left; also forced by DISABLE_ALL_OPS)
     uint8_t  disable_nzcv_liveness;  // ROSETTA_X87_DISABLE_NZCV_LIVENESS=1 — don't use Rosetta's flag-liveness dataflow to prove NZCV dead at run exit (fall back to the forward whitelist walk alone; bisection lever)
     uint8_t  disable_trig_sw_sink;   // ROSETTA_X87_DISABLE_TRIG_SW_SINK=1 — keep every trig/pow value call's C1|C2 status_word RMW, even when a later full-halfword writer in the same run makes it dead (bisection lever)
+    uint8_t  disable_fcmov_raw;      // ROSETTA_X87_DISABLE_FCMOV_RAW=1 — FCSel reads the packed guest-EFLAGS NZCV installed by FComI's full pack instead of remapped raw FCMP conditions (bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

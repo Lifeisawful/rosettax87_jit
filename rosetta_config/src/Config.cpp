@@ -252,6 +252,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_TRIG_SW_SINK"))
         cfg.disable_trig_sw_sink = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: FCMOV reads packed guest-EFLAGS NZCV (FComI emits its
+    // full pack inline) instead of raw remapped FCMP conditions.
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_FCMOV_RAW"))
+        cfg.disable_fcmov_raw = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

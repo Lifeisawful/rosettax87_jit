@@ -459,6 +459,81 @@ static bool nzcv_dead_after_run(IRInstr* instr_array, int64_t num_instrs, int64_
     return false;  // block end reached without a full redefinition
 }
 
+// ── OPT-CR: raw-condition FCMOV planning ────────────────────────────────────
+//
+// FComI's only in-run consumers are FCSel nodes, and every x87 relation an
+// FCMOV tests is directly encodable as a condition on the RAW FCMP NZCV:
+//   fcmovb   CF        = {LT,UN}      → lt        fcmovnb  !CF → ge
+//   fcmovbe  CF|ZF     = {LT,EQ,UN}   → le        fcmovnbe     → gt
+//   fcmovu   PF        = {UN}         → vs        fcmovnu      → vc
+//   fcmove   ZF        = {EQ,UN}      → eq*       fcmovne      → ne*
+// (*) EQ|UN needs one FCCMP Dn, Dm, #5, vc after the FCMP: ordered re-derives
+// the same flags, unordered forces NZCV = 0101 (Z=1,V=1,N=0,C=0) — a state in
+// which ALL eight conditions above read correctly, so the normalization is
+// compatible with mixing variants off one compare.
+//
+// So the 10-instruction guest-EFLAGS pack (3×CSET/ORR/BIC/shifts/MSR) that
+// FComI used to install for the FCSel to read is bypassed: FCSel conditions
+// are remapped onto the raw flags (kFCSelRaw), and the pack is emitted only
+// when the guest may actually read EFLAGS after the run:
+//   - an FComI followed by another live FComI never needs its pack (the next
+//     one fully redefines guest EFLAGS, and in-run nothing else reads NZCV:
+//     FCmp/FTst always save/restore around their FCMP in FComI-bearing runs
+//     — has_nzcv_user forces the per-compare pair — and the trig value stubs
+//     preserve NZCV by contract, runtime_entry.S);
+//   - the LAST FComI's pack is emitted iff !ctx.nzcv_dead, SUNK to after its
+//     last raw FCSel (kPackSink): CSET/FCSEL don't write NZCV, so the raw
+//     flags survive until there and the pack output is what post-run guest
+//     code observes, exactly as before.
+// The sunk pack also computes from the FCCMP-normalized state, which folds
+// the old Z|V and C&~V merges into plain CSETs (pack shrinks 10 → 8).
+//
+// FComI aux encoding: bit0 = emit pack, bit1 = emit FCCMP, bit2 = legacy
+// lowering (ROSETTA_X87_DISABLE_FCMOV_RAW bisection lever: full pack inline,
+// FCSels unmarked and reading packed conventions), bits[31:16] = sink node.
+
+static void plan_fcomi_raw(Context& ctx) {
+    const bool disabled =
+        g_rosetta_config && g_rosetta_config->disable_fcmov_raw;
+    int cur = -1;             // FComI whose raw flags are current
+    int cur_sink = -1;        // last FCSel associated with cur
+    bool cur_has_eqne = false;
+
+    auto finalize = [&](bool overwritten) {
+        if (cur < 0) return;
+        auto& f = ctx.nodes[cur];
+        const bool pack = !overwritten && !ctx.nzcv_dead;
+        const bool fccmp = pack || cur_has_eqne;
+        const int sink = (pack && cur_sink >= 0) ? cur_sink : cur;
+        f.aux = (pack ? 1u : 0u) | (fccmp ? 2u : 0u) |
+                (static_cast<uint64_t>(static_cast<uint16_t>(sink)) << 16);
+        if (pack && cur_sink >= 0)
+            ctx.nodes[cur_sink].flags |= kPackSink;
+    };
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op == Op::FComI) {
+            if (disabled) {
+                n.aux = 4;  // legacy: inline full pack, packed-cond FCSels
+                cur = -1;
+                continue;
+            }
+            finalize(/*overwritten=*/true);
+            cur = i;
+            cur_sink = -1;
+            cur_has_eqne = false;
+        } else if (n.op == Op::FCSel && cur >= 0) {
+            n.flags |= kFCSelRaw;
+            cur_sink = i;
+            const int c = static_cast<int>(n.imm_bits & 0xF);
+            if (c == 0 || c == 1) cur_has_eqne = true;  // EQ / NE
+        }
+    }
+    finalize(/*overwritten=*/false);
+}
+
 // ── Base-address cache ──────────────────────────────────────────────────────
 //
 // Game-profile data shows runs dominated by f32/f64 memory traffic through a
@@ -1383,6 +1458,34 @@ void lower(Context& ctx, TranslationResult* result) {
     const int final_top_known =
         (top_known >= 0) ? ((top_known + ctx.top_delta) & 7) : -1;
 
+    // OPT-CR: node index after which the pending FComI guest-EFLAGS pack is
+    // emitted (-1 = none pending). Only one can be pending: a later FComI
+    // would have made the earlier pack dead in plan_fcomi_raw.
+    int pack_after = -1;
+
+    // Guest-EFLAGS pack from the FCCMP-normalized flag state (unordered →
+    // Z=1,C=0,V=1): CSET EQ is already ZF (equal|unordered) and CSET CS is
+    // already the CF complement (ge-only), so the legacy Z|V and C&~V merges
+    // vanish. Same packed NZCV convention as the legacy FComI lowering:
+    // bit30=ZF, bit29=!CF, bit28=V (PF), bit26=PF.
+    auto emit_fcomi_pack = [&]() {
+        int Wd_z = alloc_free_gpr(*result);
+        int Wd_v = alloc_free_gpr(*result);
+        int Wd_c = alloc_free_gpr(*result);
+        emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_z);
+        emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);
+        emit_cset(buf, /*is_64bit=*/0, /*CS=*/2, Wd_c);
+        emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
+                      /*immr=*/2, /*imms=*/1, Wd_z, Wd_z);  // LSL #30
+        emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_c, 29, Wd_z, Wd_z);
+        emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 28, Wd_z, Wd_z);
+        emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 26, Wd_z, Wd_z);
+        emit_msr_nzcv(buf, Wd_z);
+        free_gpr(*result, Wd_c);
+        free_gpr(*result, Wd_v);
+        free_gpr(*result, Wd_z);
+    };
+
     // ── Emit each IR node ───────────────────────────────────────────────────
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
@@ -1669,6 +1772,16 @@ void lower(Context& ctx, TranslationResult* result) {
             int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             int cond = static_cast<int>(n.imm_bits & 0xF);
+            if (n.flags & kFCSelRaw) {
+                // OPT-CR: remap the packed-EFLAGS condition onto the raw
+                // FCMP NZCV of the owning FComI (see plan_fcomi_raw):
+                //   CC→LT  CS→GE  LS→LE  HI→GT; EQ/NE/VS/VC read the same.
+                static constexpr int8_t kRawCond[16] = {
+                    /*EQ*/ 0,  /*NE*/ 1,  /*CS*/ 10, /*CC*/ 11,
+                    -1, -1,    /*VS*/ 6,  /*VC*/ 7,
+                    /*HI*/ 12, /*LS*/ 13, -1, -1, -1, -1, -1, -1};
+                cond = kRawCond[cond];
+            }
             // FCSEL Dd, Dn_true, Dm_false, cond → Dd = cond ? Dn : Dm
             emit_fcsel_f64(buf, Dd, Dm, Dn, cond);
             break;
@@ -1836,39 +1949,53 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // ── FCOMI / FCOMIP / FUCOMI / FUCOMIP ───────────────────────────
         case Op::FComI: {
-            // Direct port of translate_fcomi: FCMP two FPRs, then pack and
-            // write x86-compatible flags into NZCV. Does NOT touch status_word.
+            // OPT-CR (plan_fcomi_raw): FCMP, plus an FCCMP that normalizes
+            // the unordered flag state when an EQ/NE FCSel or the sunk
+            // guest-EFLAGS pack needs it. The pack itself — when needed at
+            // all — is emitted after the last raw FCSel (pack_after).
             int Dd_st0 = fprs.get(n.inputs[0]);
             int Dd_src = fprs.get(n.inputs[1]);
 
             emit_fcmp_f64(buf, Dd_st0, Dd_src);
 
-            // Extract condition bits before any MSR clobbers NZCV.
-            int Wd_z = alloc_free_gpr(*result);
-            int Wd_v = alloc_free_gpr(*result);
-            int Wd_c = alloc_free_gpr(*result);
+            if (n.aux & 4) {
+                // Legacy lowering (DISABLE_FCMOV_RAW): pack and install
+                // x86-convention EFLAGS into NZCV inline; FCSels read it.
+                int Wd_z = alloc_free_gpr(*result);
+                int Wd_v = alloc_free_gpr(*result);
+                int Wd_c = alloc_free_gpr(*result);
 
-            emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_z);   // 1 if equal
-            emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);   // 1 if unordered
-            emit_cset(buf, /*is_64bit=*/0, /*CS=*/2, Wd_c);   // 1 if carry set
+                emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_z);   // 1 if equal
+                emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);   // 1 if unordered
+                emit_cset(buf, /*is_64bit=*/0, /*CS=*/2, Wd_c);   // 1 if carry set
 
-            // Z_new = Z | V  (equal or unordered → ZF)
-            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 0, Wd_z, Wd_z);
-            // C_new = C & !V  (carry clear for unordered → CF)
-            emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=invert rhs*/1, /*LSL*/0, Wd_v, 0, Wd_c, Wd_c);
+                // Z_new = Z | V  (equal or unordered → ZF)
+                emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 0, Wd_z, Wd_z);
+                // C_new = C & !V  (carry clear for unordered → CF)
+                emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=invert rhs*/1, /*LSL*/0, Wd_v, 0, Wd_c, Wd_c);
 
-            // Pack NZCV: bit30=ZF, bit29=CF, bit28=V(PF for FCMOV), bit26=PF
-            emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
-                          /*immr=*/2, /*imms=*/1, Wd_z, Wd_z);
-            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_c, 29, Wd_z, Wd_z);
-            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 28, Wd_z, Wd_z);
-            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 26, Wd_z, Wd_z);
+                // Pack NZCV: bit30=ZF, bit29=CF, bit28=V(PF for FCMOV), bit26=PF
+                emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
+                              /*immr=*/2, /*imms=*/1, Wd_z, Wd_z);
+                emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_c, 29, Wd_z, Wd_z);
+                emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 28, Wd_z, Wd_z);
+                emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 26, Wd_z, Wd_z);
 
-            emit_msr_nzcv(buf, Wd_z);
+                emit_msr_nzcv(buf, Wd_z);
 
-            free_gpr(*result, Wd_c);
-            free_gpr(*result, Wd_v);
-            free_gpr(*result, Wd_z);
+                free_gpr(*result, Wd_c);
+                free_gpr(*result, Wd_v);
+                free_gpr(*result, Wd_z);
+                break;
+            }
+
+            // Unordered → NZCV = 0101 (Z=1,C=0,V=1); ordered re-derives the
+            // FCMP flags. See plan_fcomi_raw for why #5 satisfies every
+            // remapped condition simultaneously.
+            if (n.aux & 2)
+                emit_fccmp_f64(buf, Dd_st0, Dd_src, /*nzcv=*/5, /*cond=VC*/7);
+            if (n.aux & 1)
+                pack_after = static_cast<int>((n.aux >> 16) & 0xFFFF);
             // Pop (for FCOMIP/FUCOMIP) is handled by the IR epilogue via top_delta.
             break;
         }
@@ -2125,6 +2252,15 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // Free FPRs whose last use was this node.
         fprs.free_dead_inputs(*result, n, i);
+
+        // OPT-CR: sunk guest-EFLAGS pack — the raw FCMP flags survived until
+        // here (nothing between the FComI and this node writes NZCV without
+        // restoring it), and everything after this point expects the packed
+        // convention or nothing at all.
+        if (i == pack_after) {
+            emit_fcomi_pack();
+            pack_after = -1;
+        }
     }
 
     // ── Epilogue: update x87 state ──────────────────────────────────────────
@@ -2496,7 +2632,7 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         int transient = 0;  // per-node transient GPR demand
 
         switch (n.op) {
-        // No transient GPRs
+        // No transient GPRs (FSinCosProjCos is a bare FMOV)
         case Op::ReadSt:
         case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
         case Op::CvtF32ToF64: case Op::CvtF64ToF32:
@@ -2504,7 +2640,13 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         case Op::FNMul:
         case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
         case Op::FNeg: case Op::FAbs: case Op::FSqrt:
+        case Op::FSinCosProjCos:
+            break;
+
+        // FCSel: FCSEL itself needs no GPR, but a pack-sink FCSel emits the
+        // FComI guest-EFLAGS pack right after it (3 GPRs: Wd_z + Wd_v + Wd_c).
         case Op::FCSel:
+            if (n.flags & kPackSink) transient = 3;
             break;
 
         // 1 GPR: addr from compute_operand_address
@@ -2561,7 +2703,11 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
             }
             break;
 
-        // FComI: 3 GPRs (Wd_z + Wd_v + Wd_c)
+        // FComI: 3 GPRs (Wd_z + Wd_v + Wd_c) when the pack is emitted here
+        // (legacy lever, or pack-needed with no FCSel to sink past). With a
+        // sunk pack the node itself is FCMP+FCCMP only — the 3 is charged at
+        // the kPackSink FCSel instead; keeping 3 here too is a deliberate
+        // over-estimate (safe direction).
         case Op::FComI:
             transient = 3;
             break;
@@ -2811,6 +2957,11 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     // FCmp/FTst NZCV save/restore is elided in lowering.
     ctx.nzcv_dead = nzcv_dead_after_run(instr_array, num_instrs,
                                         start_idx + ctx.consumed) ? 1 : 0;
+
+    // OPT-CR: decide raw-condition FCMOV and pack sinking/elision per FComI.
+    // Needs nzcv_dead; must precede the pressure gates (peak_live_gprs reads
+    // the kPackSink flags it sets).
+    plan_fcomi_raw(ctx);
 
     // OPT-TI: runs containing a trig value call must never keep a value
     // resident in v16 across the call (d16 is the call's in/out register).

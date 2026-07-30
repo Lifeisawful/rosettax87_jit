@@ -174,8 +174,13 @@ enum NodeFlags : uint8_t {
     kFcomFused    = 1 << 1,    // FCOM+FSTSW fused: CC stays in register
     kTruncate     = 1 << 2,    // StoreI*: always truncate (FISTTP), skip RC dispatch
     kFcomIPopping = 1 << 3,    // FComI: pop ST(0) after compare (FCOMIP/FUCOMIP)
+    kFCSelRaw     = 1 << 4,    // FCSel: condition remapped to read the raw
+                               // FCMP NZCV of its FComI (see plan_fcomi_raw)
     kF32          = 1 << 5,    // arithmetic node computes in f32 (S-form): takes
                                // raw-f32 inputs, produces a raw-f32 value
+    kPackSink     = 1 << 6,    // FCSel: its FComI's guest-EFLAGS pack is
+                               // emitted after this node (raw flags stay live
+                               // through it; CSET/FCSEL don't write NZCV)
 };
 
 // ── Guest* node payload ─────────────────────────────────────────────────────

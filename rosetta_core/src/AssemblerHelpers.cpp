@@ -517,6 +517,21 @@ auto emit_fcsel_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm, int cond) -> v
 }
 
 // =============================================================================
+// FCCMP Dn, Dm, #nzcv, cond — if cond holds, NZCV = FCMP(Dn, Dm); else
+// NZCV = #nzcv.
+// Encoding: M=0, S=0, 11110, type=01(f64), 1, Rm, cond, 01, Rn, op=0, nzcv
+// Base: 0x1E600400
+// =============================================================================
+auto emit_fccmp_f64(AssemblerBuffer& buf, int Dn, int Dm, int nzcv, int cond) -> void {
+    uint32_t insn = 0x1E600400u;
+    insn |= (uint32_t)(Dm & 0x1F) << 16;
+    insn |= (uint32_t)(cond & 0xF) << 12;
+    insn |= (uint32_t)(Dn & 0x1F) << 5;
+    insn |= (uint32_t)(nzcv & 0xF);
+    buf.emit(insn);
+}
+
+// =============================================================================
 // FCMP Dn, #0.0 — compare FP register against zero
 //
 // Encoding: same as FCMP but bit[3]=1, Rm field=00000

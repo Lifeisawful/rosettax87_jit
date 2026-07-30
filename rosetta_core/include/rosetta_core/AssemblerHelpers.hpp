@@ -243,6 +243,9 @@ auto emit_cset(AssemblerBuffer& buf, int is_64bit, int cond, int Rd) -> void;
 // AArch64 cond codes same as above
 auto emit_fcsel_f64(AssemblerBuffer& buf, int Dd, int Dn, int Dm, int cond) -> void;
 
+// FCCMP Dn, Dm, #nzcv, cond — if cond holds NZCV = FCMP(Dn, Dm), else #nzcv
+auto emit_fccmp_f64(AssemblerBuffer& buf, int Dn, int Dm, int nzcv, int cond) -> void;
+
 // FCMP Dn, #0.0 — compare FP register against zero, sets NZCV
 auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void;
 
