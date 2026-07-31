@@ -169,6 +169,80 @@ static void fnstcw_save_fldcw_restore(uint16_t new_cw,
     );
 }
 
+/* ── 7. OPT-CF: MSVC ftol idiom — in-run CONSTANT control word ──────────
+ * `mov m16, #CW; fldcw m16; fistp; fldcw restore` makes RC a translate-time
+ * constant: the conversion must lower to a single statically-rounded FCVT
+ * and still produce the mode's exact result. The restore then re-enters
+ * dynamic-RC territory — the second conversion must use the RESTORED mode.
+ */
+/* The immediate must be literal in the asm — one function per mode. */
+#define FTOL_CONST_FN(name, imm)                                        \
+    static int32_t name(double val) {                                   \
+        int32_t result = 0;                                             \
+        uint16_t slot = 0;                                              \
+        __asm__ volatile (                                              \
+            "fldl   %2\n\t"                                             \
+            "movw   $" #imm ", %1\n\t"                                  \
+            "fldcw  %1\n\t"                                             \
+            "fistpl %0\n"                                               \
+            : "=m"(result), "=m"(slot)                                  \
+            : "m"(val));                                                \
+        return result;                                                  \
+    }
+
+FTOL_CONST_FN(ftol_const_trunc,   0x0f7f)  /* RC=11 truncate */
+FTOL_CONST_FN(ftol_const_nearest, 0x037f)  /* RC=00 nearest  */
+FTOL_CONST_FN(ftol_const_floor,   0x077f)  /* RC=01 floor    */
+FTOL_CONST_FN(ftol_const_ceil,    0x0b7f)  /* RC=10 ceil     */
+
+/* Constant store OVERWRITTEN by a second one — the fold must use the last. */
+static int32_t ftol_const_overwrite(double val) {
+    int32_t result = 0;
+    uint16_t slot = 0;
+    __asm__ volatile (
+        "fldl   %2\n\t"
+        "movw   $0x0f7f, %1\n\t"   /* truncate...                */
+        "movw   $0x037f, %1\n\t"   /* ...overwritten: nearest    */
+        "fldcw  %1\n\t"
+        "fistpl %0\n"
+        : "=m"(result), "=m"(slot)
+        : "m"(val));
+    return result;
+}
+
+/* Full MSVC _ftol shape with restore: the first conversion uses the folded
+ * truncate mode; the conversion AFTER the (unknown-value) restore must use
+ * the restored mode again. */
+static void ftol_msvc_restore(double val, int32_t *r_trunc, int32_t *r_after) {
+    uint16_t saved = 0, slot = 0;
+    __asm__ volatile (
+        "fnstcw %2\n\t"            /* save entry CW (nearest)          */
+        "fldl   %4\n\t"
+        "fldl   %4\n\t"
+        "movw   $0x0f7f, %3\n\t"
+        "fldcw  %3\n\t"            /* constant: truncate               */
+        "fistpl %0\n\t"            /* static FCVTZS                    */
+        "fldcw  %2\n\t"            /* restore (unknown value)          */
+        "fistpl %1\n"              /* dynamic: restored mode (nearest) */
+        : "=m"(*r_trunc), "=m"(*r_after), "=m"(saved), "=m"(slot)
+        : "m"(val));
+}
+
+/* FRNDINT under a folded constant CW. */
+static double frndint_const_floor(double val) {
+    double result = 0.0;
+    uint16_t slot = 0;
+    __asm__ volatile (
+        "fldl   %2\n\t"
+        "movw   $0x077f, %1\n\t"
+        "fldcw  %1\n\t"
+        "frndint\n\t"
+        "fstpl  %0\n"
+        : "=m"(result), "=m"(slot)
+        : "m"(val));
+    return result;
+}
+
 int main(void) {
     uint16_t saved_cw = get_cw();
 
@@ -255,6 +329,44 @@ int main(void) {
         fnstcw_save_fldcw_restore(CW_FLOOR, &saved, &restored);
         check_u16("saved CW_NEAREST before FLDCW→FLOOR", saved, CW_NEAREST);
         check_u16("restored reads CW_FLOOR", restored, CW_FLOOR);
+    }
+
+    /* ── 7. OPT-CF: constant control word (MSVC ftol) ───────────────────── */
+    printf("\n=== OPT-CF: mov m16,#CW; fldcw; convert ===\n");
+    {
+        set_cw(CW_NEAREST);
+        check_i32("ftol const trunc: 1.7 -> 1",    ftol_const_trunc(1.7), 1);
+        check_i32("ftol const trunc: -1.7 -> -1",  ftol_const_trunc(-1.7), -1);
+        check_i32("ftol const trunc: 2.5 -> 2",    ftol_const_trunc(2.5), 2);
+
+        set_cw(CW_TRUNC);  /* entry mode must NOT leak into the fold */
+        check_i32("ftol const nearest: 1.7 -> 2",  ftol_const_nearest(1.7), 2);
+        check_i32("ftol const nearest: 2.5 -> 2 (ties-even)",
+                  ftol_const_nearest(2.5), 2);
+        check_i32("ftol const nearest: 3.5 -> 4 (ties-even)",
+                  ftol_const_nearest(3.5), 4);
+
+        set_cw(CW_NEAREST);
+        check_i32("ftol const floor: 1.7 -> 1",    ftol_const_floor(1.7), 1);
+        check_i32("ftol const floor: -1.7 -> -2",  ftol_const_floor(-1.7), -2);
+        check_i32("ftol const ceil: 1.2 -> 2",     ftol_const_ceil(1.2), 2);
+        check_i32("ftol const ceil: -1.2 -> -1",   ftol_const_ceil(-1.2), -1);
+
+        set_cw(CW_NEAREST);
+        check_i32("ftol const overwrite: last store wins (nearest 1.7 -> 2)",
+                  ftol_const_overwrite(1.7), 2);
+
+        set_cw(CW_NEAREST);
+        int32_t r_trunc = 0, r_after = 0;
+        ftol_msvc_restore(1.7, &r_trunc, &r_after);
+        check_i32("ftol+restore: folded trunc 1.7 -> 1", r_trunc, 1);
+        check_i32("ftol+restore: post-restore nearest 1.7 -> 2", r_after, 2);
+
+        set_cw(CW_NEAREST);
+        check_f64("frndint const floor: 2.7 -> 2.0",
+                  frndint_const_floor(2.7), 2.0);
+        check_f64("frndint const floor: -2.3 -> -3.0",
+                  frndint_const_floor(-2.3), -3.0);
     }
 
     /* Restore original control word */

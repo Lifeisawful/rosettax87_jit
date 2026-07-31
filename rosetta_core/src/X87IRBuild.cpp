@@ -492,7 +492,12 @@ static bool build_int_store(Context& ctx, IROperand* op, int16_t val_node, bool 
     auto id = ctx.add_node(store_op, val_node);
     if (id < 0) return false;
     ctx.nodes[id].mem_operand = op;
-    if (truncate) ctx.nodes[id].flags |= kTruncate;
+    if (truncate)
+        ctx.nodes[id].flags |= kTruncate;
+    else if (ctx.known_rc >= 0)
+        // OPT-CF: RC is a translate-time constant here — the lowering emits
+        // one statically-rounded FCVT instead of the dispatch tree.
+        ctx.nodes[id].aux = 0x100u | static_cast<uint32_t>(ctx.known_rc);
     // Evict may-aliasing entries; no forwarding (f64→int isn't invertible).
     mem_cse_evict_may_alias(ctx, op);
     return true;
@@ -1078,6 +1083,12 @@ static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
         ctx.nodes[id].mem_operand = &instr->operands[0];
         // Memory write: cached loads it may alias are stale.
         mem_cse_evict_may_alias(ctx, &instr->operands[0]);
+        // OPT-CF: a 16-bit immediate store is a constant-CW candidate for a
+        // following FLDCW of the same operand (MSVC ftol) — record it in the
+        // CSE table (evictions keep it honest; the value rides in node aux).
+        if (ctx.nodes[id].op == Op::GuestStoreI &&
+            guest_mem_size(dst) == IROperandSize::S16)
+            mem_cse_insert(ctx, &instr->operands[0], Op::GuestStoreI, id);
         return true;
     }
 
@@ -1571,6 +1582,9 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 if (st0 < 0) { ok = false; break; }
                 auto id = ctx.add_node(Op::FRndInt, st0);
                 if (id < 0) { ok = false; break; }
+                if (ctx.known_rc >= 0)  // OPT-CF: single static FRINT
+                    ctx.nodes[id].aux =
+                        0x100u | static_cast<uint32_t>(ctx.known_rc);
                 ctx.slot_val[0] = id;
                 break;
             }
@@ -1687,6 +1701,21 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 auto id = ctx.add_node(Op::StoreCW);
                 if (id < 0) { ok = false; break; }
                 ctx.nodes[id].mem_operand = &instr->operands[0];
+                // OPT-CF: when the operand provably holds an in-run immediate
+                // store's value (MSVC ftol: `mov m16,#CW; fldcw m16`), the
+                // control word — and so RC — is a translate-time constant
+                // until the next unknown FLDCW. aux bit16 flags it; the CW
+                // value rides in aux[15:0] (lowering skips the guest LDRH).
+                const int16_t src =
+                    mem_cse_lookup(ctx, &instr->operands[0], Op::GuestStoreI);
+                if (src >= 0) {
+                    const uint32_t cw =
+                        static_cast<uint32_t>(ctx.nodes[src].aux) & 0xFFFFu;
+                    ctx.nodes[id].aux = 0x10000u | cw;
+                    ctx.known_rc = static_cast<int8_t>((cw >> 10) & 3);
+                } else {
+                    ctx.known_rc = -1;
+                }
                 break;
             }
             case kOpcodeName_fnstcw: {

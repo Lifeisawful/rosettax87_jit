@@ -324,6 +324,13 @@ struct Context {
     // CC tracking for FCOM+FSTSW fusion.
     int16_t last_fcmp;              // most recent FCmp/FTst node ID, or -1
 
+    // OPT-CF: rounding control as a translate-time constant. Set when an
+    // FLDCW's operand provably holds an in-run immediate store's value
+    // (MSVC ftol: `mov m16,#CW; fldcw m16`); -1 = unknown (run entry, or
+    // an FLDCW from unknown memory). Conversions built while known are
+    // marked static-RC and skip the dispatch tree entirely.
+    int8_t  known_rc;
+
     // NZCV tracking for FCMOV safety gate.
     int16_t last_fcomi;             // most recent FComI node ID, or -1
     int16_t last_guest_flagdef;     // most recent GuestCmpF node ID, or -1
@@ -360,6 +367,7 @@ struct Context {
         num_nodes = 0;
         top_delta = 0;
         consumed = 0;
+        known_rc = -1;
         last_fcmp = -1;
         last_fcomi = -1;
         last_guest_flagdef = -1;

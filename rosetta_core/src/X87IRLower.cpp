@@ -1376,10 +1376,12 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
                 nd.base = true;
                 break;
             case Op::FRndInt:
-                if (!fast_round) nd.base = true;  // RC read from control_word
+                // RC read from control_word — unless the mode is a
+                // translate-time constant (OPT-CF static RC, aux bit 8).
+                if (!fast_round && !(n.aux & 0x100)) nd.base = true;
                 break;
             case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
-                if (!(n.flags & kTruncate)) {
+                if (!(n.flags & kTruncate) && !(n.aux & 0x100)) {
                     // RC dispatch: emit_rc_preamble / emit_rcmode_dispatch.
                     nd.base = true;
                     nd.tmp = true;
@@ -1616,15 +1618,24 @@ void lower(Context& ctx, TranslationResult* result) {
             rc_entry_valid = true;
         } else {
             int rc_count = 0;
+            bool seen_storecw = false;
             bool use_rc_cache = false;
             for (int i = 0; i < ctx.num_nodes; i++) {
                 auto& n = ctx.nodes[i];
                 if (n.flags & kDead) continue;
-                if (n.op == Op::StoreCW) { continue; }
-                bool is_rc = (n.op == Op::FRndInt) ||
+                if (n.op == Op::StoreCW) { seen_storecw = true; continue; }
+                // OPT-CF: static-RC conversions (aux bit 8) never read the
+                // cache. A dynamic consumer AFTER a StoreCW enables it even
+                // alone: the StoreCW's re-cache UBFX replaces the consumer's
+                // control_word LDRH — which would read back the halfword the
+                // StoreCW just stored (store-to-load stall).
+                bool is_rc = ((n.op == Op::FRndInt) ||
                     ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
-                     && !(n.flags & kTruncate));
-                if (is_rc && ++rc_count >= 2) { use_rc_cache = true; break; }
+                     && !(n.flags & kTruncate))) && !(n.aux & 0x100);
+                if (is_rc && (++rc_count >= 2 || seen_storecw)) {
+                    use_rc_cache = true;
+                    break;
+                }
             }
             if (use_rc_cache)
                 // alloc_free_gpr, NOT alloc_gpr(pool 3): the addr cache may
@@ -2056,7 +2067,13 @@ void lower(Context& ctx, TranslationResult* result) {
             int Dd = fprs.alloc_output(ctx, *result, i);
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
 
-            if (g_rosetta_config && g_rosetta_config->fast_round) {
+            if (n.aux & 0x100) {
+                // OPT-CF: static RC — one FRINT, no dispatch. Checked before
+                // fast_round: the exact mode beats its nearest assumption.
+                // x87 RC {nearest,floor,ceil,trunc} → FRINT{N,M,P,Z}.
+                static constexpr uint8_t kRcToFrint[4] = {8, 10, 9, 11};
+                emit_fp_dp1(buf, /*type=*/1, kRcToFrint[n.aux & 3], Dd, Dn);
+            } else if (g_rosetta_config && g_rosetta_config->fast_round) {
                 // Fast path: RC=0 → FRINTN
                 emit_fp_dp1(buf, /*type=*/1, /*FRINTN=*/8, Dd, Dn);
             } else if (Wd_rc_cached >= 0) {
@@ -2251,6 +2268,13 @@ void lower(Context& ctx, TranslationResult* result) {
                 // FISTTP: always truncate, single FCVTZS.
                 emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1,
                                     /*rmode=FCVTZS*/ 3, Wd_int, Dd_val);
+            } else if (n.aux & 0x100) {
+                // OPT-CF: RC is a translate-time constant (in-run constant
+                // FLDCW) — one statically-rounded FCVT, no dispatch tree.
+                // x87 RC {nearest,floor,ceil,trunc} → FCVT rmode {NS,MS,PS,ZS}.
+                static constexpr uint8_t kRcToRmode[4] = {0, 2, 1, 3};
+                emit_fcvt_fp_to_int(buf, is_64bit_int, /*ftype=double*/ 1,
+                                    kRcToRmode[n.aux & 3], Wd_int, Dd_val);
             } else if (Wd_rc_cached >= 0) {
                 // RC caching: emit preamble on first use, then reuse cached RC.
                 if (!rc_cache_valid) {
@@ -2403,7 +2427,13 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::StoreCW: {
             // FLDCW: load u16 from memory, write to X87State.control_word.
             int Wd_cw = alloc_free_gpr(*result);
-            if (!emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/1, Wd_cw))
+            if (n.aux & 0x10000) {
+                // OPT-CF: the operand provably holds an in-run immediate
+                // store's value — materialize the constant, skip the LDRH.
+                emit_movn(buf, /*is_64=*/0, /*MOVZ=*/2, /*hw=*/0,
+                          static_cast<uint16_t>(n.aux & 0xFFFF), Wd_cw);
+            } else if (!emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/1,
+                                               Wd_cw))
                 emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
                                     /*size_log2=*/1, /*is_load=*/1, Wd_cw);
             // STRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
@@ -2994,14 +3024,15 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
     bool rc_cache = false;
     if (!(g_rosetta_config && g_rosetta_config->fast_round)) {
         int rc_count = 0;
+        bool seen_storecw = false;
         for (int i = 0; i < ctx.num_nodes; i++) {
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
-            if (n.op == Op::StoreCW) continue;
-            bool is_rc = (n.op == Op::FRndInt) ||
+            if (n.op == Op::StoreCW) { seen_storecw = true; continue; }
+            bool is_rc = ((n.op == Op::FRndInt) ||
                 ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
-                 && !(n.flags & kTruncate));
-            if (is_rc && ++rc_count >= 2) { rc_cache = true; break; }
+                 && !(n.flags & kTruncate))) && !(n.aux & 0x100);
+            if (is_rc && (++rc_count >= 2 || seen_storecw)) { rc_cache = true; break; }
         }
     }
 

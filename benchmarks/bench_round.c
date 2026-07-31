@@ -73,6 +73,26 @@ static clock_t bench_fistp_m32_ceil(void) {
     return clock() - start;
 }
 
+/* The full inlined MSVC _ftol shape: the constant CW store is INSIDE the
+ * loop, so the run sees `mov m16,#CW; fldcw; fistp; fldcw restore` and can
+ * constant-fold RC (OPT-CF) into a single FCVTZS. */
+static clock_t bench_ftol_msvc(void) {
+    clock_t start = clock();
+    volatile uint16_t saved = 0x037f;
+    volatile uint16_t slot = 0;
+    volatile int32_t r;
+    volatile double src = 1.7;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile (
+            "fldl  %3\n\t"
+            "movw  $0x0f7f, %1\n\t"
+            "fldcw %1\n\t"
+            "fistpl %0\n\t"
+            "fldcw %2\n"
+            : "=m"(r), "=m"(slot) : "m"(saved), "m"(src));
+    return clock() - start;
+}
+
 static clock_t bench_fistp_m32_trunc(void) {
     clock_t start = clock();
     volatile uint16_t cw = CW_TRUNC;
@@ -186,6 +206,7 @@ int main(void) {
         {"fistp_m32_nearest", bench_fistp_m32_nearest},
         {"fistp_m32_floor",   bench_fistp_m32_floor},
         {"fistp_m32_ceil",    bench_fistp_m32_ceil},
+        {"ftol_msvc",         bench_ftol_msvc},
         {"fistp_m32_trunc",   bench_fistp_m32_trunc},
         {"fistp_m64_nearest", bench_fistp_m64_nearest},
         {"fistp_m64_floor",   bench_fistp_m64_floor},
