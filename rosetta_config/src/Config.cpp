@@ -284,6 +284,12 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_LOWER_DC"))
         cfg.disable_lower_dc = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: emit the TOP/tag writeback at every run break instead
+    // of deferring it across the seam to the next x87 run in the same block
+    // (OPT-SEAM).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_SEAM"))
+        cfg.disable_seam = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

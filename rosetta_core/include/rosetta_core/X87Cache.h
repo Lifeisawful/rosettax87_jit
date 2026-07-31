@@ -68,6 +68,49 @@ struct X87Cache {
     // includes implicit writers; returns 0xFFFF when unsure).
     static uint16_t gap_written_gpr_mask(const IRInstr* instr);
 
+    // OPT-SEAM: TOP/tag state deferred ACROSS a run break, within one block.
+    // Unlike top_dirty/deferred_* above (whose truth lives in the pinned
+    // top_gpr), the seam state holds no registers — it is pure translate-time
+    // knowledge plus stale-memory bookkeeping, valid because no guest
+    // instruction can address X87State (it lives in the runtime thread
+    // context). Semantics:
+    //   true TOP = (memory status_word TOP field + seam_top_delta) & 7
+    //   seam_valid_count slots at [true_top, true_top+n) pend tag set-valid
+    //   seam_empty_count slots at [true_top-n, true_top) pend tag set-empty
+    // seam_next: the window being lowered has an eligible x87 successor in
+    // the same block (set at window formation, consumed by the IR epilogue).
+    // These fields deliberately SURVIVE invalidate()/tick() — the register
+    // cache dies at a run break, the knowledge doesn't. They are cleared by
+    // the consumer (IR entry fold), by emit_seam_flush, and defensively on
+    // block change.
+    int8_t seam_top_delta = 0;
+    int8_t seam_valid_count = 0;
+    int8_t seam_empty_count = 0;
+    int8_t seam_next = 0;
+
+    bool seam_pending() const {
+        return seam_top_delta != 0 || seam_valid_count > 0 ||
+               seam_empty_count > 0;
+    }
+    void seam_clear() {
+        seam_top_delta = 0;
+        seam_valid_count = 0;
+        seam_empty_count = 0;
+    }
+
+    // OPT-SEAM eligibility: scan the gap after a window for an enabled x87
+    // run member reachable across only provably X87State-transparent guest
+    // instructions (bounded window; conservative allowlist — anything
+    // unknown, MMX-ambiguous, or x87-family-but-not-a-member says no).
+    static bool seam_scan(IRInstr* instr_array, int64_t num_instrs,
+                          int64_t gap_start, uint64_t disabled_ops_mask,
+                          bool runtime_keepalive);
+
+    // True for any opcode in the x87 mnemonic space (handled or not) — the
+    // set that must observe correct X87State memory, i.e. the set that
+    // forces a pending seam to flush before translating.
+    static bool is_x87_family(uint16_t op);
+
     bool active() const;
     void invalidate();
     void invalidate(uint32_t& free_gpr_mask, uint32_t scratch_mask);

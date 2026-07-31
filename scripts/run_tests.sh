@@ -60,6 +60,7 @@ ALL_TESTS=(
     test_fxam
     test_fprem
     test_stackops
+    test_seam
     test_peephole7
     test_fcom_nzcv
     test_arithp_fstp

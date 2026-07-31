@@ -8,6 +8,7 @@
 #include "rosetta_core/TranslatorCustom.h"
 #include "rosetta_core/TranslatorX87.h"
 #include "rosetta_core/TranslatorX87Fusion.h"
+#include "rosetta_core/TranslatorX87Helpers.hpp"
 #include "rosetta_core/X87Cache.h"
 #include "rosetta_core/X87IR.h"
 #include "rosetta_config/Config.h"
@@ -192,8 +193,20 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     // branches may have executed non-x87 code that clobbers scratch GPRs).
     // Then, if no cache is active, scan ahead to find the length of the current
     // consecutive x87 run.  x87_cache_set_run only activates if run >= 2.
+    const bool seam_on = !(g_rosetta_config && g_rosetta_config->disable_seam);
+    int formed_run = 0;  // this call's lookahead result (0 when cache active)
     {
         if (block != cache.prev_block) {
+            // OPT-SEAM: a pending seam must be consumed by its in-block
+            // successor — reaching a new block with one pending means the
+            // predicted successor was never translated. A flush emitted here
+            // would execute in the wrong control-flow context; drop the
+            // state (scan-bug containment, should be unreachable).
+            if (cache.seam_pending()) {
+                if (g_rosetta_config && g_rosetta_config->log_run_breaks)
+                    CORE_LOG("X87 seam: dropped pending state at block change");
+                cache.seam_clear();
+            }
             cache.invalidate(translation_result->free_gpr_mask, kGprScratchMask);
             cache.prev_block = block;
         }
@@ -209,6 +222,16 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 if (g_rosetta_config && g_rosetta_config->log_run_breaks && run > 0)
                     log_run_break(translation_result, instr_array, num_instrs, insn_idx, run);
                 cache.set_run(run);
+                formed_run = run;
+                // OPT-SEAM: does an eligible x87 run follow this one across a
+                // provably X87State-transparent gap in the same block? The IR
+                // epilogue of the window's last run reads this to defer its
+                // TOP/tag writeback across the seam.
+                cache.seam_next = 0;
+                if (run > 0 && seam_on)
+                    cache.seam_next = X87Cache::seam_scan(
+                        instr_array, num_instrs, insn_idx + run, ops_mask,
+                        keepalive) ? 1 : 0;
             }
         }
         // OPT-RB/OPT-KA: after a bridged gap or keepalive transcendental,
@@ -235,11 +258,20 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
         // no longer blocks the IR: compile_run folds it into the build and the
         // lowering epilogue, so mid-run entry after a deferred FXCH or partial
         // per-instruction translation still gets IR lowering.
-        if (!ir_disabled && cache.active() && cache.run_remaining >= kX87IRMinRun) {
+        const bool window_ir =
+            !ir_disabled && cache.active() && cache.run_remaining >= kX87IRMinRun;
+        // OPT-SEAM: single-instruction runs join the IR pipeline when a seam
+        // is pending (the IR entry fold consumes it) or forming (the IR
+        // epilogue defers across it) — the legacy path would flush instead.
+        const bool seam_single_ir =
+            !ir_disabled && seam_on && !cache.active() && formed_run == 1 &&
+            (cache.seam_pending() || cache.seam_next);
+        if (window_ir || seam_single_ir) {
             X87IR::CompileError error;
+            const int run_length = window_ir ? cache.run_remaining : 1;
             const int ir_consumed =
                 X87IR::compile_run(translation_result, instr_array, num_instrs, insn_idx,
-                                   cache.run_remaining, &error);
+                                   run_length, &error);
             if (ir_consumed > 0) {
                 for (int i = 0; i < ir_consumed; i++)
                     cache.tick();
@@ -267,6 +299,14 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     // against.
     if (cache.carried_any() && X87Cache::is_handled(opcode))
         cache.carried_release(translation_result->free_gpr_mask);
+
+    // OPT-SEAM: everything from here on (peephole x87_begin, legacy
+    // translate_*, runtime-routine BLs, Rosetta's own translation of a
+    // declined x87 form) reads X87State memory directly — a pending seam
+    // must be materialized first. Non-x87 gap instructions can't observe
+    // the state and fall through untouched.
+    if (seam_on && cache.seam_pending() && X87Cache::is_x87_family(opcode))
+        emit_seam_flush(*translation_result);
 
     // ── Peephole: try 2-instruction fusion patterns ─────────────────────────
     const uint64_t fusions_mask = g_rosetta_config ? g_rosetta_config->disabled_fusions_mask : 0;

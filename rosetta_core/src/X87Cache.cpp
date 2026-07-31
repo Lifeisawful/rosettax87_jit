@@ -357,37 +357,161 @@ static bool op_disabled_for_run(uint16_t op, uint64_t disabled_ops_mask) {
            ((disabled_ops_mask >> static_cast<int>(id)) & 1u);
 }
 
+// A run member is a handled+enabled x87 instruction, an OPT-TI value-call
+// FCOS (a real member: the IR consumes it as a node, the singular form
+// uses x87_begin/x87_end like any handled op), or (OPT-KA) a keepalive
+// transcendental — Rosetta translates the latter as a runtime BL that
+// preserves the pinned cache GPRs. Shared by lookahead and seam_scan.
+static bool x87_run_member(uint16_t op, uint64_t disabled_ops_mask,
+                           bool runtime_keepalive) {
+    if (g_rosetta_config) {
+        if (op == kOpcodeName_fcos && trig_ir_fcos_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fsin && trig_ir_fsin_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fptan && trig_ir_fptan_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fsincos && trig_ir_fsincos_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_f2xm1 && trig_ir_f2xm1_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fscale && trig_ir_fscale_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fyl2x && trig_ir_fyl2x_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fyl2xp1 && trig_ir_fyl2xp1_enabled(*g_rosetta_config))
+            return true;
+        if (op == kOpcodeName_fpatan && trig_ir_fpatan_enabled(*g_rosetta_config))
+            return true;
+    }
+    if (is_handled_x87(op))
+        return !op_disabled_for_run(op, disabled_ops_mask);
+    return runtime_keepalive &&
+           X87Cache::runtime_keepalive_top_delta(op).has_value();
+}
+
+// ── OPT-SEAM ────────────────────────────────────────────────────────────────
+
+bool X87Cache::is_x87_family(uint16_t op) {
+    // The contiguous x87 mnemonic cluster (f2xm1..fyl2xp1 — includes the
+    // state-observing fsave/fxsave/fldenv/fbld forms and every runtime-routine
+    // transcendental), the fcmov+fcomi families that sit outside it
+    // (0x25..0x30 — the ONLY x87 mnemonics outside the cluster, verified by
+    // enumerating kOpcodeName_f*), and the two MMX-adjacent mnemonics that
+    // alias the x87 register file. Anything here must observe correct
+    // X87State memory, so a pending seam flushes first.
+    static_assert(kOpcodeName_fcmovb < kOpcodeName_fcmovu &&
+                      kOpcodeName_fcmovu < kOpcodeName_fcomi &&
+                      kOpcodeName_fcomi < kOpcodeName_fucomip &&
+                      kOpcodeName_fucomip < kOpcodeName_f2xm1,
+                  "x87 out-of-cluster range moved — re-enumerate");
+    if (op >= kOpcodeName_f2xm1 && op <= kOpcodeName_fyl2xp1) return true;
+    if (op >= kOpcodeName_fcmovb && op <= kOpcodeName_fucomip) return true;
+    switch (op) {
+        case kOpcodeName_emms:
+        case kOpcodeName_movq:  // MMX form aliases st[]/tags; SSE form is
+                                // indistinguishable here — flush either way
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Conservative allowlist: guest instructions that provably cannot touch
+// X87State (integer/SSE only — X87State is host thread-context memory, not
+// guest-addressable) and cannot leave the block. Anything unknown, any
+// control flow, and anything MMX-ambiguous says no — a rejected gap only
+// costs the seam, never correctness.
+static bool seam_gap_transparent(uint16_t op) {
+    switch (op) {
+        // Integer moves / address arithmetic / stack ops.
+        case kOpcodeName_mov: case kOpcodeName_movzx: case kOpcodeName_movsx:
+        case kOpcodeName_movsxd: case kOpcodeName_lea:
+        case kOpcodeName_push: case kOpcodeName_pushd: case kOpcodeName_pushw:
+        case kOpcodeName_pop: case kOpcodeName_popd: case kOpcodeName_popw:
+        case kOpcodeName_xchg: case kOpcodeName_leave:
+        case kOpcodeName_cbw: case kOpcodeName_cwde: case kOpcodeName_cdqe:
+        case kOpcodeName_cwd: case kOpcodeName_cdq:
+        case kOpcodeName_nop: case kOpcodeName_wait:
+        // Integer ALU (flag effects irrelevant — only X87State matters here).
+        case kOpcodeName_add: case kOpcodeName_sub: case kOpcodeName_and:
+        case kOpcodeName_or: case kOpcodeName_xor: case kOpcodeName_test:
+        case kOpcodeName_cmp: case kOpcodeName_inc: case kOpcodeName_dec:
+        case kOpcodeName_neg: case kOpcodeName_not:
+        case kOpcodeName_shl: case kOpcodeName_shr: case kOpcodeName_sar:
+        case kOpcodeName_rol: case kOpcodeName_ror:
+        case kOpcodeName_imul: case kOpcodeName_mul:
+        case kOpcodeName_setcc:
+        // SSE scalar/packed moves, arithmetic, converts, compares — XMM/GPR
+        // only. movq/movq2dq are NOT here (MMX-ambiguous).
+        case kOpcodeName_movss: case kOpcodeName_movsd:
+        case kOpcodeName_movaps: case kOpcodeName_movapd:
+        case kOpcodeName_movups: case kOpcodeName_movupd:
+        case kOpcodeName_movlps: case kOpcodeName_movhps:
+        case kOpcodeName_movdqa: case kOpcodeName_movdqu:
+        case kOpcodeName_movd:
+        case kOpcodeName_addss: case kOpcodeName_addsd:
+        case kOpcodeName_subss: case kOpcodeName_subsd:
+        case kOpcodeName_mulss: case kOpcodeName_mulsd:
+        case kOpcodeName_divss: case kOpcodeName_divsd:
+        case kOpcodeName_sqrtss: case kOpcodeName_sqrtsd:
+        case kOpcodeName_minss: case kOpcodeName_minsd:
+        case kOpcodeName_maxss: case kOpcodeName_maxsd:
+        case kOpcodeName_andps: case kOpcodeName_andpd:
+        case kOpcodeName_orps: case kOpcodeName_orpd:
+        case kOpcodeName_xorps: case kOpcodeName_xorpd:
+        case kOpcodeName_shufps: case kOpcodeName_unpcklps:
+        case kOpcodeName_pshufd:
+        case kOpcodeName_cvtsi2ss: case kOpcodeName_cvtsi2sd:
+        case kOpcodeName_cvtss2sd: case kOpcodeName_cvtsd2ss:
+        case kOpcodeName_cvtss2si: case kOpcodeName_cvtsd2si:
+        case kOpcodeName_cvttss2si: case kOpcodeName_cvttsd2si:
+        case kOpcodeName_ucomiss: case kOpcodeName_ucomisd:
+        case kOpcodeName_comiss: case kOpcodeName_comisd:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool X87Cache::seam_scan(IRInstr* instr_array, int64_t num_instrs,
+                         int64_t gap_start, uint64_t disabled_ops_mask,
+                         bool runtime_keepalive) {
+    constexpr int kMaxSeamGap = 8;
+    for (int64_t j = gap_start;
+         j < num_instrs && j < gap_start + kMaxSeamGap; j++) {
+        const uint16_t op = instr_array[j].opcode();
+        if (x87_run_member(op, disabled_ops_mask, runtime_keepalive)) {
+            // The successor must be able to CONSUME the seam through the IR
+            // pipeline — a run whose build is structurally guaranteed to
+            // decline would pay a flush on top of the legacy path, turning
+            // the deferral into a net loss:
+            //  - a run STARTING with an fcmov has no in-run flag producer
+            //    (build_fcmov bails; a consumable cmp/test before it sits
+            //    outside the window by definition);
+            //  - fnstsw m16 and fld m80 are declined forms.
+            if (op >= kOpcodeName_fcmovb && op <= kOpcodeName_fcmovu)
+                return false;
+            if (op == kOpcodeName_fstsw &&
+                instr_array[j].num_operands >= 1 &&
+                instr_array[j].operands[0].kind != IROperandKind::Register)
+                return false;
+            if (op == kOpcodeName_fld &&
+                instr_array[j].num_operands >= 1 &&
+                instr_array[j].operands[0].kind != IROperandKind::Register &&
+                instr_array[j].operands[0].mem.size == IROperandSize::S80)
+                return false;
+            return true;
+        }
+        if (!seam_gap_transparent(op)) return false;
+    }
+    return false;
+}
+
 int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                         uint64_t disabled_ops_mask, bool bridge, bool runtime_keepalive) {
-    // A run member is a handled+enabled x87 instruction, an OPT-TI value-call
-    // FCOS (a real member: the IR consumes it as a node, the singular form
-    // uses x87_begin/x87_end like any handled op), or (OPT-KA) a keepalive
-    // transcendental — Rosetta translates the latter as a runtime BL that
-    // preserves the pinned cache GPRs.
     auto run_member = [&](uint16_t op) {
-        if (g_rosetta_config) {
-            if (op == kOpcodeName_fcos && trig_ir_fcos_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fsin && trig_ir_fsin_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fptan && trig_ir_fptan_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fsincos && trig_ir_fsincos_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_f2xm1 && trig_ir_f2xm1_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fscale && trig_ir_fscale_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fyl2x && trig_ir_fyl2x_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fyl2xp1 && trig_ir_fyl2xp1_enabled(*g_rosetta_config))
-                return true;
-            if (op == kOpcodeName_fpatan && trig_ir_fpatan_enabled(*g_rosetta_config))
-                return true;
-        }
-        if (is_handled_x87(op))
-            return !op_disabled_for_run(op, disabled_ops_mask);
-        return runtime_keepalive && runtime_keepalive_top_delta(op).has_value();
+        return x87_run_member(op, disabled_ops_mask, runtime_keepalive);
     };
     int count = 0;
     int64_t i = insn_idx;

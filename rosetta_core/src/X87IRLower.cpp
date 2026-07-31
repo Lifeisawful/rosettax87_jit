@@ -1531,11 +1531,44 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
 void lower(Context& ctx, TranslationResult* result) {
     auto& buf = result->insn_buf;
 
+    // OPT-SEAM: carried cross-run-break state. Unlike the register-window
+    // deferral below (truth in the pinned top_gpr), the seam state's truth is
+    // memory + a translate-time delta: true TOP = memory TOP + seam_delta_in.
+    // The tag counts map exactly onto the entry_push/pop fold (a deferred
+    // push's slot is at [true_top, +n), a deferred pop's at [true_top-n,
+    // true_top) — identical semantics), so they merge into the same
+    // variables; the TOP delta instead folds into the live register right
+    // after the preamble load (see the adjustment below).
+    const bool seam_on = !(g_rosetta_config && g_rosetta_config->disable_seam);
+    const int seam_delta_in =
+        seam_on ? ((result->x87_cache.seam_top_delta % 8) + 8) & 7 : 0;
+    const int seam_valid_in = seam_on ? result->x87_cache.seam_valid_count : 0;
+    const int seam_empty_in = seam_on ? result->x87_cache.seam_empty_count : 0;
+
     // Carried-in deferred cache state (mid-run entry). The epilogue folds
     // these into its TOP/tag writeback; step 6 then clears the flags.
     const bool entry_top_dirty = result->x87_cache.top_dirty != 0;
-    const int entry_push_count = result->x87_cache.deferred_push_count;
-    const int entry_pop_count = result->x87_cache.deferred_pop_count;
+    const int entry_push_count =
+        result->x87_cache.deferred_push_count + seam_valid_in;
+    const int entry_pop_count =
+        result->x87_cache.deferred_pop_count + seam_empty_in;
+
+    // OPT-SEAM producer: skip this run's TOP/tag writeback when an eligible
+    // x87 run follows in the same block (seam_next, set at window formation)
+    // and this run truly ends the window. Register-window entry state is
+    // excluded: its TOP truth lives in top_gpr with no recorded delta, so it
+    // cannot be re-expressed as a memory+delta seam.
+    const bool seam_defer =
+        seam_on && result->x87_cache.seam_next != 0 &&
+        result->x87_cache.run_remaining <= ctx.consumed &&
+        result->x87_cache.top_dirty == 0 &&
+        result->x87_cache.deferred_push_count == 0 &&
+        result->x87_cache.deferred_pop_count == 0;
+
+    // Memory TOP is stale at entry (needs a store before anything observes
+    // it) unless this run re-defers.
+    const bool entry_top_stale =
+        entry_top_dirty || (seam_delta_in != 0 && !seam_defer);
 
     // ── TOP=0 specialization gate ───────────────────────────────────────────
     // In real code TOP is almost always 0 at run entry (balanced stack
@@ -1584,8 +1617,14 @@ void lower(Context& ctx, TranslationResult* result) {
     // the following run reads all three through the cache, and paying for them
     // once here is strictly cheaper than a partial set that forces the next run
     // to redo the lot.
-    StateNeeds nd = compute_state_needs(ctx, entry_top_dirty, entry_push_count,
-                                        entry_pop_count, top0_specialize);
+    // OPT-SEAM: a deferring run re-records the folded entry state instead of
+    // emitting it, so the walk must not demand registers for it; a consuming
+    // run does the work and demands normally (entry_top_stale covers the
+    // seam-delta TOP store).
+    StateNeeds nd = compute_state_needs(ctx, entry_top_stale,
+                                        seam_defer ? 0 : entry_push_count,
+                                        seam_defer ? 0 : entry_pop_count,
+                                        top0_specialize);
     if (result->x87_cache.run_remaining > ctx.consumed)
         nd.base = nd.top = nd.st_base = nd.tmp = nd.base_dyn = true;
 
@@ -1632,6 +1671,18 @@ void lower(Context& ctx, TranslationResult* result) {
     const int16_t imm_sw_h =
         base_x18 ? static_cast<int16_t>((x87_off + kX87StatusWordOff) / 2u)
                  : kX87StatusWordImm12;
+
+    // OPT-SEAM: the preamble's TOP load read a memory field that is stale by
+    // the carried seam delta — fold it into the register in place, before the
+    // TOP=0 guard, physical indexing, FStsw patching or the epilogue read it.
+    // (A pending seam cannot coexist with pinned mid-run registers: it is
+    // produced only at a window end, where the pins die.)
+    if (seam_delta_in != 0 && Wd_top >= 0 && !mid_run_pinned) {
+        emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/0, 0, 0, seam_delta_in,
+                     Wd_top, Wd_top);
+        emit_and_imm(buf, /*is_64=*/0, Wd_top, /*N=*/0, /*immr=*/0,
+                     /*imms=*/2, Wd_top);
+    }
 
     // ── Base-address cache: materialize planned guest bases ────────────────
     // OPT-BC: a planned base whose key matches a carried entry reuses the
@@ -1920,7 +1971,7 @@ void lower(Context& ctx, TranslationResult* result) {
     }
 
     int sw_sink_node = -1;
-    if (ctx.top_delta != 0 || entry_top_dirty) {
+    if (ctx.top_delta != 0 || entry_top_stale) {
         for (int i = ctx.num_nodes - 1; i >= 0; i--) {
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
@@ -1931,6 +1982,37 @@ void lower(Context& ctx, TranslationResult* result) {
                 sw_sink_node = i;
             break;  // first writer found from the end decides
         }
+    }
+
+    // OPT-SEAM: the folded tag counts (used by the epilogue when emitting,
+    // recorded as the outgoing seam when deferring) and the outgoing TOP
+    // delta. The delta depends on what the run leaves in the memory TOP
+    // field: a sinking FStsw stores the true final TOP (delta 0); any
+    // compare's full-halfword store writes the true entry TOP (the adjusted
+    // Wd_top — delta = the run's own net); with no writer the field is
+    // untouched (carried delta accumulates). Trig C1|C2 RMWs preserve the
+    // TOP field and don't participate.
+    const int fold_valid = (entry_push_count - ctx.top_delta > 0)
+                               ? entry_push_count - ctx.top_delta : 0;
+    const int fold_empty = (ctx.top_delta + entry_pop_count - entry_push_count > 0)
+                               ? ctx.top_delta + entry_pop_count - entry_push_count : 0;
+    int seam_delta_out = 0;
+    if (seam_defer) {
+        bool run_has_compare = false;
+        for (int i = 0; i < ctx.num_nodes; i++) {
+            const auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            if (n.op == Op::FCmp || n.op == Op::FTst) {
+                run_has_compare = true;
+                break;
+            }
+        }
+        if (sw_sink_node >= 0)
+            seam_delta_out = 0;
+        else if (run_has_compare)
+            seam_delta_out = ctx.top_delta;
+        else
+            seam_delta_out = seam_delta_in + ctx.top_delta;
     }
 
     // ── Run body (node loop + x87-state epilogue) ───────────────────────────
@@ -2923,10 +3005,12 @@ void lower(Context& ctx, TranslationResult* result) {
     }
 
     // 3. Write TOP to status_word if changed, or if it was already stale on
-    //    entry (carried-in top_dirty from deferred pushes/pops).
+    //    entry (carried-in top_dirty, or a consumed seam delta).
     //    Skipped when an FSTSW already stored the halfword with the final TOP
-    //    folded in (sw_sink_node).
-    if ((ctx.top_delta != 0 || entry_top_dirty) && sw_sink_node < 0) {
+    //    folded in (sw_sink_node), or when this run defers across a seam
+    //    (OPT-SEAM: the delta rides in seam_top_delta instead).
+    if ((ctx.top_delta != 0 || entry_top_stale) && sw_sink_node < 0 &&
+        !seam_defer) {
         emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
     }
 
@@ -2936,11 +3020,11 @@ void lower(Context& ctx, TranslationResult* result) {
     //      valid slots:  V = max(0, P - top_delta)   at TOP .. TOP+V-1
     //      empty slots:  M = max(0, top_delta + Q - P) at TOP-M .. TOP-1
     //    With P = Q = 0 this reduces to the plain net push/pop cases.
+    //    A deferring run (OPT-SEAM) records fold_valid/fold_empty in the
+    //    seam fields instead of emitting.
     {
-        const int set_valid = (entry_push_count - ctx.top_delta > 0)
-                                  ? entry_push_count - ctx.top_delta : 0;
-        const int set_empty = (ctx.top_delta + entry_pop_count - entry_push_count > 0)
-                                  ? ctx.top_delta + entry_pop_count - entry_push_count : 0;
+        const int set_valid = seam_defer ? 0 : fold_valid;
+        const int set_empty = seam_defer ? 0 : fold_empty;
         if (set_valid > 0 || set_empty > 0) {
             int Wd_tmp2 = alloc_free_gpr(*result);
             int Wd_tagw = alloc_free_gpr(*result);
@@ -3044,6 +3128,20 @@ void lower(Context& ctx, TranslationResult* result) {
         emit_body(/*top_known=*/-1);
         // Patch the skip branch to land after the generic body.
         buf.data[skip_off / 4] |= ((uint32_t)((buf.end - skip_off) / 4) & 0x3FFFFFF);
+    }
+
+    // OPT-SEAM: the carried seam state was consumed above (folded into the
+    // entry counts and the Wd_top adjustment); record this run's own deferred
+    // state for the next run across the break, or leave the fields clear when
+    // everything was emitted.
+    if (seam_on) {
+        result->x87_cache.seam_clear();
+        if (seam_defer) {
+            result->x87_cache.seam_top_delta =
+                static_cast<int8_t>(((seam_delta_out % 8) + 8) & 7);
+            result->x87_cache.seam_valid_count = static_cast<int8_t>(fold_valid);
+            result->x87_cache.seam_empty_count = static_cast<int8_t>(fold_empty);
+        }
     }
 
     // 6. Clean up cache deferred state (we handled everything inline).
@@ -3629,9 +3727,13 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
 
     // Gate lowering on GPR pressure vs. available pool.
     {
+        // OPT-SEAM: a consumed seam adds the same epilogue TOP/tag work as a
+        // register-window deferral — charge it identically (conservative when
+        // the run re-defers instead of emitting).
         const bool entry_deferred = cache.top_dirty != 0 ||
                                     cache.deferred_push_count > 0 ||
-                                    cache.deferred_pop_count > 0;
+                                    cache.deferred_pop_count > 0 ||
+                                    cache.seam_pending();
         uint32_t gpr_pool = result->free_gpr_mask;
         int gpr_available = 0;
         while (gpr_pool) { gpr_available++; gpr_pool &= gpr_pool - 1; }

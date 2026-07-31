@@ -1788,7 +1788,10 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
         ctx.consumed = static_cast<int16_t>(i + 1);
     }
 
-    return ctx.consumed >= 2;  // only worthwhile if we consumed 2+ instructions
+    // Only worthwhile if we consumed 2+ instructions — except when the caller
+    // deliberately asked for a single (OPT-SEAM: a 1-instruction run at a
+    // seam folds/defers TOP+tag state the legacy path would flush).
+    return ctx.consumed >= (run_length == 1 ? 1 : 2);
 }
 
 }  // namespace X87IR

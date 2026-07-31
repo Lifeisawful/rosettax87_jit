@@ -251,6 +251,13 @@ void emit_x87_tag_set_empty_batch(AssemblerBuffer& buf, int Xbase, int Wd_top,
 void emit_x87_tag_set_valid_batch(AssemblerBuffer& buf, int Xbase, int Wd_top,
                                    int Wd_tmp, int Wd_tmp2, int Wd_tagw, int count);
 
+// OPT-SEAM: materialize a pending cross-run-break seam state (stale TOP
+// field + deferred tag set-valid/set-empty batches) at the current emission
+// point, then clear the cache fields. Safe at any instruction boundary; the
+// caller gates on x87_cache.seam_pending(). Allocates and frees up to five
+// free-pool GPRs.
+void emit_seam_flush(TranslationResult& a1);
+
 // =============================================================================
 // 2j — FCMP result → x87 condition codes in status_word
 //

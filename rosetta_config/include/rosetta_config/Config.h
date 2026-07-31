@@ -135,6 +135,7 @@ struct RosettaConfig {
     uint8_t  disable_stp_suppress;   // ROSETTA_X87_DISABLE_STP_SUPPRESS=1 — keep forming STPs even when the stored bytes are provably reloaded in the same run/block tail (STP-sourced forwarding costs 11 cyc vs 5 on M1; bisection lever)
     uint8_t  disable_x18_state;      // ROSETTA_X87_DISABLE_X18_STATE=1 — always materialize Xbase (ADD x, x18, #off) at run entry instead of addressing fixed SW/CW halfword fields directly off x18 when the run needs nothing else (bisection lever)
     uint8_t  disable_lower_dc;       // ROSETTA_X87_DISABLE_LOWER_DC=1 — disable the Lower dead-code batch: combined pop-pair tag mask (B3), fused-window dead C2 pair elision (B6), and generic-body-deferred Xst_base ADD (bisection lever)
+    uint8_t  disable_seam;           // ROSETTA_X87_DISABLE_SEAM=1 — flush TOP/tag state at every run break instead of deferring it across an intra-block seam to the next x87 run (OPT-SEAM; bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

@@ -664,6 +664,53 @@ void emit_x87_tag_set_valid_batch(AssemblerBuffer& buf, int Xbase, int Wd_top,
 }
 
 // =============================================================================
+// OPT-SEAM: flush a pending cross-run-break seam state.
+//
+// true TOP = (memory TOP + seam_top_delta) & 7; seam_valid_count slots at
+// [true_top, +n) pend set-valid, seam_empty_count at [true_top-n, true_top)
+// pend set-empty. Emits the load/adjust/store + tag batches and clears the
+// fields. A pending seam implies no live pinned cache (the previous window's
+// registers died at the break), so everything comes from the free pool.
+// =============================================================================
+void emit_seam_flush(TranslationResult& a1) {
+    auto& xc = a1.x87_cache;
+    if (!xc.seam_pending()) return;
+    AssemblerBuffer& buf = a1.insn_buf;
+
+    const int Xbase = alloc_free_gpr(a1);
+    emit_x87_base(buf, a1, Xbase);
+    const int Wd_top = alloc_free_gpr(a1);
+    emit_load_top(buf, a1, Xbase, Wd_top);
+
+    const int delta = ((xc.seam_top_delta % 8) + 8) & 7;
+    if (delta != 0) {
+        emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/0, 0, 0, delta, Wd_top, Wd_top);
+        emit_and_imm(buf, /*is_64=*/0, Wd_top, /*N=*/0, /*immr=*/0, /*imms=*/2,
+                     Wd_top);
+    }
+    const int Wd_tmp = alloc_free_gpr(a1);
+    if (delta != 0)
+        emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
+
+    if (xc.seam_empty_count > 0 || xc.seam_valid_count > 0) {
+        const int Wd_tmp2 = alloc_free_gpr(a1);
+        const int Wd_tagw = alloc_free_gpr(a1);
+        if (xc.seam_empty_count > 0)
+            emit_x87_tag_set_empty_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
+                                         Wd_tagw, xc.seam_empty_count);
+        if (xc.seam_valid_count > 0)
+            emit_x87_tag_set_valid_batch(buf, Xbase, Wd_top, Wd_tmp, Wd_tmp2,
+                                         Wd_tagw, xc.seam_valid_count);
+        free_gpr(a1, Wd_tagw);
+        free_gpr(a1, Wd_tmp2);
+    }
+    free_gpr(a1, Wd_tmp);
+    free_gpr(a1, Wd_top);
+    free_gpr(a1, Xbase);
+    xc.seam_clear();
+}
+
+// =============================================================================
 // 2j — FCMP result → x87 condition codes in status_word
 // =============================================================================
 
