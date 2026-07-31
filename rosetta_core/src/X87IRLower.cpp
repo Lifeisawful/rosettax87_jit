@@ -192,11 +192,15 @@ struct FPRState {
         }
         if (ncalls == 0) return;
 
-        // Producers whose output allocation honors prefer_fpr (everything
-        // lowered through alloc_output; load-pair members are excluded —
-        // their two-register shape has its own allocation path).
+        // Producers whose output allocation honors prefer_fpr: everything
+        // lowered through alloc_output, plus BOTH members of a load pair —
+        // the lead allocates via alloc_output and the pair emission consults
+        // the partner's pin directly. Index-based range checks stay valid for
+        // the hoisted partner: pair_node_skippable admits no call, so no
+        // value call can sit between the lead (where the value is actually
+        // born) and the partner's node index.
         auto producer_ok = [&](int16_t d) -> bool {
-            if (d < 0 || pair_with[d] >= 0) return false;
+            if (d < 0) return false;
             switch (ctx.nodes[d].op) {
             case Op::ReadSt:
             case Op::LoadF64: case Op::LoadF32Raw:
@@ -1919,8 +1923,12 @@ void lower(Context& ctx, TranslationResult* result) {
             fprs.node_fpr[i] = static_cast<int8_t>(Dd);
             const int j = pair_with[i];
             if (j >= 0) {
-                // Load pair: hoist the partner load into one LDP.
-                int Dd2 = alloc_free_fpr(*result);
+                // Load pair: hoist the partner load into one LDP. The partner
+                // honors a trig-plan pin (OPT-TI) — LDP takes arbitrary
+                // destinations, so `fld y; fld x; f2xarg` loads straight into
+                // d17/d16 with no FMOV bridges.
+                int Dd2 = (fprs.prefer_fpr[j] >= 0) ? fprs.prefer_fpr[j]
+                                                    : alloc_free_fpr(*result);
                 fprs.node_fpr[j] = static_cast<int8_t>(Dd2);
                 emit_pair_access(n, ctx.nodes[j], size, /*is_load=*/1, Dd, Dd2);
                 break;
