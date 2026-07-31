@@ -273,6 +273,12 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_STP_SUPPRESS"))
         cfg.disable_stp_suppress = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: keep the per-run-entry `ADD Xbase, x18, #off` even for
+    // runs whose only X87State traffic is fixed-offset SW/CW halfword
+    // accesses (OPT-XB addresses those directly off x18).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_X18_STATE"))
+        cfg.disable_x18_state = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

@@ -1431,6 +1431,12 @@ struct StateNeeds {
     bool top = false;       // Wd_top
     bool st_base = false;   // Xst_base (implies base + top via the ST paths)
     bool tmp = false;       // Wd_tmp
+    // OPT-XB: base is demanded by something other than a fixed-offset SW/CW
+    // halfword access. When false (and the scaled-imm12 encodings reach), the
+    // run skips the `ADD Xbase, x18, #off` and those accesses address
+    // [x18, #state_off + field] directly — removing the run-entry ADD and its
+    // address dependency in front of the loop-carried SW chain.
+    bool base_dyn = false;
 };
 
 static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
@@ -1446,20 +1452,20 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
         switch (n.op) {
             case Op::ReadSt:
                 // Generic path: emit_load_st(Xbase, Wd_top, Wd_tmp, Xst_base).
-                nd.base = nd.top = nd.st_base = nd.tmp = true;
+                nd.base = nd.top = nd.st_base = nd.tmp = nd.base_dyn = true;
                 break;
             // status_word RMW / AX write.
             case Op::FCmp: case Op::FTst:
                 // The CC store merges TOP in from Wd_top.
-                nd.base = nd.top = true;
+                nd.base = nd.top = nd.base_dyn = true;
                 break;
             case Op::FStsw:
                 // TOP is merged into the stored halfword and patched into
                 // the returned word; both read Wd_top unless it is a
                 // translate-time constant, which only the specialized body has.
-                nd.base = nd.top = true;
+                nd.base = nd.top = nd.base_dyn = true;
                 break;
-            // control_word traffic.
+            // control_word traffic — fixed-offset halfword (OPT-XB eligible).
             case Op::StoreCW: case Op::LoadCW:
                 nd.base = true;
                 break;
@@ -1475,7 +1481,8 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
                     nd.tmp = true;
                 }
                 break;
-            // Value calls clear C1 (|C2) in status_word; F2XM1 touches none.
+            // Value calls clear C1 (|C2) in status_word — fixed-offset
+            // halfword RMW (OPT-XB eligible); F2XM1 touches none.
             case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
             case Op::FSinCosCall: case Op::FScaleCall:
             case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
@@ -1489,7 +1496,8 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
     // ── Epilogue ────────────────────────────────────────────────────────────
     // Step 1/3: TOP register update and its status_word writeback.
     if (ctx.top_delta != 0 || entry_top_dirty) {
-        nd.base = nd.top = nd.tmp = true;  // emit_store_top(Xbase, Wd_top, Wd_tmp)
+        // emit_store_top(Xbase, Wd_top, Wd_tmp)
+        nd.base = nd.top = nd.tmp = nd.base_dyn = true;
     }
     // Step 2: stack-slot writeback (same skip rules as lower()'s epilogue; a
     // dead value is what makes fprs.get() return -1 there).
@@ -1499,7 +1507,7 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
         const auto& vn = ctx.nodes[val];
         if (vn.flags & kDead) continue;
         if (vn.op == Op::ReadSt && vn.initial_depth == d + ctx.top_delta) continue;
-        nd.base = nd.top = nd.st_base = nd.tmp = true;
+        nd.base = nd.top = nd.st_base = nd.tmp = nd.base_dyn = true;
         break;
     }
     // Step 4: tag-word batches (generic form indexes by Wd_top via Wd_tmp).
@@ -1508,12 +1516,13 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
                                   ? entry_push_count - ctx.top_delta : 0;
         const int set_empty = (ctx.top_delta + entry_pop_count - entry_push_count > 0)
                                   ? ctx.top_delta + entry_pop_count - entry_push_count : 0;
-        if (set_valid > 0 || set_empty > 0) nd.base = nd.top = nd.tmp = true;
+        if (set_valid > 0 || set_empty > 0)
+            nd.base = nd.top = nd.tmp = nd.base_dyn = true;
     }
     // The TOP=0 guard branches on Wd_top.
-    if (top0_specialize) nd.base = nd.top = true;
+    if (top0_specialize) nd.base = nd.top = nd.base_dyn = true;
 
-    if (nd.st_base || nd.top) nd.base = true;
+    if (nd.st_base || nd.top) nd.base = nd.base_dyn = true;
     return nd;
 }
 
@@ -1578,7 +1587,19 @@ void lower(Context& ctx, TranslationResult* result) {
     StateNeeds nd = compute_state_needs(ctx, entry_top_dirty, entry_push_count,
                                         entry_pop_count, top0_specialize);
     if (result->x87_cache.run_remaining > ctx.consumed)
-        nd.base = nd.top = nd.st_base = nd.tmp = true;
+        nd.base = nd.top = nd.st_base = nd.tmp = nd.base_dyn = true;
+
+    // OPT-XB: when base is demanded only by fixed-offset SW/CW halfword
+    // accesses and those encode as [x18, #imm12] directly, skip the
+    // `ADD Xbase, x18, #off` entirely. Not taken on mid-run entry with live
+    // pinned GPRs — the cached Xbase is free there.
+    const uint32_t x87_off = result->thread_context_offsets->x87_state_offset;
+    const bool base_x18 =
+        !(g_rosetta_config && g_rosetta_config->disable_x18_state) &&
+        nd.base && !nd.base_dyn &&
+        (x87_off & 1u) == 0u && x87_off + kX87StatusWordOff <= 0x1FFEu &&
+        !(result->x87_cache.run_remaining > 0 && result->x87_cache.gprs_valid);
+    if (base_x18) nd.base = false;
 
     const auto x87r =
         TranslatorX87::x87_begin_sel(*result, buf, nd.base, nd.top, nd.st_base);
@@ -1586,6 +1607,16 @@ void lower(Context& ctx, TranslationResult* result) {
     const int Wd_top = x87r.top;
     const int Xst_base = x87r.st_base;
     const int Wd_tmp = nd.tmp ? alloc_gpr(*result, 2) : -1;
+
+    // Fixed-offset X87State addressing: base register + halfword-scaled imm12
+    // for control_word / status_word. Equal to (Xbase, 0/kX87StatusWordImm12)
+    // normally; (x18, state_off-adjusted) under OPT-XB.
+    const int Xstate = base_x18 ? kX87ThreadReg : Xbase;
+    const int16_t imm_cw_h =
+        base_x18 ? static_cast<int16_t>(x87_off / 2u) : 0;
+    const int16_t imm_sw_h =
+        base_x18 ? static_cast<int16_t>((x87_off + kX87StatusWordOff) / 2u)
+                 : kX87StatusWordImm12;
 
     // ── Base-address cache: materialize planned guest bases ────────────────
     // OPT-BC: a planned base whose key matches a carried entry reuses the
@@ -2171,14 +2202,14 @@ void lower(Context& ctx, TranslationResult* result) {
             } else if (Wd_rc_cached >= 0) {
                 // RC caching: emit preamble on first use, then reuse cached RC.
                 if (!rc_cache_valid) {
-                    emit_rc_preamble(buf, Xbase, Wd_rc_cached);
+                    emit_rc_preamble(buf, Xstate, Wd_rc_cached, imm_cw_h);
                     rc_cache_valid = true;
                 }
                 emit_x87_rc_dispatch_frint(buf, Wd_rc_cached, Dd, Dn);
             } else {
                 // alloc_free_gpr, NOT alloc_gpr(pool 3) — see RC cache above.
                 int Wd_rc = alloc_free_gpr(*result);
-                emit_rc_preamble(buf, Xbase, Wd_rc);
+                emit_rc_preamble(buf, Xstate, Wd_rc, imm_cw_h);
                 emit_x87_rc_dispatch_frint(buf, Wd_rc, Dd, Dn);
                 free_gpr(*result, Wd_rc);
             }
@@ -2252,10 +2283,10 @@ void lower(Context& ctx, TranslationResult* result) {
                     const int imms = c1_only ? 30 : 29;
                     int Wd = alloc_free_gpr(*result);
                     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
-                                     kX87StatusWordImm12, Xbase, Wd);
+                                     imm_sw_h, Xstate, Wd);
                     emit_and_imm(buf, /*is_64bit=*/0, Wd, /*N=*/0, immr, imms, Wd);
                     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
-                                     kX87StatusWordImm12, Xbase, Wd);
+                                     imm_sw_h, Xstate, Wd);
                     free_gpr(*result, Wd);
                 }
             }
@@ -2370,14 +2401,15 @@ void lower(Context& ctx, TranslationResult* result) {
             } else if (Wd_rc_cached >= 0) {
                 // RC caching: emit preamble on first use, then reuse cached RC.
                 if (!rc_cache_valid) {
-                    emit_rc_preamble(buf, Xbase, Wd_rc_cached);
+                    emit_rc_preamble(buf, Xstate, Wd_rc_cached, imm_cw_h);
                     rc_cache_valid = true;
                 }
                 emit_x87_rc_dispatch_fcvt(buf, Wd_rc_cached, Wd_int, Dd_val,
                                            is_64bit_int);
             } else {
                 // FISTP/FIST: respect rounding mode from control_word.
-                emit_rcmode_dispatch(buf, Wd_int, Dd_val, is_64bit_int, Xbase, Wd_tmp);
+                emit_rcmode_dispatch(buf, Wd_int, Dd_val, is_64bit_int, Xstate,
+                                     Wd_tmp, imm_cw_h);
             }
 
             if (!emit_cached_gpr_access(n, store_size, /*is_load=*/0, Wd_int))
@@ -2528,8 +2560,9 @@ void lower(Context& ctx, TranslationResult* result) {
                                                Wd_cw))
                 emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
                                     /*size_log2=*/1, /*is_load=*/1, Wd_cw);
-            // STRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
-            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0, /*imm12=*/0, Xbase, Wd_cw);
+            // STRH Wd_cw, [Xstate, #imm_cw_h*2]  — control_word
+            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/0, imm_cw_h,
+                             Xstate, Wd_cw);
             // Re-cache RC from the just-written control word.
             if (Wd_rc_cached >= 0) {
                 // UBFX Wd_rc_cached, Wd_cw, #10, #2
@@ -2544,8 +2577,9 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::LoadCW: {
             // FNSTCW: read X87State.control_word, store u16 to memory.
             int Wd_cw = alloc_free_gpr(*result);
-            // LDRH Wd_cw, [Xbase, #0]  — control_word is at offset 0x00 → imm12=0
-            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, /*imm12=*/0, Xbase, Wd_cw);
+            // LDRH Wd_cw, [Xstate, #imm_cw_h*2]  — control_word
+            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/1, imm_cw_h,
+                             Xstate, Wd_cw);
             if (!emit_cached_gpr_access(n, /*size_log2=*/1, /*is_load=*/0, Wd_cw))
                 emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
                                     /*size_log2=*/1, /*is_load=*/0, Wd_cw);

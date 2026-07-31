@@ -361,11 +361,16 @@ int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
 // _frint: f64 → integral f64  (FRINTN/FRINTM/FRINTP/FRINTZ  Dd, Dn)
 // =============================================================================
 // Load control_word and extract the RC field (bits 11:10) into Wd_out.
-void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out);
+// cw_imm12: halfword-scaled LDRH offset of control_word from Xbase — 0 when
+// Xbase is the X87State base, (x87_state_offset / 2) when the caller passes
+// x18 directly (OPT-XB).
+void emit_rc_preamble(AssemblerBuffer& buf, int Xbase, int Wd_out,
+                      int16_t cw_imm12 = 0);
 
 // RC preamble + FCVT dispatch tree (single FCVTNS under config fast_round).
 void emit_rcmode_dispatch(AssemblerBuffer& buf, int Wd_int, int Dd_val,
-                          int is_64bit_int, int Xbase, int Wd_rc);
+                          int is_64bit_int, int Xbase, int Wd_rc,
+                          int16_t cw_imm12 = 0);
 
 void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
                                 int Dd_val, int is_64bit_int);
