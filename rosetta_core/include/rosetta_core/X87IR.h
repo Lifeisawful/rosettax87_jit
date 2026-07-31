@@ -161,6 +161,19 @@ enum class Op : uint8_t {
     GuestPushI,     // push imm: [rsp -= slot] = imm (sign-extended for 64-bit)
     GuestPop,       // pop r32/r64: r = [rsp], rsp += slot
 
+    // Scalar-SSE moves (opt-in ROSETTA_X87_TRANSPARENT_SSE): movsd/movss
+    // between an XMM register and memory, consumed mid-run or as trailing
+    // absorption after the window (OPT-A3 — the `fstp m; movsd xmm, m`
+    // return/seam idiom). Guest xmmN lives in host vN (0-15, disjoint from
+    // the FPR pool), so values are exchanged by register: a load forwarded
+    // from mem-CSE is one FMOV D/S (which zeroes the upper bits exactly as
+    // the x86 load form does); a store always stores from vN directly and
+    // registers the store-forward entry when the xmm's current value is a
+    // known node. aux: bits[3:0] xmm index, bit[4] is_f32 (movss).
+    SseLoad,        // xmm = [mem] (zeroing); inputs[0] = forwarded value
+                    // node (raw-f32 for movss) or -1 = load from memory
+    SseStore,       // [mem] = xmm low bits (no inputs — vN is the truth)
+
     // Guest flag DEFINER (opt-in via TRANSPARENT_FLAGS): cmp/test r32/r64
     // with register or immediate rhs, lowered to SUBS/ANDS — the same NZCV
     // guest state Rosetta's own translation of these opcodes leaves behind.
@@ -363,6 +376,14 @@ struct Context {
     // preamble, before any inlined write could happen).
     uint16_t guest_written_mask;
 
+    // OPT-A3: value currently in guest xmmN's low bits, as a node id (-1 =
+    // unknown). Set by SseLoad (the forwarded node, or the load node itself
+    // — then the value is xmm-resident and mem-CSE entries referencing it
+    // must be evicted when the xmm is overwritten). xmm_f32_mask bit N: the
+    // tracked value is raw-f32 (movss) rather than f64.
+    int16_t  xmm_val[16];
+    uint16_t xmm_f32_mask;
+
     // OPT-SS: view of the decoded instructions after the consumed run (same
     // block), set by compile_run. The pairing pass scans a bounded window of
     // it for reloads of a candidate store pair's bytes — an STP-sourced
@@ -384,6 +405,8 @@ struct Context {
         nzcv_dead = 0;
         const_promote = 0;
         guest_written_mask = 0;
+        for (int i = 0; i < 16; i++) xmm_val[i] = -1;
+        xmm_f32_mask = 0;
         tail_instrs = nullptr;
         tail_count = 0;
         last_narrow_input = -1;

@@ -693,7 +693,7 @@ static bool pair_node_skippable(Op op, bool lead_is_load) {
         // sunk past them (the load could read the stored location).
         case Op::LoadF64: case Op::LoadF32Raw:
         case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
-        case Op::GuestLoad:
+        case Op::GuestLoad: case Op::SseLoad:
             return lead_is_load;
         // Register-only inlined guest instructions never touch memory.
         // Pairs only form through cached-base operands, and plan_addr_cache
@@ -753,7 +753,7 @@ static bool pair_store_reloaded(const Context& ctx, const IROperand* mo,
         switch (m.op) {
             case Op::LoadF64: case Op::LoadF32Raw:
             case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
-            case Op::GuestLoad: case Op::GuestRmwR:
+            case Op::GuestLoad: case Op::GuestRmwR: case Op::SseLoad:
                 break;
             default:
                 continue;
@@ -879,6 +879,7 @@ static int plan_addr_cache(Context& ctx) {
             case Op::StoreF64: case Op::StoreF32Raw:
             case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
             case Op::StoreCW: case Op::LoadCW:
+            case Op::SseLoad: case Op::SseStore:
                 if (n.mem_operand->kind == IROperandKind::MemRef &&
                     n.mem_operand->mem.seg_override != 0)
                     return 0;
@@ -906,6 +907,16 @@ static int plan_addr_cache(Context& ctx) {
                 foldable = n.mem_operand->kind == IROperandKind::MemRef &&
                            addr_disp_foldable(n.mem_operand, /*is_f64=*/false);
                 break;
+            // Scalar-SSE moves (OPT-A3): f64/f32 by the aux width bit. A
+            // forwarded SseLoad emits no access, but counting it is harmless
+            // (the cache only over-provisions by one base).
+            case Op::SseLoad: case Op::SseStore: {
+                const bool sse_f32 = (n.aux & 0x10) != 0;
+                size_log2 = sse_f32 ? 2 : 3;
+                foldable = n.mem_operand->kind == IROperandKind::MemRef &&
+                           addr_disp_foldable(n.mem_operand, !sse_f32);
+                break;
+            }
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
             case Op::GuestRmwR:
                 // Width varies (8/16/32/64) — classify at the exact size so a
@@ -2767,6 +2778,38 @@ void lower(Context& ctx, TranslationResult* result) {
                                     /*is_load=*/0, Rt);
             break;
         }
+
+        // ── Scalar-SSE moves (OPT-A3) ──────────────────────────────────
+        case Op::SseLoad: {
+            const int xmm = static_cast<int>(n.aux & 0xF);
+            const bool is_f32 = (n.aux & 0x10) != 0;
+            if (n.inputs[0] >= 0) {
+                // Forwarded from a known value: one FMOV, whose D/S form
+                // zeroes the upper bits exactly like the x86 load form.
+                const int Dn = fprs.get(n.inputs[0]);
+                if (Dn != xmm)
+                    emit_fp_dp1(buf, /*type=*/is_f32 ? 0 : 1, /*FMOV=*/0,
+                                xmm, Dn);
+            } else {
+                const int size = is_f32 ? 2 : 3;
+                if (!emit_cached_access(n, size, /*is_load=*/1, xmm))
+                    emit_fp_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                       size, /*is_load=*/1, xmm);
+            }
+            // The value lives in the guest register — never pool-freed.
+            fprs.node_fpr[i] = static_cast<int8_t>(xmm);
+            fprs.pinned_mask |= 1u << xmm;
+            break;
+        }
+        case Op::SseStore: {
+            const int xmm = static_cast<int>(n.aux & 0xF);
+            const bool is_f32 = (n.aux & 0x10) != 0;
+            const int size = is_f32 ? 2 : 3;
+            if (!emit_cached_access(n, size, /*is_load=*/0, xmm))
+                emit_fp_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                   size, /*is_load=*/0, xmm);
+            break;
+        }
         case Op::GuestStoreI: {
             const int sz = guest_mem_size_log2(n.mem_operand);
             // XZR return for imm==0 encodes as STR WZR — stores zero.
@@ -3456,7 +3499,10 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
         // stores) — only the uncached address computation allocates, so 1.
         // Imm stores also materialize the value into a scratch: 2. RMW
         // holds its value scratch across the uncached address computation: 2.
+        // Scalar-SSE moves (OPT-A3) are the same shape: data lives in the
+        // guest xmm, only the address computation allocates.
         case Op::GuestLoad: case Op::GuestStoreR:
+        case Op::SseLoad: case Op::SseStore:
             transient = 1;
             break;
         case Op::GuestStoreI: case Op::GuestRmwR:

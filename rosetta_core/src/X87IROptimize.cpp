@@ -382,6 +382,8 @@ static void pass_dse(Context& ctx) {
             case Op::GuestAluRI: case Op::GuestRmwR:
             case Op::GuestPushR: case Op::GuestPushI: case Op::GuestPop:
             case Op::GuestCmpF:   // defines live guest flags
+            case Op::SseLoad:     // writes a guest xmm register
+            case Op::SseStore:    // writes guest memory
                 continue;
             default: break;
         }

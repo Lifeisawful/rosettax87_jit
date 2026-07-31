@@ -1198,6 +1198,133 @@ static bool build_guest_int(Context& ctx, IRInstr* instr, uint16_t op) {
 
 // ── Main build loop ─────────────────────────────────────────────────────────
 
+// ── Scalar-SSE moves (opt-in TRANSPARENT_SSE, OPT-A3) ───────────────────────
+//
+// movsd/movss between a plain XMM register and memory. Guest xmmN lives in
+// host vN permanently (disjoint from the FPR pool; the runtime BLs preserve
+// v0-15), so consumption exchanges values by register instead of round-
+// tripping through memory: a load whose operand hits mem-CSE becomes one
+// FMOV (which zeroes the upper bits exactly like the x86 load form), and a
+// store from an xmm with a known value registers the store-forward entry so
+// a later fld of the same operand forwards. AVX-class registers (YMM/ZMM)
+// decline — Rosetta models their upper halves via flush bookkeeping this
+// pipeline doesn't replicate — as does the reg<->reg merge form.
+
+// The size of the memory side of an SSE move (any operand kind).
+static IROperandSize sse_mem_size(const IROperand& m) {
+    switch (m.kind) {
+        case IROperandKind::MemRef: return m.mem.size;
+        case IROperandKind::AbsMem: return m.abs_mem.size;
+        case IROperandKind::Immediate: return m.imm.size;
+        default: return IROperandSize::S8;
+    }
+}
+
+// Overwriting guest xmm `k` invalidates mem-CSE entries whose value node is
+// RESIDENT in that register (an SseLoad that actually loaded — a forwarded
+// node lives in a pool FPR and survives).
+static void sse_overwrite_xmm(Context& ctx, int k) {
+    const int16_t v = ctx.xmm_val[k];
+    if (v >= 0 && ctx.nodes[v].op == Op::SseLoad) {
+        int kept = 0;
+        for (int i = 0; i < ctx.mem_cse_count; i++) {
+            if (ctx.mem_cse_val[i] != v) {
+                ctx.mem_cse_op[kept] = ctx.mem_cse_op[i];
+                ctx.mem_cse_kind[kept] = ctx.mem_cse_kind[i];
+                ctx.mem_cse_val[kept] = ctx.mem_cse_val[i];
+                kept++;
+            }
+        }
+        ctx.mem_cse_count = static_cast<int8_t>(kept);
+        ctx.mem_cse_next = 0;
+    }
+    ctx.xmm_val[k] = -1;
+    ctx.xmm_f32_mask &= static_cast<uint16_t>(~(1u << k));
+}
+
+static bool build_sse_mov(Context& ctx, IRInstr* instr, uint16_t op) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_sse)) return false;
+    if (instr->num_operands < 2) return false;
+    const bool is_f32 = (op == kOpcodeName_movss);
+    IROperand& dst = instr->operands[0];
+    IROperand& src = instr->operands[1];
+    const IROperandSize want = is_f32 ? IROperandSize::S32 : IROperandSize::S64;
+    const Op load_kind = is_f32 ? Op::LoadF32Raw : Op::LoadF64;
+
+    if (dst.kind == IROperandKind::Register &&
+        src.kind != IROperandKind::Register) {
+        // ── Load form: xmm = [mem], zeroing the upper bits ──────────────
+        if (!dst.reg.reg.is_xmm()) return false;
+        if (src.kind == IROperandKind::MemRef && src.mem.seg_override != 0)
+            return false;
+        if (sse_mem_size(src) != want) return false;
+        const int xmm = dst.reg.reg.index();
+
+        int16_t fwd = -1;
+        const int16_t hit = mem_cse_lookup(ctx, &src, load_kind);
+        if (hit >= 0) {
+            // f32 entries hold the WIDENED f64 view by convention — take the
+            // raw input back out; anything else falls back to the load.
+            if (!is_f32)
+                fwd = hit;
+            else if (ctx.nodes[hit].op == Op::CvtF32ToF64)
+                fwd = ctx.nodes[hit].inputs[0];
+        }
+        const int16_t id = ctx.add_node(Op::SseLoad, fwd);
+        if (id < 0) return false;
+        ctx.nodes[id].mem_operand = &src;
+        ctx.nodes[id].aux = static_cast<uint32_t>(xmm) | (is_f32 ? 0x10u : 0u);
+        sse_overwrite_xmm(ctx, xmm);
+        if (fwd >= 0) {
+            ctx.xmm_val[xmm] = fwd;
+        } else {
+            // The loaded value is xmm-resident; let later loads of the same
+            // operand (fld included) forward from the register. f32 entries
+            // store the widened view (DSE reaps the widen if never used).
+            ctx.xmm_val[xmm] = id;
+            if (!is_f32) {
+                mem_cse_insert(ctx, &src, Op::LoadF64, id);
+            } else {
+                const int16_t w = ctx.add_node(Op::CvtF32ToF64, id);
+                if (w >= 0) mem_cse_insert(ctx, &src, Op::LoadF32Raw, w);
+            }
+        }
+        if (is_f32) ctx.xmm_f32_mask |= static_cast<uint16_t>(1u << xmm);
+        return true;
+    }
+
+    if (src.kind == IROperandKind::Register &&
+        dst.kind != IROperandKind::Register) {
+        // ── Store form: [mem] = xmm low bits ────────────────────────────
+        if (!src.reg.reg.is_xmm()) return false;
+        if (dst.kind == IROperandKind::MemRef && dst.mem.seg_override != 0)
+            return false;
+        if (sse_mem_size(dst) != want) return false;
+        const int xmm = src.reg.reg.index();
+
+        const int16_t id = ctx.add_node(Op::SseStore);
+        if (id < 0) return false;
+        ctx.nodes[id].mem_operand = &dst;
+        ctx.nodes[id].aux = static_cast<uint32_t>(xmm) | (is_f32 ? 0x10u : 0u);
+        mem_cse_evict_may_alias(ctx, &dst);
+        // Store-forward: when the xmm's current low bits are a known node of
+        // the matching width, a later load of this operand forwards to it.
+        const int16_t v = ctx.xmm_val[xmm];
+        const bool vf32 = (ctx.xmm_f32_mask >> xmm) & 1;
+        if (v >= 0 && vf32 == is_f32) {
+            if (!is_f32) {
+                mem_cse_insert(ctx, &dst, Op::LoadF64, v);
+            } else {
+                const int16_t w = ctx.add_node(Op::CvtF32ToF64, v);
+                if (w >= 0) mem_cse_insert(ctx, &dst, Op::LoadF32Raw, w);
+            }
+        }
+        return true;
+    }
+
+    return false;  // reg<->reg merge form (or malformed) — not consumed
+}
+
 bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start_idx,
            int run_length, const int8_t* perm, bool const_promote) {
     ctx.init();
@@ -1744,6 +1871,12 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ok = build_guest_int(ctx, instr, op);
                 break;
 
+            // ── Scalar-SSE moves (opt-in TRANSPARENT_SSE, OPT-A3) ───────
+            case kOpcodeName_movsd:
+            case kOpcodeName_movss:
+                ok = build_sse_mov(ctx, instr, op);
+                break;
+
             // ── Flag-writing ALU forms (opt-in TRANSPARENT_FLAGS) ───────
             case kOpcodeName_add:
             case kOpcodeName_sub:
@@ -1786,6 +1919,27 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
 
         if (!ok) break;
         ctx.consumed = static_cast<int16_t>(i + 1);
+    }
+
+    // OPT-A3: absorb TRAILING scalar-SSE moves. The canonical seam idiom
+    // (`fstp m; movsd xmm, m` / `movsd m2, xmm`) trails the last x87 member,
+    // where lookahead never counts a gap — a run always ends on an x87
+    // member from the WINDOW's perspective. Consuming them here keeps that
+    // contract intact (the window bookkeeping is untouched; the extra
+    // instructions are IR-internal and only extend ctx.consumed), and the
+    // decline path is unchanged: if the run itself failed to build, nothing
+    // is absorbed.
+    if (ctx.consumed == run_length) {
+        constexpr int kMaxTrailingSse = 4;
+        for (int t = 0; t < kMaxTrailingSse; t++) {
+            const int64_t idx = start_idx + ctx.consumed;
+            if (idx >= num_instrs) break;
+            auto* tail = &instr_array[idx];
+            const auto top = tail->opcode();
+            if (top != kOpcodeName_movsd && top != kOpcodeName_movss) break;
+            if (!build_sse_mov(ctx, tail, top)) break;
+            ctx.consumed++;
+        }
     }
 
     // Only worthwhile if we consumed 2+ instructions — except when the caller

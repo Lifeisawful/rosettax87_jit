@@ -290,6 +290,10 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_SEAM"))
         cfg.disable_seam = (*v == '1') ? 1 : 0;
 
+    // Opt-in: consume scalar movsd/movss (xmm<->mem) into IR runs (OPT-A3).
+    if (const char* v = std::getenv("ROSETTA_X87_TRANSPARENT_SSE"))
+        cfg.transparent_sse = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;
