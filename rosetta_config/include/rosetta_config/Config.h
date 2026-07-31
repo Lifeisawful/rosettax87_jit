@@ -137,6 +137,7 @@ struct RosettaConfig {
     uint8_t  disable_lower_dc;       // ROSETTA_X87_DISABLE_LOWER_DC=1 — disable the Lower dead-code batch: combined pop-pair tag mask (B3), fused-window dead C2 pair elision (B6), and generic-body-deferred Xst_base ADD (bisection lever)
     uint8_t  disable_seam;           // ROSETTA_X87_DISABLE_SEAM=1 — flush TOP/tag state at every run break instead of deferring it across an intra-block seam to the next x87 run (OPT-SEAM; bisection lever)
     uint8_t  transparent_sse;        // ROSETTA_X87_TRANSPARENT_SSE=1 — consume scalar movsd/movss (xmm<->mem) into IR runs, incl. trailing absorption after the last x87 member (OPT-A3; the fstp/movsd seam collapses to a register move; opt-in)
+    uint8_t  disable_window_defer;   // ROSETTA_X87_DISABLE_WINDOW_DEFER=1 — mid-window IR runs emit their TOP/tag writeback instead of deferring it into the register-window fields (top_dirty/deferred_*) that the window-ending member flushes (OPT-WD; bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

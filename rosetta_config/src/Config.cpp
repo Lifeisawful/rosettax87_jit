@@ -294,6 +294,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_TRANSPARENT_SSE"))
         cfg.transparent_sse = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: mid-window IR runs emit TOP/tag writeback inline
+    // instead of deferring into the register-window fields (OPT-WD).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_WINDOW_DEFER"))
+        cfg.disable_window_defer = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

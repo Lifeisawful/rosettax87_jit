@@ -2007,17 +2007,17 @@ void lower(Context& ctx, TranslationResult* result) {
                                ? entry_push_count - ctx.top_delta : 0;
     const int fold_empty = (ctx.top_delta + entry_pop_count - entry_push_count > 0)
                                ? ctx.top_delta + entry_pop_count - entry_push_count : 0;
+    bool run_has_compare = false;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op == Op::FCmp || n.op == Op::FTst) {
+            run_has_compare = true;
+            break;
+        }
+    }
     int seam_delta_out = 0;
     if (seam_defer) {
-        bool run_has_compare = false;
-        for (int i = 0; i < ctx.num_nodes; i++) {
-            const auto& n = ctx.nodes[i];
-            if (n.flags & kDead) continue;
-            if (n.op == Op::FCmp || n.op == Op::FTst) {
-                run_has_compare = true;
-                break;
-            }
-        }
         if (sw_sink_node >= 0)
             seam_delta_out = 0;
         else if (run_has_compare)
@@ -2025,6 +2025,48 @@ void lower(Context& ctx, TranslationResult* result) {
         else
             seam_delta_out = seam_delta_in + ctx.top_delta;
     }
+
+    // OPT-WD: mid-window deferral. When the run cache outlives this run
+    // (bridged gap ahead — the pinned Wd_top survives and carries the true
+    // TOP), the TOP/tag writeback defers into the register-window fields
+    // (top_dirty / deferred_push/pop_count) that the legacy translators and
+    // the IR entry fold already consume; the window-ending member's
+    // x87_end / epilogue materializes them. Mutually exclusive with
+    // seam_defer (which requires the window to END here).
+    //
+    // Legacy-machinery invariants the recorded state must satisfy:
+    //  - P and Q never coexist (x87_push/x87_pop manage one side at a time);
+    //  - with top_dirty && P > 0, memory TOP == register TOP + P — the
+    //    pop-cancellation path clears top_dirty WITHOUT storing once every
+    //    deferred push is cancelled (mem is "the pre-batch baseline");
+    //  - the mirror for top_dirty && Q > 0: memory TOP == register TOP - Q;
+    //  - counts stay below the 8-slot batch cap.
+    // Certify against what this run actually leaves in the memory TOP field
+    // (mod 8): a sinking FStsw stored the true final TOP; any compare stored
+    // the true entry TOP; otherwise the field is untouched (stale by the
+    // consumed seam delta and the entry-register baseline).
+    // Memory TOP left stale by this run (truth stays in the pinned Wd_top).
+    const bool wd_top_stale =
+        (ctx.top_delta != 0 || entry_top_stale) && sw_sink_node < 0;
+    const int mem_minus_reg =
+        (sw_sink_node >= 0) ? 0
+        : run_has_compare
+            ? -ctx.top_delta
+            : result->x87_cache.deferred_push_count -
+                  result->x87_cache.deferred_pop_count - seam_delta_in -
+                  ctx.top_delta;
+    const bool wd_invariant_ok =
+        !wd_top_stale ||
+        (fold_valid == 0 && fold_empty == 0) ||
+        (fold_valid > 0 && fold_valid < 8 &&
+         ((mem_minus_reg - fold_valid) & 7) == 0) ||
+        (fold_empty > 0 && fold_empty < 8 &&
+         ((mem_minus_reg + fold_empty) & 7) == 0);
+    const bool window_defer =
+        !(g_rosetta_config && g_rosetta_config->disable_window_defer) &&
+        result->x87_cache.run_remaining > ctx.consumed &&
+        !(fold_valid > 0 && fold_empty > 0) &&
+        fold_valid < 8 && fold_empty < 8 && wd_invariant_ok;
 
     // ── Run body (node loop + x87-state epilogue) ───────────────────────────
     // Emitted once normally, or twice when TOP=0 specialization is active:
@@ -3051,9 +3093,9 @@ void lower(Context& ctx, TranslationResult* result) {
     //    entry (carried-in top_dirty, or a consumed seam delta).
     //    Skipped when an FSTSW already stored the halfword with the final TOP
     //    folded in (sw_sink_node), or when this run defers across a seam
-    //    (OPT-SEAM: the delta rides in seam_top_delta instead).
-    if ((ctx.top_delta != 0 || entry_top_stale) && sw_sink_node < 0 &&
-        !seam_defer) {
+    //    (OPT-SEAM: the delta rides in seam_top_delta) or into the rest of
+    //    the window (OPT-WD: top_dirty rides with the pinned register).
+    if (wd_top_stale && !seam_defer && !window_defer) {
         emit_store_top(buf, Xbase, Wd_top, Wd_tmp);
     }
 
@@ -3063,11 +3105,11 @@ void lower(Context& ctx, TranslationResult* result) {
     //      valid slots:  V = max(0, P - top_delta)   at TOP .. TOP+V-1
     //      empty slots:  M = max(0, top_delta + Q - P) at TOP-M .. TOP-1
     //    With P = Q = 0 this reduces to the plain net push/pop cases.
-    //    A deferring run (OPT-SEAM) records fold_valid/fold_empty in the
-    //    seam fields instead of emitting.
+    //    A deferring run (OPT-SEAM/OPT-WD) records fold_valid/fold_empty in
+    //    the seam or register-window fields instead of emitting.
     {
-        const int set_valid = seam_defer ? 0 : fold_valid;
-        const int set_empty = seam_defer ? 0 : fold_empty;
+        const int set_valid = (seam_defer || window_defer) ? 0 : fold_valid;
+        const int set_empty = (seam_defer || window_defer) ? 0 : fold_empty;
         if (set_valid > 0 || set_empty > 0) {
             int Wd_tmp2 = alloc_free_gpr(*result);
             int Wd_tagw = alloc_free_gpr(*result);
@@ -3187,10 +3229,19 @@ void lower(Context& ctx, TranslationResult* result) {
         }
     }
 
-    // 6. Clean up cache deferred state (we handled everything inline).
-    result->x87_cache.top_dirty = 0;
-    result->x87_cache.deferred_push_count = 0;
-    result->x87_cache.deferred_pop_count = 0;
+    // 6. Clean up cache deferred state (we handled everything inline) — or,
+    //    under OPT-WD, record this run's deferred TOP/tag state for the rest
+    //    of the window (the pinned Wd_top carries the true TOP; the
+    //    window-ending member's x87_end / IR entry fold materializes).
+    if (window_defer) {
+        result->x87_cache.top_dirty = wd_top_stale ? 1 : 0;
+        result->x87_cache.deferred_push_count = static_cast<int8_t>(fold_valid);
+        result->x87_cache.deferred_pop_count = static_cast<int8_t>(fold_empty);
+    } else {
+        result->x87_cache.top_dirty = 0;
+        result->x87_cache.deferred_push_count = 0;
+        result->x87_cache.deferred_pop_count = 0;
+    }
     result->x87_cache.reset_perm();
 
     // 7. Free scratch GPRs — or carry them across the bridge (OPT-BC).
