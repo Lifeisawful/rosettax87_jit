@@ -3,8 +3,19 @@
 #include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/CoreLog.h"
 #include "rosetta_core/IRBlock.h"
+#include "rosetta_core/Register.h"
 #include "rosetta_core/TranslationResult.h"
 #include <rosetta_config/Config.h>
+
+static inline bool backedge_enabled(const RosettaConfig* cfg) {
+    return cfg && !cfg->disable_backedge;
+}
+
+static inline bool is_self_loop_block(const IRBlock* block) {
+    const IRTerminator& t = block->terminator;
+    return t.kind == TK_JCC && t.data.target.block.kind == BasicBlock &&
+           t.data.target.block.block == block;
+}
 
 // ── OPT-BE stage 0 spike ────────────────────────────────────────────────────
 // Goal: prove the post-block patch point (design_b_2026-07-31.md §4.0).
@@ -48,7 +59,7 @@ static bool g_block_recs_overflow = false;
 
 void x87_backedge_note_block(TranslationResult* result, IRBlock* block) {
     const RosettaConfig* cfg = g_rosetta_config;
-    if (!cfg || !cfg->log_backedge)
+    if (!cfg || (!cfg->log_backedge && !backedge_enabled(cfg)))
         return;
     if (result != g_rec_owner) {
         g_rec_owner = result;
@@ -59,12 +70,9 @@ void x87_backedge_note_block(TranslationResult* result, IRBlock* block) {
         g_block_recs_overflow = true;
         return;
     }
-    const IRTerminator& t = block->terminator;
-    const bool self_loop = t.kind == TK_JCC &&
-                           t.data.target.block.kind == BasicBlock &&
-                           t.data.target.block.block == block;
     g_block_recs[g_num_block_recs++] = {
-        (uint32_t)result->insn_buf.end, block->start_pc, (uint8_t)(self_loop ? 1 : 0)};
+        (uint32_t)result->insn_buf.end, block->start_pc,
+        (uint8_t)(is_self_loop_block(block) ? 1 : 0)};
 }
 
 namespace {
@@ -183,6 +191,68 @@ struct SelfLoopVerdict {
     int key_gpr = -1;
 };
 
+// The skipped-region walk, shared between the full post-pass analysis and
+// the translate-time gap-pin extractor (which runs it over the partially
+// emitted block). Every word must derive only from x18 / X87State memory /
+// earlier region defs; the walk ends at the first st[] load (reg-offset D
+// form based on the x18-derived state base). Returns nullptr on success or
+// the decline reason (fail_idx = offending word).
+struct PrefixInfo {
+    uint32_t region_gpr_defs = 0;  // bit per GPR defined in the region
+    int base_gpr = -1;
+    int key_gpr = -1;
+    int fpr = -1;
+    uint64_t ldr_idx = 0;
+    uint64_t fail_idx = 0;
+};
+
+const char* walk_prefix(volatile uint32_t* words, uint64_t limit, PrefixInfo* out) {
+    PrefixInfo& p = *out;
+    auto reads_ok = [&](int r) {
+        return r == 18 || r == 31 || (p.region_gpr_defs >> r) & 1u;
+    };
+    for (uint64_t i = 0; i < limit; i++) {
+        const uint32_t w = words[i];
+        p.fail_idx = i;
+        if (is_add_x_imm(w) && rn_of(w) == 18) {
+            p.region_gpr_defs |= 1u << rd_of(w);
+            p.base_gpr = rd_of(w);  // latest x18-derived base
+        } else if (is_ldrh_imm(w) &&
+                   (rn_of(w) == 18 || (p.base_gpr >= 0 && rn_of(w) == p.base_gpr))) {
+            p.region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_ubfm_w(w)) {
+            if (!reads_ok(rn_of(w)))
+                return "prefix-reads-outside";
+            p.region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_orr_w_reg(w)) {
+            if (!reads_ok(rn_of(w)) || !reads_ok(rm_of(w)))
+                return "prefix-reads-outside";
+            p.region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_addsub_w_imm(w)) {
+            if (!reads_ok(rn_of(w)))
+                return "prefix-reads-outside";
+            p.region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_shiftv_w(w)) {
+            if (!reads_ok(rn_of(w)) || !reads_ok(rm_of(w)))
+                return "prefix-reads-outside";
+            p.region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_ldr_d_regoff(w)) {
+            if (p.base_gpr < 0 || rn_of(w) != p.base_gpr)
+                return "prime-load-base";
+            if (!((p.region_gpr_defs >> rm_of(w)) & 1u))
+                return "prime-load-key";
+            p.ldr_idx = i;
+            p.fpr = rd_of(w);
+            p.key_gpr = rm_of(w);
+            return nullptr;
+        } else {
+            return "prefix-unrecognized";
+        }
+    }
+    p.fail_idx = 0;
+    return "no-priming-load";
+}
+
 // words[0..n_words) = the block region [head .. next block head); the block's
 // terminator back edge must be the region's last word.
 SelfLoopVerdict analyze_self_loop(volatile uint32_t* words, uint64_t n_words) {
@@ -206,56 +276,16 @@ SelfLoopVerdict analyze_self_loop(volatile uint32_t* words, uint64_t n_words) {
         return decline("backedge-target-not-head", be);
 
     // 2. Skipped region: walk from the head through the priming load.
-    //    Every word must derive only from x18 / X87State memory / earlier
-    //    region defs; the region ends at the first st[] load (reg-offset D
-    //    form based on the state base).
-    uint32_t region_gpr_defs = 0;  // bit per GPR defined in the region
-    auto region_reads_ok = [&](int r) {
-        return r == 18 || r == 31 || (region_gpr_defs >> r) & 1u;
-    };
-    int base_gpr = -1;
-    uint64_t ldr_idx = 0;
-    bool found_load = false;
-    for (uint64_t i = 0; i < be && !found_load; i++) {
-        const uint32_t w = words[i];
-        if (is_add_x_imm(w) && rn_of(w) == 18) {
-            region_gpr_defs |= 1u << rd_of(w);
-            base_gpr = rd_of(w);  // latest x18-derived base
-        } else if (is_ldrh_imm(w) &&
-                   (rn_of(w) == 18 || (base_gpr >= 0 && rn_of(w) == base_gpr))) {
-            region_gpr_defs |= 1u << rd_of(w);
-        } else if (is_ubfm_w(w)) {
-            if (!region_reads_ok(rn_of(w)))
-                return decline("prefix-reads-outside", i);
-            region_gpr_defs |= 1u << rd_of(w);
-        } else if (is_orr_w_reg(w)) {
-            if (!region_reads_ok(rn_of(w)) || !region_reads_ok(rm_of(w)))
-                return decline("prefix-reads-outside", i);
-            region_gpr_defs |= 1u << rd_of(w);
-        } else if (is_addsub_w_imm(w)) {
-            if (!region_reads_ok(rn_of(w)))
-                return decline("prefix-reads-outside", i);
-            region_gpr_defs |= 1u << rd_of(w);
-        } else if (is_shiftv_w(w)) {
-            if (!region_reads_ok(rn_of(w)) || !region_reads_ok(rm_of(w)))
-                return decline("prefix-reads-outside", i);
-            region_gpr_defs |= 1u << rd_of(w);
-        } else if (is_ldr_d_regoff(w)) {
-            if (base_gpr < 0 || rn_of(w) != base_gpr)
-                return decline("prime-load-base", i);
-            if (!((region_gpr_defs >> rm_of(w)) & 1u))
-                return decline("prime-load-key", i);
-            ldr_idx = i;
-            found_load = true;
-        } else {
-            return decline("prefix-unrecognized", i);
-        }
-    }
-    if (!found_load)
-        return decline("no-priming-load", 0);
+    PrefixInfo pfx;
+    const char* pfx_reason = walk_prefix(words, be, &pfx);
+    if (pfx_reason)
+        return decline(pfx_reason, pfx.fail_idx);
 
-    const int fpr = rd_of(words[ldr_idx]);
-    const int key_gpr = rm_of(words[ldr_idx]);
+    const uint32_t region_gpr_defs = pfx.region_gpr_defs;
+    const int base_gpr = pfx.base_gpr;
+    const uint64_t ldr_idx = pfx.ldr_idx;
+    const int fpr = pfx.fpr;
+    const int key_gpr = pfx.key_gpr;
 
     // 3. Body + gap: [ldr_idx+1 .. be). One st[] store of the same FPR to the
     //    same base+key; no writes to region-defined GPRs; no FPR write after
@@ -318,17 +348,54 @@ SelfLoopVerdict analyze_self_loop(volatile uint32_t* words, uint64_t n_words) {
 
 }  // namespace
 
+void x87_backedge_gap_pins(TranslationResult* result, IRBlock* block,
+                           uint32_t* gpr_pins, uint32_t* fpr_pins) {
+    *gpr_pins = 0;
+    *fpr_pins = 0;
+    const RosettaConfig* cfg = g_rosetta_config;
+    if (!backedge_enabled(cfg))
+        return;
+    if (result != g_rec_owner || g_num_block_recs == 0 || g_block_recs_overflow)
+        return;
+    if (!is_self_loop_block(block))
+        return;
+    // The current block is always the most recent record (note_block fires at
+    // the block-change edge before any of its instructions translate).
+    const BlockRec& rec = g_block_recs[g_num_block_recs - 1];
+    if (rec.start_pc != block->start_pc || (rec.arm_off & 3))
+        return;
+    const uint64_t end = result->insn_buf.end;
+    if (rec.arm_off >= end)
+        return;
+    volatile uint32_t* words = result->insn_buf.data + rec.arm_off / 4;
+    PrefixInfo pfx;
+    if (walk_prefix(words, (end - rec.arm_off) / 4, &pfx) != nullptr)
+        return;
+    // Only scratch GPRs can (and need to) be withheld from Rosetta's
+    // allocator; the post-pass decode check stays the enforcement if
+    // anything writes a pin regardless.
+    *gpr_pins = pfx.region_gpr_defs & kGprScratchMask;
+    *fpr_pins = 1u << pfx.fpr;
+}
+
 void x87_backedge_module_post(TranslationResult* result) {
     const RosettaConfig* cfg = g_rosetta_config;
-    if (!cfg || (!cfg->log_backedge && !cfg->backedge_noop_probe))
+    const bool log = cfg && cfg->log_backedge;
+    const bool probe = cfg && cfg->backedge_noop_probe;
+    const bool patch = backedge_enabled(cfg);
+    if (!log && !probe && !patch)
         return;
-    if (!result)
+    if (!result) {
+        g_rec_owner = nullptr;
         return;
+    }
 
     g_backedge_module_count++;
 
-    // JIT mode: code accumulates in insn_buf. AOT mode: characterize where it
-    // actually lives at this point (stage-0 question — insn_buf vs data_).
+    // JIT mode: code accumulates in insn_buf. AOT mode: the finished code has
+    // been moved to data_/data_size by the time translator_translate returns;
+    // block offsets recorded during translation are congruent (stage-1
+    // verified).
     volatile uint32_t* words = result->insn_buf.data;
     uint64_t n_words = result->insn_buf.end / 4;
     const char* src = "insn_buf";
@@ -338,35 +405,38 @@ void x87_backedge_module_post(TranslationResult* result) {
         src = "data_";
     }
 
-    BranchScan scan;
-    for (uint64_t i = 0; i < n_words; i++) {
-        const uint32_t w = words[i];
-        if (!is_cond_branch(w))
-            continue;
-        const int32_t off = cond_branch_offset_words(w);
-        if (off < 0) {
-            scan.backward_cond++;
-            if (cfg->backedge_noop_probe)
-                words[i] = w;  // G0.2: same-value write — must change nothing
-        } else if (off == 0) {
-            scan.zero_off_cond++;
+    // Stage-0 evidence scan (debug only — a full-buffer walk per module).
+    if (log || probe) {
+        BranchScan scan;
+        for (uint64_t i = 0; i < n_words; i++) {
+            const uint32_t w = words[i];
+            if (!is_cond_branch(w))
+                continue;
+            const int32_t off = cond_branch_offset_words(w);
+            if (off < 0) {
+                scan.backward_cond++;
+                if (probe)
+                    words[i] = w;  // G0.2: same-value write — must change nothing
+            } else if (off == 0) {
+                scan.zero_off_cond++;
+            }
         }
+        if (log)
+            CORE_LOG("backedge: module=%llu mode=%d src=%s words=%llu "
+                     "backward_cond=%llu placeholder_cond=%llu%s",
+                     (unsigned long long)g_backedge_module_count,
+                     (int)result->_mode, src, (unsigned long long)n_words,
+                     (unsigned long long)scan.backward_cond,
+                     (unsigned long long)scan.zero_off_cond,
+                     probe ? " probe=on" : "");
     }
 
-    if (cfg->log_backedge)
-        CORE_LOG("backedge: module=%llu mode=%d src=%s words=%llu "
-                 "backward_cond=%llu placeholder_cond=%llu%s",
-                 (unsigned long long)g_backedge_module_count, (int)result->_mode,
-                 src, (unsigned long long)n_words,
-                 (unsigned long long)scan.backward_cond,
-                 (unsigned long long)scan.zero_off_cond,
-                 cfg->backedge_noop_probe ? " probe=on" : "");
-
-    // ── Stage 1: analyze recorded self-loop blocks (log-only) ──────────────
-    if (cfg->log_backedge && result == g_rec_owner) {
-        if (g_block_recs_overflow)
-            CORE_LOG("backedge-cand: block records overflowed, module skipped");
-        else {
+    // ── Analyze recorded self-loop blocks; patch the qualifying ones ───────
+    if ((log || patch) && result == g_rec_owner) {
+        if (g_block_recs_overflow) {
+            if (log)
+                CORE_LOG("backedge-cand: block records overflowed, module skipped");
+        } else {
             for (uint32_t bi = 0; bi < g_num_block_recs; bi++) {
                 const BlockRec& rec = g_block_recs[bi];
                 if (!rec.self_loop)
@@ -376,23 +446,39 @@ void x87_backedge_module_post(TranslationResult* result) {
                                              : (uint32_t)(n_words * 4);
                 if (rec.arm_off >= end_off || (rec.arm_off & 3) ||
                     end_off > n_words * 4) {
-                    CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x DECLINE "
-                             "reason=bad-region",
-                             rec.start_pc, rec.arm_off);
+                    if (log)
+                        CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x DECLINE "
+                                 "reason=bad-region",
+                                 rec.start_pc, rec.arm_off);
                     continue;
                 }
                 SelfLoopVerdict v = analyze_self_loop(
                     words + rec.arm_off / 4, (end_off - rec.arm_off) / 4);
-                if (v.qualify)
+                if (!v.qualify) {
+                    if (log)
+                        CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x DECLINE "
+                                 "reason=%s at=+0x%x word=0x%08x",
+                                 rec.start_pc, rec.arm_off, v.reason,
+                                 v.detail_off, v.detail_word);
+                    continue;
+                }
+                if (log)
                     CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x QUALIFY "
-                             "skip=+0x%x fpr=d%d base=x%d key=x%d",
+                             "skip=+0x%x fpr=d%d base=x%d key=x%d%s",
                              rec.start_pc, rec.arm_off, v.skip_off, v.fpr,
-                             v.base_gpr, v.key_gpr);
-                else
-                    CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x DECLINE "
-                             "reason=%s at=+0x%x word=0x%08x",
-                             rec.start_pc, rec.arm_off, v.reason, v.detail_off,
-                             v.detail_word);
+                             v.base_gpr, v.key_gpr, patch ? " PATCH" : "");
+                // The transform: retarget the back edge past the priming
+                // load. Single-step mode plants a BRK after the terminator,
+                // so its region never ends in the branch — the decode check
+                // already excludes it; the mode gate is belt-and-suspenders.
+                if (patch && result->_mode != 2) {
+                    const uint64_t be_idx = end_off / 4 - 1;
+                    const uint64_t tgt_idx = (rec.arm_off + v.skip_off) / 4;
+                    const uint32_t bw = words[be_idx];
+                    const int32_t imm19 = (int32_t)tgt_idx - (int32_t)be_idx;
+                    words[be_idx] =
+                        (bw & ~0x00FFFFE0u) | (((uint32_t)imm19 & 0x7FFFF) << 5);
+                }
             }
         }
     }

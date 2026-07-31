@@ -3,6 +3,7 @@
 #include "rosetta_core/CoreLog.h"
 #include "rosetta_core/Register.h"
 #include "rosetta_core/TranslationResult.h"
+#include "rosetta_core/X87BackEdge.h"
 #include "rosetta_core/Translator.h"
 #include "rosetta_core/hook.h"
 
@@ -56,10 +57,22 @@ int64_t hook_translate_insn(TranslationResult* result, IRBlock* block, IRInstr* 
     auto new_insn_idx =
         Translator::translate_instruction(result, block, instr_array, num_instrs, insn_idx);
 
-    int64_t result_idx =
-        new_insn_idx.has_value()
-            ? new_insn_idx.value()
-            : original_translate_insn(result, block, instr_array, num_instrs, insn_idx);
+    int64_t result_idx;
+    if (new_insn_idx.has_value()) {
+        result_idx = new_insn_idx.value();
+    } else {
+        // OPT-BE: withhold a qualifying self-loop block's pinned registers
+        // from Rosetta's allocator for this stock-translated instruction.
+        // The GPR exclusion is undone by the mask reset below; the FPR mask
+        // has no per-instruction reset, so save and restore it explicitly.
+        uint32_t gpr_pins = 0, fpr_pins = 0;
+        x87_backedge_gap_pins(result, block, &gpr_pins, &fpr_pins);
+        const uint32_t saved_fpr_mask = result->free_fpr_mask;
+        result->free_gpr_mask &= ~gpr_pins;
+        result->free_fpr_mask &= ~fpr_pins;
+        result_idx = original_translate_insn(result, block, instr_array, num_instrs, insn_idx);
+        result->free_fpr_mask = saved_fpr_mask;
+    }
 
     if (g_translation_hook && g_translation_hook->after)
         g_translation_hook->after(result, block, instr_array, num_instrs, insn_idx, result_idx);

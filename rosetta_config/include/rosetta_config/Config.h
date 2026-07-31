@@ -140,6 +140,7 @@ struct RosettaConfig {
     uint8_t  disable_window_defer;   // ROSETTA_X87_DISABLE_WINDOW_DEFER=1 — mid-window IR runs emit their TOP/tag writeback instead of deferring it into the register-window fields (top_dirty/deferred_*) that the window-ending member flushes (OPT-WD; bisection lever)
     uint8_t  log_backedge;           // ROSETTA_X87_LOG_BACKEDGE=1 — log every module seen by the post-translate hook (OPT-BE stage 0: interception + branch-scan evidence)
     uint8_t  backedge_noop_probe;    // ROSETTA_X87_BACKEDGE_NOOP_PROBE=1 — rewrite every backward conditional-branch word in the post-translate hook with its own value (OPT-BE stage 0 G0.2: buffer writability, must be a byte-identical no-op)
+    uint8_t  disable_backedge;       // ROSETTA_X87_DISABLE_BACKEDGE=1 — don't retarget self-loop back edges past the priming st[] load in decode-verified accumulator blocks (OPT-BE; bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

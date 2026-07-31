@@ -61,6 +61,7 @@ ALL_TESTS=(
     test_fprem
     test_stackops
     test_seam
+    test_backedge
     test_sse_scalar
     test_peephole7
     test_fcom_nzcv

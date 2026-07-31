@@ -26,6 +26,17 @@ void x87_backedge_module_post(TranslationResult* result);
 // decoding the emitted words. Inert unless ROSETTA_X87_LOG_BACKEDGE=1.
 void x87_backedge_note_block(TranslationResult* result, IRBlock* block);
 
+// Stage 2: pin-mask extension. For an instruction Rosetta is about to
+// translate inside a JCC self-loop block whose emitted words already match
+// the accumulator-prefix shape, returns the scratch-register masks to
+// withhold from Rosetta's allocator (state base + key GPRs, accumulator
+// FPR) so its gap translation — e.g. production flag materialization for a
+// dec — doesn't land on a pin. Purely an enabler: if Rosetta clobbers a pin
+// anyway, the post-pass decode check declines the block and it stays stock.
+// Returns zero masks unless OPT-BE is enabled and the block matches.
+void x87_backedge_gap_pins(TranslationResult* result, IRBlock* block,
+                           unsigned int* gpr_pins, unsigned int* fpr_pins);
+
 // Stage-0 G0.4 audit: called AFTER the original fixup application, with the
 // published destination buffer. Compares dest against the pre-publication
 // internal buffer and logs which words fixups changed — specifically whether

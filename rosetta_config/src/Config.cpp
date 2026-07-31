@@ -306,6 +306,12 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_BACKEDGE_NOOP_PROBE"))
         cfg.backedge_noop_probe = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: keep self-loop back edges targeting the block head
+    // instead of retargeting decode-verified accumulator loops past the
+    // priming st[] load (OPT-BE).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_BACKEDGE"))
+        cfg.disable_backedge = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;
