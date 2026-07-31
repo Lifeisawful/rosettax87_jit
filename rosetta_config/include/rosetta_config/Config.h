@@ -144,6 +144,7 @@ struct RosettaConfig {
     uint8_t  disable_test_ccmn;      // ROSETTA_X87_DISABLE_TEST_CCMN=1 — lower the OPT-PS raw-FCMP test shortcut through the two-insn CSET+ANDS pair instead of one integer CCMN (bisection lever)
     uint8_t  disable_guest_setcc;    // ROSETTA_X87_DISABLE_GUEST_SETCC=1 — don't consume setcc r8 after an in-run cmp/test (GuestSetcc), and don't absorb the trailing `test; setcc [; movzx]` compare tail (bisection lever)
     uint8_t  disable_pinned_demand;  // ROSETTA_X87_DISABLE_PINNED_DEMAND=1 — charge the historical flat 4 pinned preamble GPRs in peak_live_gprs instead of the demand-derived count (bisection lever)
+    uint8_t  disable_sse_lead;       // ROSETTA_X87_DISABLE_SSE_LEAD=1 — don't form x87 windows at LEADING movsd/movss ahead of a run (R3-2 store-forward seam; bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

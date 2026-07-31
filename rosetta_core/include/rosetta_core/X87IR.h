@@ -173,6 +173,13 @@ enum class Op : uint8_t {
     SseLoad,        // xmm = [mem] (zeroing); inputs[0] = forwarded value
                     // node (raw-f32 for movss) or -1 = load from memory
     SseStore,       // [mem] = xmm low bits (no inputs — vN is the truth)
+    SseGetXmm,      // pure value: the guest xmm's low bits AT THIS POSITION
+                    // (R3-2 — the store-forward entry for an SseStore whose
+                    // xmm content is unknown, e.g. at run entry). Emits
+                    // nothing: the node binds vN like a resident SseLoad;
+                    // the sse_overwrite_xmm copy-out rule applies identically.
+                    // aux: bits[3:0] xmm, bit[4] f32 (raw-f32 value), bit[5]
+                    // copy-out.
 
     // Guest flag DEFINER (opt-in via TRANSPARENT_FLAGS): cmp/test r32/r64
     // with register or immediate rhs, lowered to SUBS/ANDS — the same NZCV

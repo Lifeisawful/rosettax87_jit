@@ -221,9 +221,40 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
                 const uint64_t ops_mask = g_rosetta_config ? g_rosetta_config->disabled_ops_mask : 0;
                 const bool bridge = g_rosetta_config && g_rosetta_config->run_bridge;
                 const bool keepalive = g_rosetta_config && g_rosetta_config->runtime_keepalive;
-                const int run =
+                int run =
                     X87Cache::lookahead(instr_array, num_instrs, insn_idx, ops_mask, bridge,
                                         keepalive);
+                // R3-2: leading scalar-SSE moves ahead of an x87 run. The
+                // window normally starts at the first x87 member, so a
+                // LEADING movsd/movss (the seam idiom `movsd [m],xmm;
+                // fld [m]`) never enters it and the fld pays a store→load
+                // forward. Form the window at the movsd instead: build
+                // consumes the group (SseStore registers an SseGetXmm
+                // store-forward entry when the xmm content is unknown).
+                if (run == 0 && g_rosetta_config &&
+                    g_rosetta_config->transparent_sse &&
+                    !g_rosetta_config->disable_sse_lead) {
+                    const uint16_t op0 = instr_array[insn_idx].opcode();
+                    if (op0 == kOpcodeName_movsd || op0 == kOpcodeName_movss) {
+                        constexpr int kMaxLeadingSse = 4;
+                        int lead = 0;
+                        int64_t j = insn_idx;
+                        while (j < num_instrs && lead < kMaxLeadingSse) {
+                            const uint16_t lop = instr_array[j].opcode();
+                            if (lop != kOpcodeName_movsd &&
+                                lop != kOpcodeName_movss)
+                                break;
+                            j++;
+                            lead++;
+                        }
+                        if (lead > 0) {
+                            const int r2 = X87Cache::lookahead(
+                                instr_array, num_instrs, j, ops_mask, bridge,
+                                keepalive);
+                            if (r2 >= 2) run = lead + r2;
+                        }
+                    }
+                }
                 if (g_rosetta_config && g_rosetta_config->log_run_breaks && run > 0)
                     log_run_break(translation_result, instr_array, num_instrs, insn_idx, run);
                 cache.set_run(run);

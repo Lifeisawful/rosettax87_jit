@@ -1329,41 +1329,53 @@ static IROperandSize sse_mem_size(const IROperand& m) {
     }
 }
 
-// Overwriting guest xmm `k` invalidates mem-CSE entries whose value node is
-// RESIDENT in that register (an SseLoad that actually loaded — a forwarded
-// node lives in a pool FPR and survives).
+// A node whose FPR binding is guest register vN itself: a non-forwarded,
+// non-copy-out SseLoad, or an SseGetXmm snapshot. (Forwarded SseLoads and
+// copy-out nodes live in pool FPRs and survive an overwrite of vN.)
+static bool node_resident_in_xmm(const Context& ctx, int16_t id, int k) {
+    if (id < 0 || id >= ctx.num_nodes) return false;
+    const auto& n = ctx.nodes[id];
+    if (n.op != Op::SseLoad && n.op != Op::SseGetXmm) return false;
+    if (static_cast<int>(n.aux & 0xF) != k) return false;
+    if (n.op == Op::SseLoad && n.inputs[0] >= 0) return false;
+    return !(n.aux & 0x20);
+}
+
+// Overwriting guest xmm `k`:
+//  - evict mem-CSE entries whose value node is RESIDENT in that register
+//    (widened-f32 entries hold a pool copy taken at their own position and
+//    stay valid);
+//  - stale-xmm copy-out: a resident node with a live reference reads the
+//    register at its consumers' emission points — after this overwrite for
+//    epilogue slot values, later consumer nodes, sunk store pairs, and the
+//    f32 raw re-forward through a surviving widened entry. Mark such nodes
+//    (aux bit 5) so the lowering lands the value in a pool FPR at birth.
 static void sse_overwrite_xmm(Context& ctx, int k) {
-    const int16_t v = ctx.xmm_val[k];
-    if (v >= 0 && ctx.nodes[v].op == Op::SseLoad) {
-        int kept = 0;
-        for (int i = 0; i < ctx.mem_cse_count; i++) {
-            if (ctx.mem_cse_val[i] != v) {
-                ctx.mem_cse_op[kept] = ctx.mem_cse_op[i];
-                ctx.mem_cse_kind[kept] = ctx.mem_cse_kind[i];
-                ctx.mem_cse_val[kept] = ctx.mem_cse_val[i];
-                kept++;
-            }
+    int kept = 0;
+    for (int i = 0; i < ctx.mem_cse_count; i++) {
+        if (!node_resident_in_xmm(ctx, ctx.mem_cse_val[i], k)) {
+            ctx.mem_cse_op[kept] = ctx.mem_cse_op[i];
+            ctx.mem_cse_kind[kept] = ctx.mem_cse_kind[i];
+            ctx.mem_cse_val[kept] = ctx.mem_cse_val[i];
+            kept++;
         }
+    }
+    if (kept != ctx.mem_cse_count) {
         ctx.mem_cse_count = static_cast<int8_t>(kept);
         ctx.mem_cse_next = 0;
-        // Stale-xmm fix: the resident node's value IS the guest register,
-        // but a reference that outlives this overwrite reads the register at
-        // ITS OWN emission point — a forwarded fld still on the stack at the
-        // epilogue, a consumer node after this one, a sunk store pair, or
-        // (f32) the widened CSE entry that survives the eviction above and
-        // re-forwards later. Mark the node for copy-out (aux bit 5): the
-        // lowering lands the value in a pool FPR at birth instead of binding
-        // the guest register.
+    }
+    for (int m = 0; m < ctx.num_nodes; m++) {
+        if (!node_resident_in_xmm(ctx, static_cast<int16_t>(m), k)) continue;
         bool referenced = false;
         for (int i = 0; i < ctx.num_nodes && !referenced; i++) {
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             for (int j = 0; j < 3; j++)
-                if (n.inputs[j] == v) { referenced = true; break; }
+                if (n.inputs[j] == m) { referenced = true; break; }
         }
         for (int d = 0; d < 8 && !referenced; d++)
-            if (ctx.slot_val[d] == v) referenced = true;
-        if (referenced) ctx.nodes[v].aux |= 0x20u;
+            if (ctx.slot_val[d] == m) referenced = true;
+        if (referenced) ctx.nodes[m].aux |= 0x20u;
     }
     ctx.xmm_val[k] = -1;
     ctx.xmm_f32_mask &= static_cast<uint16_t>(~(1u << k));
@@ -1436,15 +1448,34 @@ static bool build_sse_mov(Context& ctx, IRInstr* instr, uint16_t op) {
         mem_cse_evict_may_alias(ctx, &dst);
         // Store-forward: when the xmm's current low bits are a known node of
         // the matching width, a later load of this operand forwards to it.
-        const int16_t v = ctx.xmm_val[xmm];
+        // Unknown content (run entry, or width mismatch): the register
+        // ITSELF is the value — synthesize an SseGetXmm snapshot as the
+        // entry (R3-2, the SSE→x87 mirror of OPT-A3). It emits nothing (vN
+        // binding, copy-out on later overwrite) and DSE reaps it unused.
+        int16_t v = ctx.xmm_val[xmm];
         const bool vf32 = (ctx.xmm_f32_mask >> xmm) & 1;
-        if (v >= 0 && vf32 == is_f32) {
-            if (!is_f32) {
-                mem_cse_insert(ctx, &dst, Op::LoadF64, v);
-            } else {
-                const int16_t w = ctx.add_node(Op::CvtF32ToF64, v);
-                if (w >= 0) mem_cse_insert(ctx, &dst, Op::LoadF32Raw, w);
+        if (v < 0 || vf32 != is_f32) {
+            const int16_t g = ctx.add_node(Op::SseGetXmm);
+            if (g < 0) return true;  // node budget — store already emitted
+            ctx.nodes[g].aux =
+                static_cast<uint32_t>(xmm) | (is_f32 ? 0x10u : 0u);
+            if (v < 0) {
+                // Fully unknown: the snapshot becomes the tracked value so
+                // a following same-width SseStore forwards too. On a width
+                // mismatch the tracked view is left alone.
+                ctx.xmm_val[xmm] = g;
+                if (is_f32)
+                    ctx.xmm_f32_mask |= static_cast<uint16_t>(1u << xmm);
+                else
+                    ctx.xmm_f32_mask &= static_cast<uint16_t>(~(1u << xmm));
             }
+            v = g;
+        }
+        if (!is_f32) {
+            mem_cse_insert(ctx, &dst, Op::LoadF64, v);
+        } else {
+            const int16_t w = ctx.add_node(Op::CvtF32ToF64, v);
+            if (w >= 0) mem_cse_insert(ctx, &dst, Op::LoadF32Raw, w);
         }
         return true;
     }

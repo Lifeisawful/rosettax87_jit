@@ -2936,6 +2936,23 @@ void lower(Context& ctx, TranslationResult* result) {
                                    size, /*is_load=*/0, xmm);
             break;
         }
+        case Op::SseGetXmm: {
+            // Snapshot of the guest xmm at this position (R3-2). Plain form
+            // emits nothing — the value IS the register (resident binding,
+            // like SseLoad); the copy-out form (see sse_overwrite_xmm) lands
+            // it in a pool FPR because a reference outlives an overwrite.
+            const int xmm = static_cast<int>(n.aux & 0xF);
+            const bool is_f32 = (n.aux & 0x10) != 0;
+            if (n.aux & 0x20) {
+                const int Dd = alloc_free_fpr(*result);
+                emit_fp_dp1(buf, /*type=*/is_f32 ? 0 : 1, /*FMOV=*/0, Dd, xmm);
+                fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            } else {
+                fprs.node_fpr[i] = static_cast<int8_t>(xmm);
+                fprs.pinned_mask |= 1u << xmm;
+            }
+            break;
+        }
         case Op::GuestStoreI: {
             const int sz = guest_mem_size_log2(n.mem_operand);
             // XZR return for imm==0 encodes as STR WZR — stores zero.
@@ -3791,8 +3808,8 @@ int peak_live_fprs(const Context& ctx) {
                 produces_fpr = true;
                 can_reuse = true;
                 break;
-            case Op::SseLoad:
-                // Resident form lives in the guest register (no pool); the
+            case Op::SseLoad: case Op::SseGetXmm:
+                // Resident forms live in the guest register (no pool); the
                 // copy-out form (stale-xmm fix, aux bit 5) holds a pool FPR.
                 produces_fpr = (n.aux & 0x20) != 0;
                 break;

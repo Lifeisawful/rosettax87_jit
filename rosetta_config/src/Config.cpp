@@ -327,6 +327,10 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_PINNED_DEMAND"))
         cfg.disable_pinned_demand = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: no window formation at leading movsd/movss (R3-2).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_SSE_LEAD"))
+        cfg.disable_sse_lead = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

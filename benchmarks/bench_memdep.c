@@ -331,6 +331,30 @@ static clock_t bench_stp_stream(void) {
     return clock() - start;
 }
 
+/* Leading movsd store ahead of the x87 run (R3-2): the loop body block
+ * starts at the movsd, so window formation must begin THERE for the fld to
+ * forward from the register (SseGetXmm) instead of the store buffer. */
+static clock_t bench_sse_lead(void) {
+    volatile double spill = 0.0;
+    volatile double r;
+    double seed = 0.25;
+    clock_t start = clock();
+    __asm__ volatile (
+        "movsd %2, %%xmm0\n\t"
+        "movl %3, %%ecx\n"
+        "1:\n\t"
+        "movsd %%xmm0, %1\n\t"   /* leading store from a live xmm */
+        "fldl %1\n\t"            /* store-forward target */
+        "fadd %%st(0), %%st(0)\n\t"
+        "fstpl %0\n\t"
+        "movsd %0, %%xmm0\n\t"   /* value flows back through xmm0 —
+                                    loop-carried through the seam */
+        "decl %%ecx\n\t"
+        "jnz 1b\n"
+        : "=m"(r), "+m"(spill) : "m"(seed), "i"(TIMES) : "ecx", "cc", "xmm0");
+    return clock() - start;
+}
+
 int main(void) {
     struct { const char *name; clock_t (*fn)(void); } benches[] = {
         {"acc_st",   bench_acc_st},
@@ -348,6 +372,7 @@ int main(void) {
         {"dec_mid_dead", bench_dec_mid_dead},
         {"stp_reload",   bench_stp_reload},
         {"stp_stream",   bench_stp_stream},
+        {"sse_lead",     bench_sse_lead},
     };
     int n = (int)(sizeof(benches) / sizeof(benches[0]));
     for (int i = 0; i < n; i++) {
