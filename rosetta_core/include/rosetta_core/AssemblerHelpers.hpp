@@ -237,6 +237,8 @@ auto emit_fmov_d_imm8(AssemblerBuffer& buf, int Dd, uint8_t imm8) -> void;
 // AArch64 cond codes: EQ=0 NE=1 CS=2 CC=3 MI=4 PL=5 VS=6 VC=7
 //                     HI=8 LS=9 GE=10 LT=11 GT=12 LE=13
 auto emit_cset(AssemblerBuffer& buf, int is_64bit, int cond, int Rd) -> void;
+auto emit_csinc(AssemblerBuffer& buf, int is_64bit, int cond, int Rd, int Rn,
+                int Rm) -> void;
 
 // FCSEL Dd, Dn, Dm, cond — conditional FP select (f64)
 // Dd = cond ? Dn : Dm

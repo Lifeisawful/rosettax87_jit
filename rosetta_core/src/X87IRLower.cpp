@@ -1048,6 +1048,21 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             // translation of these opcodes produces. The deliberate exception
             // to the flag-free Guest-node rule — redefining guest EFLAGS here
             // IS the instruction's architectural effect (see X87IR.h).
+            if (n.aux & 0x10) {
+                // OPT-PS (plan_test_shortcut): the tested value is the FSTSW
+                // image of the compare whose raw NZCV is still live, and the
+                // mask asks a single FCMP condition. CSET the inverse, then
+                // ANDS #1 — Z = the predicate, N=C=V=0: the exact x86 TEST
+                // flag state for this mask (sign bit of the tested width is
+                // outside every supported mask).
+                const int cond = static_cast<int>((n.aux >> 8) & 0xF);
+                const int Rt = alloc_free_gpr(result);
+                emit_cset(buf, /*is_64bit=*/0, cond ^ 1, Rt);
+                emit_logical_imm(buf, /*is_64bit=*/0, /*ANDS*/3, /*N=*/0,
+                                 /*immr=*/0, /*imms=*/0, Rt, GPR::XZR);
+                free_gpr(result, Rt);
+                break;
+            }
             const int is64 = p.is64 ? 1 : 0;
             const bool is_test = n.aux & 1;
             const int wclass = static_cast<int>((n.aux >> 2) & 3);
@@ -1160,6 +1175,152 @@ static bool carried_key_match(const X87Cache::CarriedBase& c, const IROperand* o
            c.base_reg == op->mem.base_reg &&
            c.index_reg == op->mem.index_reg &&
            c.shift_amount == op->mem.shift_amount;
+}
+
+// ── OPT-PS: predicate shortcut for the fnstsw/test CC-mask idiom ────────────
+//
+// `fcom(p); fnstsw ax; test ax/ah, CCMASK; setcc/jcc` funnels the compare
+// through the packed-CC/AX round trip only to ask a question the raw FCMP
+// NZCV already answers. When the tested register provably still holds the
+// FSTSW image of the LAST compare — the same compare whose raw NZCV is still
+// architecturally live (nzcv_skip: no MRS/MSR restore, and every node
+// in between is NZCV-transparent) — the TEST's entire flag effect collapses
+// to one condition of that FCMP:
+//
+//   mask ⊆ {C0,C2,C3}:  {C0,C2,C3} / {C0,C3} → all-clear ⇔ GT
+//                       {C0,C2} / {C0}       → all-clear ⇔ GE
+//                       {C2}                 → all-clear ⇔ VC (ordered)
+//   ({C3}-containing masks without C0 have no single condition; C1/TOP/low-
+//    byte exception bits are not modeled — any such mask bit disqualifies.)
+//
+// The lowering emits CSET Wt, !cond; ANDS ZR, Wt, #1 — the exact x86 TEST
+// flag state for every liveness-admitted reader: Z = the predicate, N=C=V=0
+// (every supported mask has the tested width's sign bit clear, so SF = 0).
+// Same instruction count as the MOV+TST it replaces, but the dependency on
+// the CC pack and the AX write is gone: the predicate comes straight off the
+// FCMP, and the pack can retire in parallel.
+//
+// Returns the number of GuestCmpF nodes marked (aux bit 4 set, the raw
+// condition in aux[11:8]). Only sound under nzcv_skip — the caller gates.
+
+// Map an AH-relative CC mask (C0=0x01, C2=0x04, C3=0x40) to the AArch64
+// condition that is TRUE exactly when the masked bits are all clear.
+static int test_mask_to_cond(uint32_t m8) {
+    switch (m8) {
+        case 0x45: case 0x41: return 12;  // GT
+        case 0x05: case 0x01: return 10;  // GE
+        case 0x04:            return 7;   // VC (ordered)
+        default:              return -1;
+    }
+}
+
+static void plan_test_shortcut(Context& ctx) {
+    int last_cmp = -1;  // FCmp/FTst whose raw NZCV is architecturally current
+    int ax_owner = -1;  // that compare, as of the FStsw that captured it
+    int ax_reg = -1;    // FStsw dest register still holding the captured image
+
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        switch (n.op) {
+            case Op::FCmp: case Op::FTst:
+                last_cmp = i;
+                break;
+            case Op::FStsw: {
+                const int dest = static_cast<int>(n.aux & 0xF);
+                if (last_cmp >= 0 && n.inputs[0] == last_cmp) {
+                    ax_owner = last_cmp;
+                    ax_reg = dest;
+                } else if (dest == ax_reg) {
+                    ax_reg = -1;  // overwritten with an uncaptured image
+                }
+                break;
+            }
+            case Op::GuestCmpF: {
+                const bool is_test = (n.aux & 1) != 0;
+                const bool reg_rhs = (n.aux & 2) != 0;
+                const int wclass = static_cast<int>((n.aux >> 2) & 3);
+                const GuestPayload p = guest_unpack(n.imm_bits);
+                uint32_t m8 = 0;
+                bool form_ok = false;
+                if (is_test && !reg_rhs && ax_reg >= 0 && p.dst == ax_reg &&
+                    last_cmp >= 0 && ax_owner == last_cmp) {
+                    if (wclass == 3) {  // test AH-class, imm8: already AH-relative
+                        m8 = p.imm;
+                        form_ok = true;
+                    } else if (wclass == 1 || wclass == 0) {
+                        // test r16 / r32 / r64, imm: the mask must touch only
+                        // the CC byte — low bits would read exception flags,
+                        // higher bits untested garbage.
+                        if ((p.imm & ~0x7F00u) == 0) {
+                            m8 = p.imm >> 8;
+                            form_ok = true;
+                        }
+                    }
+                }
+                if (form_ok) {
+                    const int cond = test_mask_to_cond(m8);
+                    if (cond >= 0) {
+                        n.aux |= 0x10u | (static_cast<uint32_t>(cond) << 8);
+                    }
+                }
+                // Either way the cmp/test redefines the live flags: a later
+                // GuestCmpF can no longer read the compare's raw NZCV.
+                last_cmp = -1;
+                break;
+            }
+
+            // Guest-register writers (all NZCV-transparent): invalidate the
+            // captured image when they redefine its register.
+            case Op::GuestMovRR: case Op::GuestMovRI: case Op::GuestExt:
+            case Op::GuestLea: case Op::GuestAluRI: {
+                const GuestPayload p = guest_unpack(n.imm_bits);
+                if (p.dst == ax_reg) ax_reg = -1;
+                break;
+            }
+            case Op::GuestLoad:
+                if (static_cast<int>(n.aux & 0xF) == ax_reg) ax_reg = -1;
+                break;
+            case Op::GuestPop: {
+                const GuestPayload p = guest_unpack(n.imm_bits);
+                if (p.dst == ax_reg || ax_reg == 4) ax_reg = -1;
+                break;
+            }
+            case Op::GuestPushR: case Op::GuestPushI:
+                if (ax_reg == 4) ax_reg = -1;  // RSP writeback
+                break;
+            // Memory-only guest ops: no register writes, no flags.
+            case Op::GuestStoreR: case Op::GuestStoreI: case Op::GuestRmwR:
+                break;
+
+            // NZCV-transparent x87 value/memory nodes (verified against the
+            // emitters: FP arithmetic and FP/int loads-stores touch no flags).
+            case Op::ReadSt:
+            case Op::ConstZero: case Op::ConstOne: case Op::ConstF64:
+            case Op::CvtF32ToF64: case Op::CvtF64ToF32:
+            case Op::FAdd: case Op::FSub: case Op::FMul: case Op::FDiv:
+            case Op::FNMul: case Op::FMAdd: case Op::FMSub: case Op::FNMSub:
+            case Op::FNeg: case Op::FAbs: case Op::FSqrt:
+            case Op::FSinCosProjCos:
+            case Op::LoadF64: case Op::LoadF32Raw:
+            case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+            case Op::StoreF64: case Op::StoreF32Raw:
+            case Op::StoreCW: case Op::LoadCW:
+                break;
+            case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
+                // Truncating stores are a bare FCVTZS+STR; the RC-dispatch
+                // path compares and branches — NZCV is gone.
+                if (!(n.flags & kTruncate)) last_cmp = -1;
+                break;
+
+            default:
+                // FRndInt (RC dispatch), trig/pow calls, FComI, FCSel, and
+                // anything unaudited: assume NZCV and the image are lost.
+                last_cmp = -1;
+                ax_reg = -1;
+                break;
+        }
+    }
 }
 
 // ── x87-state preamble demand ───────────────────────────────────────────────
@@ -1519,6 +1680,12 @@ void lower(Context& ctx, TranslationResult* result) {
         nzcv_hoist = !nzcv_skip && !has_nzcv_user && !has_guest_cmp &&
                      cmp_count >= 2;
     }
+
+    // OPT-PS: only sound under nzcv_skip — that is the proof that no MRS/MSR
+    // restore sits between a compare and the GuestCmpF that would read it.
+    if (nzcv_skip &&
+        !(g_rosetta_config && g_rosetta_config->disable_test_shortcut))
+        plan_test_shortcut(ctx);
 
     // ── FSTSW / epilogue status_word merge ──────────────────────────────────
     // `fcomp; fnstsw ax` — the dominant compare idiom — wrote status_word
@@ -2154,14 +2321,12 @@ void lower(Context& ctx, TranslationResult* result) {
                 int Wd_v = alloc_free_gpr(*result);
                 int Wd_c = alloc_free_gpr(*result);
 
-                emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_z);   // 1 if equal
+                // One flag-reading instruction per x86 flag (see
+                // translate_fcomi): ZF = EQ|UN via CSINC off the C2 value,
+                // !CF = GT|EQ via cset ge.
                 emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);   // 1 if unordered
-                emit_cset(buf, /*is_64bit=*/0, /*CS=*/2, Wd_c);   // 1 if carry set
-
-                // Z_new = Z | V  (equal or unordered → ZF)
-                emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 0, Wd_z, Wd_z);
-                // C_new = C & !V  (carry clear for unordered → CF)
-                emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=invert rhs*/1, /*LSL*/0, Wd_v, 0, Wd_c, Wd_c);
+                emit_csinc(buf, /*is_64bit=*/0, /*NE=*/1, Wd_z, Wd_v, Wd_v);
+                emit_cset(buf, /*is_64bit=*/0, /*GE=*/10, Wd_c);
 
                 // Pack NZCV: bit30=ZF, bit29=CF, bit28=V(PF for FCMOV), bit26=PF
                 emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,

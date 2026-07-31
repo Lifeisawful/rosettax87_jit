@@ -262,6 +262,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_GUEST_CMP"))
         cfg.disable_guest_cmp = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: lower the fnstsw/test CC-mask idiom through the
+    // packed-AX TST instead of a raw-FCMP condition (OPT-PS).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_TEST_SHORTCUT"))
+        cfg.disable_test_shortcut = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

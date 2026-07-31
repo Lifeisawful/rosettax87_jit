@@ -502,6 +502,22 @@ auto emit_cset(AssemblerBuffer& buf, int is_64bit, int cond, int Rd) -> void {
 }
 
 // =============================================================================
+// CSINC Rd, Rn, Rm, cond — Rd = cond ? Rn : Rm + 1
+//
+// Encoding: sf | 0 | 0 | 11010100 | Rm | cond | 0 | 1 | Rn | Rd
+// =============================================================================
+auto emit_csinc(AssemblerBuffer& buf, int is_64bit, int cond, int Rd, int Rn,
+                int Rm) -> void {
+    uint32_t insn = 0x1A800400u;
+    insn |= (uint32_t)(is_64bit & 1) << 31;
+    insn |= (uint32_t)(Rm & 0x1F) << 16;
+    insn |= (uint32_t)(cond & 0xF) << 12;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Rd & 0x1F);
+    buf.emit(insn);
+}
+
+// =============================================================================
 // FCSEL Dd, Dn, Dm, cond — conditional FP select (f64)
 //
 // Encoding: M=0, S=0, 11110, type=01(f64), 1, Rm, cond, 11, Rn, Rd

@@ -131,6 +131,7 @@ struct RosettaConfig {
     uint8_t  disable_trig_sw_sink;   // ROSETTA_X87_DISABLE_TRIG_SW_SINK=1 — keep every trig/pow value call's C1|C2 status_word RMW, even when a later full-halfword writer in the same run makes it dead (bisection lever)
     uint8_t  disable_fcmov_raw;      // ROSETTA_X87_DISABLE_FCMOV_RAW=1 — FCSel reads the packed guest-EFLAGS NZCV installed by FComI's full pack instead of remapped raw FCMP conditions (bisection lever)
     uint8_t  disable_guest_cmp;      // ROSETTA_X87_DISABLE_GUEST_CMP=1 — don't consume cmp/test r32/r64 as in-run guest flag definers (GuestCmpF); the run ends there instead (bisection lever)
+    uint8_t  disable_test_shortcut;  // ROSETTA_X87_DISABLE_TEST_SHORTCUT=1 — lower the fnstsw/test CC-mask idiom through the packed-AX TST instead of a raw-FCMP condition (bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };

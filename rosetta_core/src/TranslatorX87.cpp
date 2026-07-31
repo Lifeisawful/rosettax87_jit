@@ -2426,15 +2426,13 @@ auto translate_fcomi(TranslationResult* a1, IRInstr* a2) -> void {
     const int Wd_v = alloc_free_gpr(*a1);
     const int Wd_c = alloc_free_gpr(*a1);
 
-    // All three CSETs must execute before any MSR clobbers NZCV.
-    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_z);     // 1 if equal
-    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);     // 1 if overflow (unordered)
-    emit_cset(buf, /*is_64bit=*/0, /*CS=*/2, Wd_c);     // 1 if carry set
-
-    // Z_new = Z | V  (EQ or unordered)
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_v, 0, Wd_z, Wd_z);
-    // C_new = C & !V  (carry clear for unordered)
-    emit_logical_shifted_reg(buf, 0, /*AND*/0, /*N=invert*/1, /*LSL*/0, Wd_v, 0, Wd_c, Wd_c);
+    // One flag-reading instruction per x86 flag, no merges (all three must
+    // execute before any MSR clobbers NZCV):
+    //   ZF  = EQ | UN  → csinc ·,vs,vs,ne (EQ: Z=1,V=0 → Wd_v+1; else Wd_v)
+    //   !CF = GT | EQ  → cset ge          (ge ⇔ N==V ⇔ C∧¬V on FCMP output)
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_v);     // 1 if unordered
+    emit_csinc(buf, /*is_64bit=*/0, /*NE=*/1, Wd_z, Wd_v, Wd_v);
+    emit_cset(buf, /*is_64bit=*/0, /*GE=*/10, Wd_c);
 
     // Pack into NZCV format: [31]=N=0, [30]=Z, [29]=C, [28]=V=PF, [26]=PF
     // Two consumers of this NZCV value use different bit positions for the

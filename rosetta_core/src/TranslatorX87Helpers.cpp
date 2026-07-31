@@ -772,31 +772,27 @@ void emit_x87_perm_flush(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp
 //   EQ: N=0, Z=1, C=1, V=0
 //   UN: N=0, Z=0, C=1, V=1
 //
-// x87 CC derivation:
-//   C0 (bit 8)  = CC | VS  = (C==0) | (V==1)   → 1 for LT and UN
-//   C2 (bit 10) = VS       = (V==1)             → 1 for UN only
-//   C3 (bit 14) = EQ | VS  = (Z==1) | (V==1)   → 1 for EQ and UN
+// x87 CC derivation (each in one flag-reading instruction):
+//   C0 (bit 8)  = LT | UN  = cset lt          (lt ⇔ N≠V: LT 1000, UN 0011)
+//   C2 (bit 10) = UN       = cset vs
+//   C3 (bit 14) = EQ | UN  = csinc ·,vs,vs,ne (EQ: Z=1,V=0 → vs+1 = 1;
+//                                              else the C2 value: UN 1, GT/LT 0)
 //
-// All three CSET instructions must execute before MSR restores NZCV.
+// All three NZCV readers must execute before MSR restores NZCV.
 // =============================================================================
 void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
                         int Wd_result, int Wd_save) {
     const int Wd_cc = alloc_free_gpr(a1);
     const int Wd_vs = alloc_free_gpr(a1);
 
-    // Extract individual flag conditions (all 3 must precede MSR)
-    emit_cset(buf, /*is_64bit=*/0, /*CC=*/3, Wd_cc);    // 1 if carry clear (LT)
-    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);    // 1 if overflow (UN)
-    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_result); // 1 if equal
+    // Extract the three CC bits (all must precede MSR)
+    emit_cset(buf, /*is_64bit=*/0, /*LT=*/11, Wd_cc);   // C0 = LT|UN
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);    // C2 = UN
+    emit_csinc(buf, /*is_64bit=*/0, /*NE=*/1, Wd_result, Wd_vs, Wd_vs);  // C3 = EQ|UN
 
-    // MSR NZCV, Wd_save — restore saved x86 EFLAGS (all CSETs done)
+    // MSR NZCV, Wd_save — restore saved x86 EFLAGS (all NZCV reads done)
     emit_msr_nzcv(buf, Wd_save);
     free_gpr(a1, Wd_save);
-
-    // C0 = CC | VS
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_cc, Wd_cc);
-    // C3 = EQ | VS
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_result, Wd_result);
 
     // Pack: Wd_result = (C0 << 8) | (C2 << 10) | (C3 << 14)
     // Step 1: C0 << 8
@@ -821,14 +817,9 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
     const int Wd_cc = alloc_free_gpr(a1);
     const int Wd_vs = alloc_free_gpr(a1);
 
-    emit_cset(buf, /*is_64bit=*/0, /*CC=*/3, Wd_cc);     // 1 if carry clear (LT)
-    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);     // 1 if overflow (UN)
-    emit_cset(buf, /*is_64bit=*/0, /*EQ=*/0, Wd_result); // 1 if equal
-
-    // C0 = CC | VS
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_cc, Wd_cc);
-    // C3 = EQ | VS
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 0, Wd_result, Wd_result);
+    emit_cset(buf, /*is_64bit=*/0, /*LT=*/11, Wd_cc);   // C0 = LT|UN
+    emit_cset(buf, /*is_64bit=*/0, /*VS=*/6, Wd_vs);    // C2 = UN
+    emit_csinc(buf, /*is_64bit=*/0, /*NE=*/1, Wd_result, Wd_vs, Wd_vs);  // C3 = EQ|UN
 
     // Pack: Wd_result = (C0 << 8) | (C2 << 10) | (C3 << 14)
     emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
