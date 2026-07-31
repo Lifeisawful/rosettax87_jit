@@ -2008,7 +2008,8 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             case kOpcodeName_fxch: {
                 // Rosetta encodes FXCH as [ST(0), ST(i)] — target depth is operands[1].
                 int depth = instr->operands[1].reg.reg.index();
-                if (depth <= 0 || depth >= 8) { ok = false; break; }
+                if (depth == 0) break;  // fxch st(0): architectural no-op
+                if (depth < 0 || depth >= 8) { ok = false; break; }
                 // Force-resolve both slots so the epilogue can track the swap.
                 // Without this, two unresolved initial slots (val < 0) would be
                 // swapped symbolically but the epilogue would skip both stores.

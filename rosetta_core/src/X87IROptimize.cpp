@@ -271,6 +271,11 @@ static void pass_const_arith(Context& ctx) {
             } else if (n.op == Op::FAdd &&
                        const_is(ctx, n.inputs[1], /*alias_op=*/-1, kMZeroBits)) {
                 keep = n.inputs[0]; cidx = n.inputs[1];
+            } else if (n.op == Op::FAdd &&
+                       const_is(ctx, n.inputs[0], /*alias_op=*/-1, kMZeroBits)) {
+                // Commuted form (fld -0.0 first): exact by the same
+                // round-to-nearest signed-zero argument.
+                keep = n.inputs[1]; cidx = n.inputs[0];
             }
             if (keep >= 0) {
                 fold_to(static_cast<int16_t>(i), keep, cidx);
