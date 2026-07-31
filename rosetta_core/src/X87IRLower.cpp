@@ -1147,6 +1147,10 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             // translation of these opcodes produces. The deliberate exception
             // to the flag-free Guest-node rule — redefining guest EFLAGS here
             // IS the instruction's architectural effect (see X87IR.h).
+            // aux bit 5 (test only): append CFINV — x86 TEST defines CF=0,
+            // and the stored guest convention is C = ¬CF, so a live/consumed
+            // C-reader needs C=1 where ANDS left 0 (see build_guest_cmp).
+            const bool cf_fix = (n.aux & 0x20) != 0;
             if (n.aux & 0x10) {
                 // OPT-PS (plan_test_shortcut): the tested value is the FSTSW
                 // image of the compare whose raw NZCV is still live, and the
@@ -1169,6 +1173,7 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                     emit_ccmn_imm(buf, /*is_64bit=*/0, GPR::XZR, /*imm5=*/0,
                                   /*nzcv=*/0, cond);
                 }
+                if (cf_fix) emit_cfinv(buf);
                 break;
             }
             const int is64 = p.is64 ? 1 : 0;
@@ -1192,6 +1197,7 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                                          p.dst, static_cast<int8_t>(lhs_shift),
                                          Rt, GPR::XZR);
                 free_gpr(result, Rt);
+                if (cf_fix) emit_cfinv(buf);
                 break;
             }
             if (n.aux & 2) {  // register rhs
@@ -1202,6 +1208,7 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                     emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/1, /*S=*/1,
                                              /*LSL*/0, p.src, 0, p.dst,
                                              GPR::XZR);
+                if (cf_fix) emit_cfinv(buf);
                 break;
             }
             // Immediate rhs; r64 forms sign-extend the imm32 (x86 semantics).
@@ -1222,6 +1229,7 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                                              Rt, 0, p.dst, GPR::XZR);
                     free_gpr(result, Rt);
                 }
+                if (cf_fix) emit_cfinv(buf);
             } else {
                 // CMP #imm / CMN #-imm are flag-exact aliases of the x86
                 // subtraction for either sign (same addition, same NZCV).
@@ -1241,6 +1249,30 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                                              /*LSL*/0, Rt, 0, p.dst, GPR::XZR);
                     free_gpr(result, Rt);
                 }
+            }
+            break;
+        }
+        case Op::GuestSetcc: {
+            // cls: 0=r8lo, 1=r8hi (AH class), 2=r16 (fused movzx), 3=r32/64
+            // full write. The condition was resolved against the producing
+            // GuestCmpF at build time (guest_setcc_cond); CSET reads NZCV
+            // and writes none, so the flag state stays live for chained
+            // setccs and the post-run guest. Partial widths merge into the
+            // X register (upper bits preserved — x86 semantics); the full
+            // form is a bare CSET Wd, whose zero-extend IS the movzx.
+            const int cond = static_cast<int>(p.imm & 0xF);
+            if (p.cls == 3) {
+                emit_cset(buf, /*is_64bit=*/0, cond, p.dst);
+            } else {
+                const int lsb = (p.cls == 1) ? 8 : 0;
+                const int width = (p.cls == 2) ? 16 : 8;
+                const int Rt = alloc_free_gpr(result);
+                emit_cset(buf, /*is_64bit=*/0, cond, Rt);
+                // BFXIL Xdst,Xt,#0,#width / BFI Xdst,Xt,#8,#8 (AH class)
+                emit_bitfield(buf, /*sf=*/1, /*BFM*/1, /*N=*/1,
+                              static_cast<int8_t>((64 - lsb) & 63),
+                              static_cast<int8_t>(width - 1), Rt, p.dst);
+                free_gpr(result, Rt);
             }
             break;
         }
@@ -1375,6 +1407,14 @@ static void plan_test_shortcut(Context& ctx) {
                 // Either way the cmp/test redefines the live flags: a later
                 // GuestCmpF can no longer read the compare's raw NZCV.
                 last_cmp = -1;
+                break;
+            }
+
+            // setcc: reads NZCV (writes none — last_cmp is untouched), but
+            // its byte write into the captured image's register stales it.
+            case Op::GuestSetcc: {
+                const GuestPayload p = guest_unpack(n.imm_bits);
+                if (p.dst == ax_reg) ax_reg = -1;
                 break;
             }
 
@@ -2766,6 +2806,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::GuestPushI:
         case Op::GuestPop:
         case Op::GuestCmpF:
+        case Op::GuestSetcc:
             emit_guest_node(*result, buf, n);
             break;
 
@@ -3579,6 +3620,13 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
 
         // cmp/test: one scratch when the immediate fits no SUBS/ANDS form.
         case Op::GuestCmpF:
+            transient = 1;
+            break;
+
+        // setcc: one scratch for the CSET on the partial-width merge forms
+        // (the full-width form writes the guest GPR directly — charge 1
+        // uniformly, safe direction).
+        case Op::GuestSetcc:
             transient = 1;
             break;
         }

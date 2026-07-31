@@ -548,6 +548,14 @@ auto emit_fccmp_f64(AssemblerBuffer& buf, int Dn, int Dm, int nzcv, int cond) ->
 }
 
 // =============================================================================
+// CFINV — invert PSTATE.C (ARMv8.4 FlagM; Rosetta itself emits it after its
+// ADDS translations to keep the stored guest convention C = ¬CF).
+// =============================================================================
+auto emit_cfinv(AssemblerBuffer& buf) -> void {
+    buf.emit(0xD500401Fu);
+}
+
+// =============================================================================
 // CCMN Rn, #imm5, #nzcv, cond — if cond holds, NZCV = flags of (Rn + imm5);
 // else NZCV = #nzcv.
 // Encoding (conditional compare immediate, op=0 for CCMN):

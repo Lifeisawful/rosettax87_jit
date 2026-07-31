@@ -142,6 +142,7 @@ struct RosettaConfig {
     uint8_t  backedge_noop_probe;    // ROSETTA_X87_BACKEDGE_NOOP_PROBE=1 — rewrite every backward conditional-branch word in the post-translate hook with its own value (OPT-BE stage 0 G0.2: buffer writability, must be a byte-identical no-op)
     uint8_t  disable_backedge;       // ROSETTA_X87_DISABLE_BACKEDGE=1 — don't retarget self-loop back edges past the priming st[] load in decode-verified accumulator blocks (OPT-BE; bisection lever)
     uint8_t  disable_test_ccmn;      // ROSETTA_X87_DISABLE_TEST_CCMN=1 — lower the OPT-PS raw-FCMP test shortcut through the two-insn CSET+ANDS pair instead of one integer CCMN (bisection lever)
+    uint8_t  disable_guest_setcc;    // ROSETTA_X87_DISABLE_GUEST_SETCC=1 — don't consume setcc r8 after an in-run cmp/test (GuestSetcc), and don't absorb the trailing `test; setcc [; movzx]` compare tail (bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
@@ -149,7 +150,8 @@ struct RosettaConfig {
 // size, 0x28 → 0x30 when the 25th (disable_fyl2x_val) crossed again,
 // 0x30 → 0x38 when the 33rd (transparent_flags) crossed again,
 // 0x38 → 0x40 when the 41st (disable_x18_state) crossed again, and
-// 0x40 → 0x48 when the 49th (disable_test_ccmn) crossed again.
+// 0x40 → 0x48 when the 49th (disable_test_ccmn) crossed again
+// (the 50th, disable_guest_setcc, fits the same size).
 // The loader writes this struct into the runtime's __DATA,config by
 // sizeof — both sides compile from this header, so they stay in sync as long
 // as loader and runtime dylib come from the same build.

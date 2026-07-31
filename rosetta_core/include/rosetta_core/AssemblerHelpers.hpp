@@ -253,6 +253,9 @@ auto emit_fccmp_f64(AssemblerBuffer& buf, int Dn, int Dm, int nzcv, int cond) ->
 auto emit_ccmn_imm(AssemblerBuffer& buf, int is_64bit, int Rn, int imm5,
                    int nzcv, int cond) -> void;
 
+// CFINV — invert PSTATE.C (ARMv8.4 FlagM)
+auto emit_cfinv(AssemblerBuffer& buf) -> void;
+
 // FCMP Dn, #0.0 — compare FP register against zero, sets NZCV
 auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void;
 

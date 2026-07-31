@@ -173,21 +173,21 @@ static uint32_t sign_pack_shape(const float *v /* [3] */, float bias) {
 static uint32_t alu_imm_chain(uint32_t x, double *d) {
     uint32_t r = x;
     __asm__ volatile(
-        "fldl (%2)\n"
+        "fldl (%1)\n"
         "addl $-7, %0\n"
         "fabs\n"
         "subl $0x12345, %0\n"
         "fchs\n"
         "shll $4, %0\n"
-        "fldl 8(%2)\n"
+        "fldl 8(%1)\n"
         "sarl $2, %0\n"
         "faddp\n"
         "shrl $33, %0\n"
-        "fstpl (%2)\n"
+        "fstpl (%1)\n"
         "andl $0xFFFFFFF0, %0\n"
-        "fldl 8(%2)\n"
+        "fldl 8(%1)\n"
         "xorl $0x0F0F0F0F, %0\n"
-        "fstpl 8(%2)\n"
+        "fstpl 8(%1)\n"
         "testl %0, %0\n"
         : "+r"(r) : "r"(d) : "memory", "cc");
     return r;
@@ -197,12 +197,12 @@ static uint32_t alu_imm_chain(uint32_t x, double *d) {
 static uint64_t alu64_forms(uint64_t x, uint64_t *m, double *d) {
     uint64_t r = x;
     __asm__ volatile(
-        "fldl (%3)\n"
+        "fldl (%2)\n"
         "andq $-16, %0\n"
         "fchs\n"
         "addq $5, %0\n"
-        "orq %0, (%2)\n"
-        "fstpl (%3)\n"
+        "orq %0, (%1)\n"
+        "fstpl (%2)\n"
         "testq %0, %0\n"
         : "+r"(r) : "r"(m), "r"(d) : "memory", "cc");
     return r;
@@ -268,10 +268,10 @@ static uint32_t flags_live_shr_carry(double *a) {
 static uint32_t nonencodable_and(uint32_t x, double *a) {
     uint32_t r = x;
     __asm__ volatile(
-        "fldl (%2)\n"
+        "fldl (%1)\n"
         "andl $0x12345678, %0\n"
         "fchs\n"
-        "fstpl (%2)\n"
+        "fstpl (%1)\n"
         "testl %0, %0\n"
         : "+r"(r) : "r"(a) : "memory", "cc");
     return r;
@@ -284,17 +284,17 @@ static uint32_t nonencodable_and(uint32_t x, double *a) {
 static uint32_t unary_chain(uint32_t x, double *d) {
     uint32_t r = x;
     __asm__ volatile(
-        "fldl (%2)\n"
+        "fldl (%1)\n"
         "incl %0\n"
         "fabs\n"
         "decl %0\n"
         "fchs\n"
         "negl %0\n"
-        "fldl 8(%2)\n"
+        "fldl 8(%1)\n"
         "notl %0\n"
         "faddp\n"
         "incl %0\n"
-        "fstpl (%2)\n"
+        "fstpl (%1)\n"
         "testl %0, %0\n"
         : "+r"(r) : "r"(d) : "memory", "cc");
     return r;
@@ -344,6 +344,146 @@ static uint32_t inc_mem_declines(double *a) {
         "testl $1, %0\n"
         : "+m"(m) : "r"(a) : "memory", "cc");
     return m;
+}
+
+/* ── Stage 4: setcc consumption (GuestSetcc, R3-11) ─────────────────────── */
+
+/* The classic trailing compare tail: `fcomp; fnstsw; test; setz; movzx`.
+ * test+setz absorb after the run (movzx ax,al fuses into the setcc width);
+ * with the OPT-PS shortcut the predicate rides the raw FCMP. */
+static uint32_t fnstsw_test_setz(double a, double b) {
+    uint16_t r;
+    __asm__ volatile(
+        "fldl %1\n"
+        "fcompl %2\n"
+        "fnstsw %%ax\n"
+        "testw $0x4500, %%ax\n"
+        "setz %%al\n"
+        "movzbw %%al, %%ax\n"
+        "movw %%ax, %0\n"
+        : "=m"(r) : "m"(a), "m"(b) : "ax", "cc");
+    return r;   /* 1 iff a > b (ordered) */
+}
+
+/* Same tail with a full-width movzx (cls 3 fusion: RAX[63:32] zeroed) and a
+ * mask outside the OPT-PS table (C3 alone) — covers the non-shortcut
+ * GuestSetcc path off the real shifted-ANDS state. */
+static uint64_t fnstsw_setz_movzx32(double a, double b) {
+    uint64_t r;
+    __asm__ volatile(
+        "movq $0x00DEADBEEF000000, %%rax\n"
+        "fldl %1\n"
+        "fcompl %2\n"
+        "fnstsw %%ax\n"
+        "testw $0x4000, %%ax\n"   /* C3: equality bit */
+        "setz %%al\n"
+        "movzbl %%al, %%eax\n"
+        "movq %%rax, %0\n"
+        : "=r"(r) : "m"(a), "m"(b) : "rax", "cc");
+    return r;   /* 1 iff a != b (C3 clear), upper 56 bits zeroed */
+}
+
+/* Mid-run cmp producer, unsigned conditions (setb = inverted borrow → CC,
+ * seta → HI). The trailing test kills the block-end all-live seed so the
+ * cmp's PF/AF gate passes. */
+static uint32_t cmp_setb_seta_midrun(uint32_t x, double *d) {
+    uint32_t r1 = 0, r2 = 0;
+    __asm__ volatile(
+        "fldl (%3)\n"
+        "cmpl $5, %2\n"
+        "setb %%al\n"
+        "seta %%cl\n"          /* chained: same cmp's flags */
+        "fchs\n"
+        "fstpl (%3)\n"
+        "movzbl %%al, %0\n"
+        "movzbl %%cl, %1\n"
+        "testl %0, %0\n"
+        : "=r"(r1), "=r"(r2) : "r"(x), "r"(d)
+        : "eax", "ecx", "memory", "cc");
+    return (r1 << 4) | r2;
+}
+
+/* Mid-run cmp producer, signed conditions (setl → LT, setg → GT). */
+static uint32_t cmp_setl_setg_midrun(int32_t x, double *d) {
+    uint32_t r1 = 0, r2 = 0;
+    __asm__ volatile(
+        "fldl (%3)\n"
+        "cmpl $-2, %2\n"
+        "setl %%al\n"
+        "setg %%cl\n"
+        "fchs\n"
+        "fstpl (%3)\n"
+        "movzbl %%al, %0\n"
+        "movzbl %%cl, %1\n"
+        "testl %0, %0\n"
+        : "=r"(r1), "=r"(r2) : "r"(x), "r"(d)
+        : "eax", "ecx", "memory", "cc");
+    return (r1 << 4) | r2;
+}
+
+/* AH-class destination: the BFI #8,#8 path must write only bits [15:8]. */
+static uint32_t cmp_sete_ah(uint32_t x, double *d) {
+    uint32_t r;
+    __asm__ volatile(
+        "movl $0xAABBCCDD, %%eax\n"
+        "fldl (%2)\n"
+        "cmpl $7, %1\n"
+        "sete %%ah\n"
+        "fchs\n"
+        "fstpl (%2)\n"
+        "movl %%eax, %0\n"
+        "testl %0, %0\n"
+        : "=r"(r) : "r"(x), "r"(d) : "eax", "memory", "cc");
+    return r;   /* 0xAABB01DD when x==7, 0xAABB00DD otherwise */
+}
+
+/* setb after TEST: x86 CF=0 always. The consumed form must install the
+ * ¬CF convention (ANDS leaves C=0 → CFINV → C=1) so the b reading is 0
+ * whether the setb is consumed (cond CC) or bridged (Rosetta's generic
+ * setb reads convention carry). Regression guard for the CFINV fix. */
+static uint32_t test_setb_reads_zero(uint32_t x, double *d) {
+    uint32_t r;
+    __asm__ volatile(
+        "fldl (%2)\n"
+        "testl $255, %1\n"
+        "setb %%al\n"          /* x86: CF=0 after test → always 0 */
+        "fchs\n"
+        "fstpl (%2)\n"
+        "movzbl %%al, %0\n"
+        "testl %0, %0\n"
+        : "=r"(r) : "r"(x), "r"(d) : "eax", "memory", "cc");
+    return r;
+}
+
+/* seta after TEST (a = !CF && !ZF = !ZF): post-CFINV HI = C && !Z = !Z. */
+static uint32_t test_seta(uint32_t x, double *d) {
+    uint32_t r;
+    __asm__ volatile(
+        "fldl (%2)\n"
+        "testl $255, %1\n"
+        "seta %%al\n"
+        "fchs\n"
+        "fstpl (%2)\n"
+        "movzbl %%al, %0\n"
+        "testl %0, %0\n"
+        : "=r"(r) : "r"(x), "r"(d) : "eax", "memory", "cc");
+    return r;   /* 1 iff (x & 255) != 0 */
+}
+
+/* fcmovb after a consumed test: CF=0 architecturally, so the fcmov must
+ * NOT move — requires the producer's CFINV (the fcmov's C read is not in
+ * Rosetta's integer flag-liveness, so build_fcmov forces the bit). */
+static double test_fcmovb_nomove(double a, double b) {
+    double r;
+    __asm__ volatile(
+        "fldl %2\n"            /* st1 = b */
+        "fldl %1\n"            /* st0 = a */
+        "testl $1, %%eax\n"
+        "fcmovb %%st(1), %%st\n"   /* CF=0 → keep a */
+        "fstpl %0\n"
+        "fstp %%st(0)\n"
+        : "=m"(r) : "m"(a), "m"(b) : "eax", "cc", "st", "st(1)");
+    return r;   /* always a */
 }
 
 int main(void) {
@@ -445,8 +585,29 @@ int main(void) {
         check_u("  (fchs applied)", dv == -1.0, 1);
     }
 
+    /* ── Stage 4: setcc consumption ── */
+    check_u("fnstsw/test/setz tail: 1 > 0.5 (gt)", fnstsw_test_setz(1.0, 0.5), 1);
+    check_u("fnstsw/test/setz tail: 1 < 5 (not gt)", fnstsw_test_setz(1.0, 5.0), 0);
+    check_u("fnstsw/setz/movzx32: unequal", fnstsw_setz_movzx32(1.0, 5.0), 1);
+    check_u("fnstsw/setz/movzx32: equal", fnstsw_setz_movzx32(2.0, 2.0), 0);
+    {
+        double dv = 3.0;
+        check_u("cmp; setb/seta mid-run (3 vs 5)", cmp_setb_seta_midrun(3, &dv), 0x10);
+        check_u("cmp; setb/seta mid-run (9 vs 5)", cmp_setb_seta_midrun(9, &dv), 0x01);
+        check_u("cmp; setb/seta mid-run (5 vs 5)", cmp_setb_seta_midrun(5, &dv), 0x00);
+        check_u("  (fp net intact)", dv == -3.0, 1);  /* 3 fchs → odd count */
+        check_u("cmp; setl/setg mid-run (-5 vs -2)", cmp_setl_setg_midrun(-5, &dv), 0x10);
+        check_u("cmp; setl/setg mid-run (0 vs -2)", cmp_setl_setg_midrun(0, &dv), 0x01);
+        check_u("sete %ah writes only [15:8] (eq)", cmp_sete_ah(7, &dv), 0xAABB01DD);
+        check_u("sete %ah writes only [15:8] (ne)", cmp_sete_ah(8, &dv), 0xAABB00DD);
+        check_u("setb after test reads 0 (CFINV)", test_setb_reads_zero(3, &dv), 0);
+        check_u("seta after test (nonzero)", test_seta(3, &dv), 1);
+        check_u("seta after test (zero)", test_seta(256, &dv), 0);
+        check_u("fcmovb after test: no move", test_fcmovb_nomove(1.5, 9.5) == 1.5, 1);
+    }
+
     if (failures == 0)
-        printf("ALL TESTS PASSED (33 tests)\n");
+        printf("ALL TESTS PASSED (49 tests)\n");
     else
         printf("%d TESTS FAILED\n", failures);
     return failures != 0;

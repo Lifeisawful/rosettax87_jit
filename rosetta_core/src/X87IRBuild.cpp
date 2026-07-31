@@ -5,6 +5,7 @@
 #include "rosetta_config/Config.h"
 #include "rosetta_core/AssemblerHelpers.hpp"
 #include "rosetta_core/CoreConfig.h"
+#include "rosetta_core/CoreLog.h"
 #include "rosetta_core/IRInstr.h"
 #include "rosetta_core/IROperand.h"
 #include "rosetta_core/Opcode.h"
@@ -622,6 +623,11 @@ static bool build_fcomi(Context& ctx, IRInstr* instr, bool is_popping) {
 
 // ── FCMOV family (conditional move to ST(0)) ────────────────────────────────
 
+// Conditions that read PSTATE.C: CS, CC, HI, LS.
+static bool cond_reads_carry(int cond) {
+    return cond == 2 || cond == 3 || cond == 8 || cond == 9;
+}
+
 static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
     // Safety: FCMOV reads NZCV. Admissible when a prior node in THIS run
     // installed known guest flags — an FComI, or a consumed guest cmp/test
@@ -629,6 +635,15 @@ static bool build_fcmov(Context& ctx, IRInstr* instr, int aarch64_cond) {
     // after cmp). Whichever is later owns the flags; plan_fcomi_raw resolves
     // which convention the FCSel condition reads. No definer → bail.
     if (ctx.last_fcomi < 0 && ctx.last_guest_flagdef < 0) return false;
+
+    // C-reading conditions against a consumed TEST producer need the ¬CF
+    // convention state (see build_guest_cmp's CFINV note) — force the bit.
+    // Rosetta's flag-liveness only covers integer consumers, so an fcmovcc
+    // read may not have made CF live at the test.
+    if (ctx.last_guest_flagdef > ctx.last_fcomi &&
+        (ctx.nodes[ctx.last_guest_flagdef].aux & 1) != 0 &&
+        cond_reads_carry(aarch64_cond))
+        ctx.nodes[ctx.last_guest_flagdef].aux |= 0x20u;
 
     int16_t st0 = ctx.resolve(0);
     if (st0 < 0) return false;
@@ -967,8 +982,10 @@ static bool build_guest_pushpop(Context& ctx, IRInstr* instr, uint16_t op) {
 // NZCV Rosetta's own translation of cmp/test leaves, so downstream readers
 // (an in-run FCSel via build_fcmov's relaxed gate, or post-run jcc/setcc)
 // see correct guest state. What NZCV cannot carry is gated dead via
-// flag_liveness: PF always (no NZCV slot), and AF for cmp (cmp defines AF
-// architecturally; test leaves it undefined, so no correct reader exists).
+// flag_liveness: PF always (no NZCV slot), AF for cmp (cmp defines AF
+// architecturally; test leaves it undefined, so no correct reader exists),
+// and CF for test (ANDS leaves C=0 where the ¬CF convention wants 1 — see
+// the gate below).
 //
 // Form restrictions: register lhs, register or non-fixup immediate rhs,
 // 32/64-bit only (8/16-bit flags come from partial-width results — the
@@ -981,6 +998,18 @@ static bool build_guest_cmp(Context& ctx, IRInstr* instr, uint16_t op) {
     const uint8_t unmaterialized =
         is_test ? FLAG_PF : static_cast<uint8_t>(FLAG_PF | FLAG_AF);
     if (instr->flag_liveness & unmaterialized) return false;
+    // CF convention fix for test: Rosetta's stored guest convention keeps
+    // C = ¬CF (SUBS leaves it naturally; its ADDS translations append
+    // CFINV). x86 TEST defines CF=0, but ANDS leaves C=0 — the INVERTED
+    // convention value. Rosetta's own `tst` leaves the same state and gets
+    // away with it by statically resolving every C-reader against the
+    // producer; a consumed test hides the producer, so a post-run C-reader
+    // (setb/jb) would read inverted carry. When CF is live out of the test,
+    // the lowering appends one CFINV (aux bit 5) — C becomes 1 = ¬CF,
+    // convention-true. In-run C-readers (fcmovcc, consumed setcc) force the
+    // same bit regardless of liveness, which Rosetta computes only for
+    // integer consumers.
+    const bool cf_fix = is_test && (instr->flag_liveness & FLAG_CF) != 0;
 
     const IROperand& lhs = instr->operands[0];
     const IROperand& rhs = instr->operands[1];
@@ -1037,8 +1066,88 @@ static bool build_guest_cmp(Context& ctx, IRInstr* instr, uint16_t op) {
     auto id = ctx.add_node(Op::GuestCmpF);
     if (id < 0) return false;
     ctx.nodes[id].imm_bits = guest_pack(p);
-    ctx.nodes[id].aux = (is_test ? 1u : 0u) | (reg_rhs ? 2u : 0u) | (wclass << 2);
+    ctx.nodes[id].aux = (is_test ? 1u : 0u) | (reg_rhs ? 2u : 0u) |
+                        (wclass << 2) | (cf_fix ? 0x20u : 0u);
     ctx.last_guest_flagdef = id;
+    return true;
+}
+
+// ── Guest flag consumer: setcc r8 (TRANSPARENT_FLAGS tier, R3-11) ──────────
+//
+// Consumes the x86 condition against the in-run GuestCmpF's NZCV — one CSET
+// instead of Rosetta's packed materialization, and (for the fnstsw idiom)
+// the predicate rides the OPT-PS shortcut straight off the raw FCMP.
+//
+// The AArch64 condition is resolved against the PRODUCER at build time,
+// mirroring how a per-producer static translator resolves flag consumers:
+//   cmp  (SUBS — C is the inverted x86 borrow, Rosetta's own convention):
+//        full map; p/np decline (parity has no NZCV slot).
+//   test (ANDS [+CFINV], V=0 while x86 defines CF=0, OF=0): Z/N/V-based
+//        conditions map directly (the tested width's sign bit lands in N via
+//        the shifted ANDS forms, and V=0=OF makes the signed ones exact);
+//        the C-reading b/ae/be/a map through the convention (C=¬CF=1) and
+//        REQUIRE the producer's CFINV bit — build_guest_setcc forces it.
+//        The OPT-PS shortcut state (Z=predicate, N=C=V=0, same CFINV
+//        treatment) equals the real ANDS state for every supported mask
+//        (sign bit outside the mask), so a build-resolved condition stays
+//        correct whether or not the shortcut fires at lowering.
+static constexpr int8_t kSetccCondCmp[16] = {
+    //  o   no   b   ae   e   ne   be   a    s   ns   p   np    l   ge   le   g
+        6,   7,  3,   2,  0,   1,   9,  8,   4,   5, -1,  -1,  11,  10,  13, 12};
+static constexpr int8_t kSetccCondTest[16] = {
+        6,   7,  3,   2,  0,   1,   9,  8,   4,   5, -1,  -1,  11,  10,  13, 12};
+
+static int guest_setcc_cond(uint8_t cc, bool producer_is_test) {
+    if (cc >= 16) return -1;
+    return producer_is_test ? kSetccCondTest[cc] : kSetccCondCmp[cc];
+}
+
+// Form + condition admissibility. Shared with the trailing-tail absorb,
+// which must validate the setcc BEFORE consuming its test (a bare absorbed
+// test is the measured-regression shape the lookahead note warns about).
+static bool guest_setcc_admissible(const IRInstr* instr, bool producer_is_test) {
+    if (instr->num_operands < 2) return false;
+    const IROperand& c = instr->operands[0];
+    const IROperand& d = instr->operands[1];
+    if (c.kind != IROperandKind::ConditionCode) return false;
+    if (d.kind != IROperandKind::Register || !d.reg.reg.is_gpr()) return false;
+    if (d.reg.size != IROperandSize::S8) return false;
+    // Register-byte class nibble: 0x0X = low byte, 0x1X = AH/CH/DH/BH.
+    if ((d.reg.reg.value & 0xF0) > 0x10) return false;
+    return guest_setcc_cond(c.cc.cc, producer_is_test) >= 0;
+}
+
+static bool build_guest_setcc(Context& ctx, IRInstr* instr) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
+    if (g_rosetta_config->disable_guest_setcc) return false;
+    // Producer discipline: every node after the GuestCmpF must be another
+    // GuestSetcc (setcc chains off one test are common) — CSET writes no
+    // flags and nothing else may sit between, so the producer's NZCV is
+    // physically current when this one reads it.
+    const int fd = ctx.last_guest_flagdef;
+    if (fd < 0) return false;
+    for (int i = fd + 1; i < ctx.num_nodes; i++)
+        if (ctx.nodes[i].op != Op::GuestSetcc) return false;
+    const bool producer_is_test = (ctx.nodes[fd].aux & 1) != 0;
+    if (!guest_setcc_admissible(instr, producer_is_test)) return false;
+
+    const IROperand& d = instr->operands[1];
+    GuestPayload p = {};
+    p.dst = d.reg.reg.index();
+    p.cls = ((d.reg.reg.value & 0xF0) == 0x10) ? 1 : 0;
+    p.imm = static_cast<uint32_t>(
+        guest_setcc_cond(instr->operands[0].cc.cc, producer_is_test));
+    // C-reading conditions after a test are resolved against the ¬CF
+    // convention — force the producer's CFINV regardless of liveness.
+    if (producer_is_test && cond_reads_carry(static_cast<int>(p.imm)))
+        ctx.nodes[fd].aux |= 0x20u;
+    auto id = ctx.add_node(Op::GuestSetcc);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    // The dst register is redefined: cached loads addressed through it now
+    // point at a different location, and it may not serve as a cached base.
+    ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+    mem_cse_evict_reg(ctx, p.dst);
     return true;
 }
 
@@ -1903,6 +2012,11 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ok = build_guest_cmp(ctx, instr, op);
                 break;
 
+            // ── Guest flag consumer: setcc r8 (FLAGS tier, R3-11) ───────
+            case kOpcodeName_setcc:
+                ok = build_guest_setcc(ctx, instr);
+                break;
+
             // ── push/pop (opt-in TRANSPARENT_PUSHPOP) ───────────────────
             case kOpcodeName_push:
             case kOpcodeName_pushd:
@@ -1929,7 +2043,8 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
     // instructions are IR-internal and only extend ctx.consumed), and the
     // decline path is unchanged: if the run itself failed to build, nothing
     // is absorbed.
-    if (ctx.consumed == run_length) {
+    const bool run_complete = ctx.consumed == run_length;
+    if (run_complete) {
         constexpr int kMaxTrailingSse = 4;
         for (int t = 0; t < kMaxTrailingSse; t++) {
             const int64_t idx = start_idx + ctx.consumed;
@@ -1939,6 +2054,66 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             if (top != kOpcodeName_movsd && top != kOpcodeName_movss) break;
             if (!build_sse_mov(ctx, tail, top)) break;
             ctx.consumed++;
+        }
+    }
+
+    // R3-11: absorb a TRAILING `test/cmp; setcc [; movzx]` compare tail.
+    // X87Cache::lookahead never counts a trailing cmp/test, and consuming
+    // the test ALONE was measured a regression (duplicated into both dual
+    // bodies for zero structural gain — see the lookahead note). A setcc
+    // consumer flips the economics: the predicate resolves as one CSET off
+    // the producer's NZCV instead of Rosetta's packed-AX materialization
+    // (mov+tst+cset+bfxil+uxtb+bfxil), and for the fnstsw idiom the OPT-PS
+    // shortcut drops the whole pack→AX→TST dependency from the critical
+    // path. So the tail is absorbed only when BOTH halves consume — the
+    // setcc is validated before the test is touched.
+    if (run_complete &&
+        !(g_rosetta_config && g_rosetta_config->disable_guest_setcc)) {
+        const int64_t ti = start_idx + ctx.consumed;
+        if (ti + 1 < num_instrs) {
+            auto* tcmp = &instr_array[ti];
+            auto* tset = &instr_array[ti + 1];
+            const auto tcop = tcmp->opcode();
+            if ((tcop == kOpcodeName_test || tcop == kOpcodeName_cmp) &&
+                tset->opcode() == kOpcodeName_setcc &&
+                guest_setcc_admissible(tset, tcop == kOpcodeName_test) &&
+                build_guest_cmp(ctx, tcmp, tcop)) {
+                ctx.consumed++;
+                if (build_guest_setcc(ctx, tset)) {
+                    const int16_t sid =
+                        static_cast<int16_t>(ctx.num_nodes - 1);
+                    ctx.consumed++;
+                    // Fold a same-register widening (`setz al;
+                    // movzx {ax,eax,rax}, al`) into the setcc write: the
+                    // CSET value is already zero-extended, so the movzx is
+                    // one width field, not a uxtb+bfxil pair.
+                    const int64_t mi = start_idx + ctx.consumed;
+                    GuestPayload sp = guest_unpack(ctx.nodes[sid].imm_bits);
+                    if (mi < num_instrs && sp.cls == 0) {
+                        auto* mext = &instr_array[mi];
+                        if (mext->opcode() == kOpcodeName_movzx &&
+                            mext->num_operands >= 2) {
+                            const IROperand& md = mext->operands[0];
+                            const IROperand& ms = mext->operands[1];
+                            if (md.kind == IROperandKind::Register &&
+                                ms.kind == IROperandKind::Register &&
+                                md.reg.reg.is_gpr() && ms.reg.reg.is_gpr() &&
+                                ms.reg.size == IROperandSize::S8 &&
+                                (ms.reg.reg.value & 0xF0) == 0 &&
+                                ms.reg.reg.index() == sp.dst &&
+                                md.reg.reg.index() == sp.dst &&
+                                (md.reg.size == IROperandSize::S16 ||
+                                 md.reg.size == IROperandSize::S32 ||
+                                 md.reg.size == IROperandSize::S64)) {
+                                sp.cls = (md.reg.size == IROperandSize::S16)
+                                             ? 2 : 3;
+                                ctx.nodes[sid].imm_bits = guest_pack(sp);
+                                ctx.consumed++;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

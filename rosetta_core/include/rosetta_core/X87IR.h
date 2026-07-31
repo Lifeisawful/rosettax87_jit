@@ -186,6 +186,17 @@ enum class Op : uint8_t {
     // (GuestPayload: dst = lhs reg, src = rhs reg, imm, is64); aux bit0 =
     // test (ANDS) vs cmp (SUBS), bit1 = register rhs.
     GuestCmpF,
+
+    // Guest flag CONSUMER (opt-in TRANSPARENT_FLAGS): setcc r8, admitted
+    // only when every node after the producing GuestCmpF is another
+    // GuestSetcc — the producer's SUBS/ANDS (or OPT-PS CCMN) state is then
+    // physically current at the CSET, and the AArch64 condition was resolved
+    // against that producer's convention at build time (see
+    // guest_setcc_cond). Also carries a same-register movzx widening fused
+    // at build (`setz al; movzx eax, al`). Payload: dst = written reg,
+    // cls = width class (0 = r8lo, 1 = r8hi, 2 = r16, 3 = r32/r64 full
+    // write), imm[3:0] = AArch64 condition. Reads NZCV, writes none.
+    GuestSetcc,
 };
 
 // ALU sub-op selector for GuestAluRI (whole aux) and GuestRmwR (aux[6:4]).
@@ -218,12 +229,13 @@ enum NodeFlags : uint8_t {
 //
 // Packed into Node::imm_bits:
 //   [31:0]  imm32 (GuestMovRI) / disp32 (GuestLea; sign-extended for 64-bit
-//           address computation)
+//           address computation) / AArch64 condition (GuestSetcc, [3:0])
 //   [35:32] dst guest reg index (guest GPR index == host GPR number,
 //           binary-verified: Rosetta lowers `mov ecx, 1` to `MOVZ W1, #1`)
 //   [39:36] src guest reg index (GuestMovRR/GuestExt) / lea base reg
 //   [43:40] lea index reg
-//   [45:44] lea shift amount / GuestExt source class (0=8lo, 1=8hi, 2=16, 3=32)
+//   [45:44] lea shift amount / GuestExt source class (0=8lo, 1=8hi, 2=16,
+//           3=32) / GuestSetcc width class (0=8lo, 1=8hi, 2=16, 3=32/64)
 //   [46]    dst is 64-bit
 //   [47]    GuestExt sign-extend (movsx/movsxd)
 //   [48]    lea has_base
