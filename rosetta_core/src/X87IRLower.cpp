@@ -1601,11 +1601,26 @@ void lower(Context& ctx, TranslationResult* result) {
         !(result->x87_cache.run_remaining > 0 && result->x87_cache.gprs_valid);
     if (base_x18) nd.base = false;
 
-    const auto x87r =
-        TranslatorX87::x87_begin_sel(*result, buf, nd.base, nd.top, nd.st_base);
+    // OPT-DB: the TOP=0 specialized body addresses every st[] slot statically
+    // ([Xbase, #imm]) — Xst_base is only read by the generic body. When no
+    // later run consumes the published preamble (the cache does not outlive
+    // this run) and the registers aren't already pinned, defer the
+    // `ADD Xst_base, Xbase, #kX87RegFileOff` into the generic body so the hot
+    // specialized path never executes it.
+    const bool mid_run_pinned =
+        result->x87_cache.run_remaining > 0 && result->x87_cache.gprs_valid;
+    const bool defer_st_base =
+        nd.st_base && top0_specialize && !mid_run_pinned &&
+        result->x87_cache.run_remaining > 0 &&
+        result->x87_cache.run_remaining <= ctx.consumed &&
+        !(g_rosetta_config && g_rosetta_config->disable_lower_dc);
+
+    const auto x87r = TranslatorX87::x87_begin_sel(
+        *result, buf, nd.base, nd.top, nd.st_base && !defer_st_base);
     const int Xbase = x87r.base;
     const int Wd_top = x87r.top;
-    const int Xst_base = x87r.st_base;
+    const int Xst_base =
+        defer_st_base ? alloc_gpr(*result, 6) : x87r.st_base;
     const int Wd_tmp = nd.tmp ? alloc_gpr(*result, 2) : -1;
 
     // Fixed-offset X87State addressing: base register + halfword-scaled imm12
@@ -1957,6 +1972,10 @@ void lower(Context& ctx, TranslationResult* result) {
     // OPT-TS proved them dead against the fused store that no longer exists.
     int fused_pack_reg = -1;
     bool sw_fused_fallback = false;
+    // OPT-B6: the open window's compare pack skipped its C2 ORR (a trig
+    // C1|C2 clear in the window makes it dead), so the in-window register
+    // AND has nothing left to clear either.
+    bool fused_pack_c2_dead = false;
 
     // Fused FCmp/FTst tail: keep the packed CC alive for the FStsw. The GPR
     // number rides in node_fpr[] (repurposed). kFusedClears windows must hold
@@ -1976,6 +1995,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 return;
             }
             fused_pack_reg = Wd_packed;
+            fused_pack_c2_dead = (n.aux & 1) != 0;
         }
         fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
     };
@@ -2270,8 +2290,9 @@ void lower(Context& ctx, TranslationResult* result) {
                     // OPT-SW: inside a kFusedClears window the clear lands on
                     // the held pack register the fused FStsw will store. C1 is
                     // structurally 0 in the pack, so the C1-only family emits
-                    // nothing and the trig C1|C2 clear is one AND (bit 10).
-                    if (!c1_only)
+                    // nothing and the trig C1|C2 clear is one AND (bit 10) —
+                    // or nothing at all when the pack skipped C2 (OPT-B6).
+                    if (!c1_only && !fused_pack_c2_dead)
                         emit_and_imm(buf, /*is_64bit=*/0, fused_pack_reg,
                                      /*N=*/0, /*immr=*/21, /*imms=*/29,
                                      fused_pack_reg);
@@ -2421,6 +2442,9 @@ void lower(Context& ctx, TranslationResult* result) {
 
         // ── Compare ─────────────────────────────────────────────────────
         case Op::FCmp: {
+            // OPT-B6: a fused trig call clears the pack's C2 before the FStsw
+            // stores it — skip building the bit.
+            const bool c2_dead = (n.flags & kFusedClears) && (n.aux & 1);
             int Wd_packed;
             if (nzcv_skip || nzcv_hoist) {
                 if (nzcv_hoist && Wd_nzcv_saved < 0) {
@@ -2430,7 +2454,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_fcmp_f64(buf, fprs.get(n.inputs[0]), fprs.get(n.inputs[1]));
 
                 Wd_packed = alloc_free_gpr(*result);
-                emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed);
+                emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed, c2_dead);
                 if (nzcv_hoist && i == nzcv_last_cmp) {
                     emit_msr_nzcv(buf, Wd_nzcv_saved);
                     free_gpr(*result, Wd_nzcv_saved);
@@ -2442,7 +2466,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_fcmp_f64(buf, fprs.get(n.inputs[0]), fprs.get(n.inputs[1]));
 
                 Wd_packed = alloc_free_gpr(*result);
-                emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save);
+                emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save, c2_dead);
                 // emit_fcom_cc_pack restores NZCV and frees Wd_save internally.
             }
 
@@ -2462,6 +2486,7 @@ void lower(Context& ctx, TranslationResult* result) {
             break;
         }
         case Op::FTst: {
+            const bool c2_dead = (n.flags & kFusedClears) && (n.aux & 1);
             int Wd_packed;
             if (nzcv_skip || nzcv_hoist) {
                 if (nzcv_hoist && Wd_nzcv_saved < 0) {
@@ -2471,7 +2496,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_fcmp_zero_f64(buf, fprs.get(n.inputs[0]));
 
                 Wd_packed = alloc_free_gpr(*result);
-                emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed);
+                emit_fcom_cc_pack_hoisted(buf, *result, Wd_packed, c2_dead);
                 if (nzcv_hoist && i == nzcv_last_cmp) {
                     emit_msr_nzcv(buf, Wd_nzcv_saved);
                     free_gpr(*result, Wd_nzcv_saved);
@@ -2483,7 +2508,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 emit_fcmp_zero_f64(buf, fprs.get(n.inputs[0]));
 
                 Wd_packed = alloc_free_gpr(*result);
-                emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save);
+                emit_fcom_cc_pack(buf, *result, Wd_packed, Wd_save, c2_dead);
             }
 
             if (n.flags & kFcomFused) {
@@ -2723,6 +2748,7 @@ void lower(Context& ctx, TranslationResult* result) {
                 fprs.node_fpr[n.inputs[0]] >= 0;
             fused_pack_reg = -1;
             sw_fused_fallback = false;
+            fused_pack_c2_dead = false;
 
             if (fused_live) {
                 // Fused: the CC bits are still in the register the FCmp left
@@ -3010,6 +3036,11 @@ void lower(Context& ctx, TranslationResult* result) {
         // explicitly so the generic body starts from the identical pool.
         result->free_gpr_mask = saved_gpr_mask;
         result->free_fpr_mask = saved_fpr_mask;
+        // OPT-DB: deferred Xst_base lands at the generic body's head — the
+        // CBNZ guard is patched to exactly this point, so the specialized
+        // path never executes it.
+        if (defer_st_base)
+            emit_add_imm(buf, 1, 0, 0, 0, kX87RegFileOff, Xbase, Xst_base);
         emit_body(/*top_known=*/-1);
         // Patch the skip branch to land after the generic body.
         buf.data[skip_off / 4] |= ((uint32_t)((buf.end - skip_off) / 4) & 0x3FFFFFF);

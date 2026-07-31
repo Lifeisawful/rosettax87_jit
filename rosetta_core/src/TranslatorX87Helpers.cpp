@@ -569,25 +569,52 @@ void emit_x87_tag_set_empty_batch(AssemblerBuffer& buf, int Xbase, int Wd_top,
     // LDRH  Wd_tagw, [Xbase, #4]  — load tag word once
     emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordImm12, Xbase, Wd_tagw);
 
-    for (int i = 0; i < count; i++) {
-        // Compute slot = (Wd_top - count + i) & 7 → Wd_tmp
-        const int offset_from_top = count - i;  // positive offset back from current TOP
-        // SUB Wd_tmp, Wd_top, #offset_from_top
+    if (count >= 2 &&
+        !(g_rosetta_config && g_rosetta_config->disable_lower_dc)) {
+        // OPT-B3: combined mask, same wrap-safe idiom as the valid batch —
+        // the popped slots are `count` consecutive 2-bit fields starting at
+        // (Wd_top - count) & 7, so one shifted mask + LSR#16 wrap fold ORs
+        // them all to kEmpty (0b11) at once: 7 insns + LDRH/STRH regardless
+        // of count, vs 6 per slot.
+        // SUB Wd_tmp, Wd_top, #count ; AND #7  — start slot
         emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/1, /*is_set_flags=*/0,
-                     /*shift=*/0, offset_from_top, Wd_top, Wd_tmp);
-        // AND Wd_tmp, Wd_tmp, #7
+                     /*shift=*/0, count, Wd_top, Wd_tmp);
         emit_and_imm(buf, /*is_64=*/0, Wd_tmp,
                      /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_tmp);
         // LSL Wd_tmp, Wd_tmp, #1  (bit_pos = slot * 2)
         emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
                       /*immr*/ 31, /*imms*/ 30, Wd_tmp, Wd_tmp);
-        // MOVZ Wd_tmp2, #3
-        emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp2);
-        // LSLV Wd_tmp2, Wd_tmp2, Wd_tmp  → mask = 3 << bit_pos
+        // mask = (1 << (2 * count)) - 1, shifted into position
+        const uint16_t mask = static_cast<uint16_t>((1u << (2 * count)) - 1);
+        emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, mask, Wd_tmp2);
         emit_lslv(buf, 0, Wd_tmp, Wd_tmp2, Wd_tmp2);
-        // ORR Wd_tagw, Wd_tagw, Wd_tmp2
+        // Circular wrap: fold overflow bits back into the low 16
+        emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                                 /*LSR*/ 1, Wd_tmp2, /*shift_amt*/ 16, Wd_tmp2, Wd_tmp2);
+        // ORR Wd_tagw, Wd_tagw, Wd_tmp2  — all fields to kEmpty at once
         emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
                                  /*LSL*/ 0, Wd_tmp2, /*shift_amt*/ 0, Wd_tagw, Wd_tagw);
+    } else {
+        for (int i = 0; i < count; i++) {
+            // Compute slot = (Wd_top - count + i) & 7 → Wd_tmp
+            const int offset_from_top = count - i;  // positive offset back from current TOP
+            // SUB Wd_tmp, Wd_top, #offset_from_top
+            emit_add_imm(buf, /*is_64=*/0, /*is_sub=*/1, /*is_set_flags=*/0,
+                         /*shift=*/0, offset_from_top, Wd_top, Wd_tmp);
+            // AND Wd_tmp, Wd_tmp, #7
+            emit_and_imm(buf, /*is_64=*/0, Wd_tmp,
+                         /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_tmp);
+            // LSL Wd_tmp, Wd_tmp, #1  (bit_pos = slot * 2)
+            emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0,
+                          /*immr*/ 31, /*imms*/ 30, Wd_tmp, Wd_tmp);
+            // MOVZ Wd_tmp2, #3
+            emit_movn(buf, /*is_64=*/0, /*MOVZ opc*/ 2, /*hw*/ 0, 3, Wd_tmp2);
+            // LSLV Wd_tmp2, Wd_tmp2, Wd_tmp  → mask = 3 << bit_pos
+            emit_lslv(buf, 0, Wd_tmp, Wd_tmp2, Wd_tmp2);
+            // ORR Wd_tagw, Wd_tagw, Wd_tmp2
+            emit_logical_shifted_reg(buf, /*is_64=*/0, /*ORR*/ 1, /*N=*/0,
+                                     /*LSL*/ 0, Wd_tmp2, /*shift_amt*/ 0, Wd_tagw, Wd_tagw);
+        }
     }
 
     // STRH  Wd_tagw, [Xbase, #4]  — write tag word once
@@ -781,7 +808,7 @@ void emit_x87_perm_flush(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp
 // All three NZCV readers must execute before MSR restores NZCV.
 // =============================================================================
 void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
-                        int Wd_result, int Wd_save) {
+                        int Wd_result, int Wd_save, bool skip_c2) {
     const int Wd_cc = alloc_free_gpr(a1);
     const int Wd_vs = alloc_free_gpr(a1);
 
@@ -798,8 +825,9 @@ void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
     // Step 1: C0 << 8
     emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
                   /*immr=*/24, /*imms=*/23, Wd_cc, Wd_cc);  // LSL #8
-    // Step 2: ORR with C2(=VS) << 10
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
+    // Step 2: ORR with C2(=VS) << 10 — skipped when a fused window clears it
+    if (!skip_c2)
+        emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
     // Step 3: ORR with C3 << 14, result in Wd_result
     emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_result, 14, Wd_cc, Wd_result);
 
@@ -813,7 +841,7 @@ void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
 // whole group of compares (IR run) instead of per-compare.
 // =============================================================================
 void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
-                                int Wd_result) {
+                                int Wd_result, bool skip_c2) {
     const int Wd_cc = alloc_free_gpr(a1);
     const int Wd_vs = alloc_free_gpr(a1);
 
@@ -824,7 +852,8 @@ void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
     // Pack: Wd_result = (C0 << 8) | (C2 << 10) | (C3 << 14)
     emit_bitfield(buf, /*is_64=*/0, /*UBFM=*/2, /*N=*/0,
                   /*immr=*/24, /*imms=*/23, Wd_cc, Wd_cc);  // LSL #8
-    emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
+    if (!skip_c2)
+        emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_vs, 10, Wd_cc, Wd_cc);
     emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wd_result, 14, Wd_cc, Wd_result);
 
     free_gpr(a1, Wd_vs);

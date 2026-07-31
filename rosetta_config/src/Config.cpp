@@ -279,6 +279,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_X18_STATE"))
         cfg.disable_x18_state = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: turn off the Lower dead-code batch (combined pop-pair
+    // tag mask, fused-window dead C2 elision, deferred Xst_base ADD).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_LOWER_DC"))
+        cfg.disable_lower_dc = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

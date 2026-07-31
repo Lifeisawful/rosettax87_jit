@@ -291,13 +291,15 @@ void emit_x87_perm_flush(AssemblerBuffer& buf, int Xbase, int Wd_top, int Wd_tmp
 //       Host NZCV restored from Wd_save. Wd_save freed.
 //       Internally allocates/frees 2 GPRs (Wd_cc, Wd_vs).
 // =============================================================================
+// skip_c2 (OPT-B6): omit the C2 ORR when a fused trig-family value call in
+// the same window clears C1|C2 before the FStsw stores the pack anyway.
 void emit_fcom_cc_pack(AssemblerBuffer& buf, TranslationResult& a1,
-                        int Wd_result, int Wd_save);
+                        int Wd_result, int Wd_save, bool skip_c2 = false);
 
 // NZCV-hoisted variant: same CC packing, but does NOT restore NZCV. The
 // caller is responsible for one MRS/MSR pair around the whole compare group.
 void emit_fcom_cc_pack_hoisted(AssemblerBuffer& buf, TranslationResult& a1,
-                                int Wd_result);
+                                int Wd_result, bool skip_c2 = false);
 
 // =============================================================================
 // OPT-L: RMW status_word — clear C0/C1/C2/C3, OR in packed CC bits, store.

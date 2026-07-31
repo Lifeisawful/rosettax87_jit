@@ -855,6 +855,12 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
         // admitted but mark the window (their clears move onto the register).
         bool clean = true;
         bool has_calls = false;
+        // OPT-B6: a trig-family call (C1|C2 clear) in the window makes the
+        // compare's C2 dead in the pack — the pack skips the C2 ORR and the
+        // in-window register AND vanishes. Only safe when no earlier FStsw
+        // consumes the pack before that call (it must still see C2).
+        bool has_c2_call = false;
+        bool fstsw_before_c2 = false;
         for (int j = fcmp_id + 1; j < i; j++) {
             auto& between = ctx.nodes[j];
             if (between.flags & kDead) continue;
@@ -862,11 +868,23 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
                 clean = false;
                 break;
             }
-            if (is_sw_value_call(between.op)) has_calls = true;
+            if (between.op == Op::FStsw && !has_c2_call) fstsw_before_c2 = true;
+            if (is_sw_value_call(between.op)) {
+                has_calls = true;
+                if (between.op == Op::FCosCall || between.op == Op::FSinCall ||
+                    between.op == Op::FPtanCall || between.op == Op::FSinCosCall)
+                    has_c2_call = true;
+            }
         }
         if (clean) {
             fcmp_node.flags |= kFcomFused;
-            if (has_calls) fcmp_node.flags |= kFusedClears;
+            if (has_calls) {
+                fcmp_node.flags |= kFusedClears;
+                // aux bit 0 on the compare: the fused window kills C2.
+                if (has_c2_call && !fstsw_before_c2 &&
+                    !(g_rosetta_config && g_rosetta_config->disable_lower_dc))
+                    fcmp_node.aux |= 1;
+            }
             n.flags |= kFcomFused;
         }
     }
