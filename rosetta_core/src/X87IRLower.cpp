@@ -1499,9 +1499,77 @@ struct StateNeeds {
     bool base_dyn = false;
 };
 
+// ── TOP=0 specialization gate ───────────────────────────────────────────────
+// In real code TOP is almost always 0 at run entry (balanced stack
+// discipline). When enough stack-slot traffic would become static, the run
+// is emitted twice behind a CBNZ guard (see lower() for the body layout).
+// Shared with peak_live_gprs: the pressure model must agree with the
+// body-count decision it prices.
+static bool compute_top0_specialize(const Context& ctx) {
+    int top0_benefit = 0;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        // ReadSt at depth > 0: ADD+AND+LDR → LDR imm.
+        if (n.op == Op::ReadSt && n.initial_depth > 0) top0_benefit += 2;
+    }
+    for (int d = 1; d < 8; d++) {
+        // Epilogue store at depth > 0: ADD+AND+STR → STR imm.
+        int16_t val = ctx.slot_val[d];
+        if (val < 0 || val >= ctx.num_nodes) continue;
+        if (ctx.nodes[val].op == Op::ReadSt &&
+            ctx.nodes[val].initial_depth == d + ctx.top_delta)
+            continue;  // epilogue skips this store anyway
+        top0_benefit += 2;
+    }
+    // TOP update becomes MOVZ, tag batch masks become constants.
+    if (ctx.top_delta != 0) top0_benefit += 3;
+    // A compare's status_word store merges the TOP field. With TOP known at
+    // translate time that operand is a constant; otherwise it comes from the
+    // preamble's LDRH of status_word — the very halfword the store writes —
+    // putting a full memory round-trip on the loop-carried dependency chain
+    // (STRH -> LDRH -> UBFX -> ORR -> STRH). Specializing breaks it, and the
+    // guard branch is a control dependency the predictor hides. Measured ~46%
+    // on the fcom/ftst family, so any compare alone justifies the second body.
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op == Op::FCmp || n.op == Op::FTst) { top0_benefit += 4; break; }
+    }
+    return top0_benefit >= 4;
+}
+
+// ── RC-cache decision, local evidence only ──────────────────────────────────
+// True when this run's own nodes justify caching RC in a register (≥2
+// dynamic-RC consumers, or one after a StoreCW). lower() additionally
+// enables the cache for a carried RC pin (OPT-BC) — peak_live_gprs ignores
+// that: an uncovered StoreI then over-demands Wd_tmp and a covered one
+// never under-charges (the carried register is outside the free pool).
+static bool compute_rc_cache_local(const Context& ctx) {
+    if (g_rosetta_config && g_rosetta_config->fast_round) return false;
+    int rc_count = 0;
+    bool seen_storecw = false;
+    for (int i = 0; i < ctx.num_nodes; i++) {
+        const auto& n = ctx.nodes[i];
+        if (n.flags & kDead) continue;
+        if (n.op == Op::StoreCW) { seen_storecw = true; continue; }
+        // OPT-CF: static-RC conversions (aux bit 8) never read the cache. A
+        // dynamic consumer AFTER a StoreCW enables it even alone: the
+        // StoreCW's re-cache UBFX replaces the consumer's control_word LDRH
+        // — which would read back the halfword the StoreCW just stored
+        // (store-to-load stall).
+        const bool is_rc = ((n.op == Op::FRndInt) ||
+            ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
+             && !(n.flags & kTruncate))) && !(n.aux & 0x100);
+        if (is_rc && (++rc_count >= 2 || seen_storecw)) return true;
+    }
+    return false;
+}
+
 static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
                                       int entry_push_count, int entry_pop_count,
-                                      bool top0_specialize) {
+                                      bool top0_specialize,
+                                      bool rc_covers_stores) {
     StateNeeds nd;
     const bool fast_round = g_rosetta_config && g_rosetta_config->fast_round;
 
@@ -1537,8 +1605,10 @@ static StateNeeds compute_state_needs(const Context& ctx, bool entry_top_dirty,
             case Op::StoreI16: case Op::StoreI32: case Op::StoreI64:
                 if (!(n.flags & kTruncate) && !(n.aux & 0x100)) {
                     // RC dispatch: emit_rc_preamble / emit_rcmode_dispatch.
+                    // With an RC cache register covering the run the
+                    // dispatch never touches Wd_tmp (R3-6).
                     nd.base = true;
-                    nd.tmp = true;
+                    if (!rc_covers_stores) nd.tmp = true;
                 }
                 break;
             // Value calls clear C1 (|C2) in status_word — fixed-offset
@@ -1631,42 +1701,10 @@ void lower(Context& ctx, TranslationResult* result) {
         entry_top_dirty || (seam_delta_in != 0 && !seam_defer);
 
     // ── TOP=0 specialization gate ───────────────────────────────────────────
-    // In real code TOP is almost always 0 at run entry (balanced stack
-    // discipline). When enough stack-slot traffic would become static, the
-    // run is emitted twice behind a CBNZ guard: a specialized body where
-    // every ST(i) physical index, tag mask and TOP value is a translate-time
-    // constant (wrap included), and the generic body as fallback.
-    int top0_benefit = 0;
-    for (int i = 0; i < ctx.num_nodes; i++) {
-        const auto& n = ctx.nodes[i];
-        if (n.flags & kDead) continue;
-        // ReadSt at depth > 0: ADD+AND+LDR → LDR imm.
-        if (n.op == Op::ReadSt && n.initial_depth > 0) top0_benefit += 2;
-    }
-    for (int d = 1; d < 8; d++) {
-        // Epilogue store at depth > 0: ADD+AND+STR → STR imm.
-        int16_t val = ctx.slot_val[d];
-        if (val < 0 || val >= ctx.num_nodes) continue;
-        if (ctx.nodes[val].op == Op::ReadSt &&
-            ctx.nodes[val].initial_depth == d + ctx.top_delta)
-            continue;  // epilogue skips this store anyway
-        top0_benefit += 2;
-    }
-    // TOP update becomes MOVZ, tag batch masks become constants.
-    if (ctx.top_delta != 0) top0_benefit += 3;
-    // A compare's status_word store merges the TOP field. With TOP known at
-    // translate time that operand is a constant; otherwise it comes from the
-    // preamble's LDRH of status_word — the very halfword the store writes —
-    // putting a full memory round-trip on the loop-carried dependency chain
-    // (STRH -> LDRH -> UBFX -> ORR -> STRH). Specializing breaks it, and the
-    // guard branch is a control dependency the predictor hides. Measured ~46%
-    // on the fcom/ftst family, so any compare alone justifies the second body.
-    for (int i = 0; i < ctx.num_nodes; i++) {
-        const auto& n = ctx.nodes[i];
-        if (n.flags & kDead) continue;
-        if (n.op == Op::FCmp || n.op == Op::FTst) { top0_benefit += 4; break; }
-    }
-    const bool top0_specialize = top0_benefit >= 4;
+    // A specialized body where every ST(i) physical index, tag mask and TOP
+    // value is a translate-time constant (wrap included), plus the generic
+    // body as fallback, behind a CBNZ guard (see compute_top0_specialize).
+    const bool top0_specialize = compute_top0_specialize(ctx);
 
     // ── Preamble: acquire only the x87-state registers this run reads ───────
     // Emitted here (not at function entry) because the demand walk needs
@@ -1681,10 +1719,18 @@ void lower(Context& ctx, TranslationResult* result) {
     // emitting it, so the walk must not demand registers for it; a consuming
     // run does the work and demands normally (entry_top_stale covers the
     // seam-delta TOP store).
+    // RC coverage for the StoreI tmp demand (R3-6): a carried RC pin or a
+    // local ≥2-consumer decision gives the dispatch its own register — the
+    // same predicate the RC-caching block below applies.
+    const bool rc_covers =
+        !(g_rosetta_config && g_rosetta_config->fast_round) &&
+        ((g_rosetta_config && g_rosetta_config->bridge_carry &&
+          result->x87_cache.carried_rc_gpr >= 0) ||
+         compute_rc_cache_local(ctx));
     StateNeeds nd = compute_state_needs(ctx, entry_top_stale,
                                         seam_defer ? 0 : entry_push_count,
                                         seam_defer ? 0 : entry_pop_count,
-                                        top0_specialize);
+                                        top0_specialize, rc_covers);
     if (result->x87_cache.run_remaining > ctx.consumed)
         nd.base = nd.top = nd.st_base = nd.tmp = nd.base_dyn = true;
 
@@ -1861,32 +1907,11 @@ void lower(Context& ctx, TranslationResult* result) {
         if (carry_on && xc.carried_rc_gpr >= 0) {
             Wd_rc_cached = xc.carried_rc_gpr;
             rc_entry_valid = true;
-        } else {
-            int rc_count = 0;
-            bool seen_storecw = false;
-            bool use_rc_cache = false;
-            for (int i = 0; i < ctx.num_nodes; i++) {
-                auto& n = ctx.nodes[i];
-                if (n.flags & kDead) continue;
-                if (n.op == Op::StoreCW) { seen_storecw = true; continue; }
-                // OPT-CF: static-RC conversions (aux bit 8) never read the
-                // cache. A dynamic consumer AFTER a StoreCW enables it even
-                // alone: the StoreCW's re-cache UBFX replaces the consumer's
-                // control_word LDRH — which would read back the halfword the
-                // StoreCW just stored (store-to-load stall).
-                bool is_rc = ((n.op == Op::FRndInt) ||
-                    ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
-                     && !(n.flags & kTruncate))) && !(n.aux & 0x100);
-                if (is_rc && (++rc_count >= 2 || seen_storecw)) {
-                    use_rc_cache = true;
-                    break;
-                }
-            }
-            if (use_rc_cache)
-                // alloc_free_gpr, NOT alloc_gpr(pool 3): the addr cache may
-                // already hold x25 (any scratch), and fixed-slot allocation
-                // asserts on collision. The RC dispatch works from any register.
-                Wd_rc_cached = alloc_free_gpr(*result);
+        } else if (compute_rc_cache_local(ctx)) {
+            // alloc_free_gpr, NOT alloc_gpr(pool 3): the addr cache may
+            // already hold x25 (any scratch), and fixed-slot allocation
+            // asserts on collision. The RC dispatch works from any register.
+            Wd_rc_cached = alloc_free_gpr(*result);
         }
     }
 
@@ -3400,12 +3425,15 @@ void lower(Context& ctx, TranslationResult* result) {
 // caller should bail out to the ordinary per-instruction translation path.
 //
 // Permanent GPRs (held for the entire lower() duration):
-//   - Xbase (pool 0), Wd_top (pool 1), Wd_tmp (pool 2), Xst_base (pool 6) = 4
+//   - Xbase, Wd_top, Xst_base, Wd_tmp — charged per compute_state_needs
+//     (R3-6), the same demand walk lower() allocates by; a balanced run that
+//     demands none is no longer billed the historical flat 4.
 //     ... except on mid-run entry (`gprs_cached`): x87_begin then reuses the
 //     cache's already-pinned Xbase/Wd_top/Xst_base, which the caller has
 //     already excluded from the free pool — counting them again would
 //     double-charge 3 registers and spuriously decline nearly every mid-run
-//     attempt. Only Wd_tmp is newly allocated in that case = 1.
+//     attempt. Only Wd_tmp is newly allocated in that case = 1. A cache that
+//     outlives the run forces the full 4 (lower() materializes them all).
 //   - Wd_rc_cached (pool 3) when RC caching is active = +1
 //
 // Per-node transient GPR demand (mirrors the lowering code exactly):
@@ -3425,24 +3453,35 @@ void lower(Context& ctx, TranslationResult* result) {
 //
 // Fused FCmp/FTst holds 1 GPR (Wd_packed) alive across nodes until FStsw.
 // We track this as a "held" count that overlaps with per-node transient demand.
-int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached) {
-    // Determine if RC caching will be active (same logic as lower()).
-    bool rc_cache = false;
-    if (!(g_rosetta_config && g_rosetta_config->fast_round)) {
-        int rc_count = 0;
-        bool seen_storecw = false;
-        for (int i = 0; i < ctx.num_nodes; i++) {
-            const auto& n = ctx.nodes[i];
-            if (n.flags & kDead) continue;
-            if (n.op == Op::StoreCW) { seen_storecw = true; continue; }
-            bool is_rc = ((n.op == Op::FRndInt) ||
-                ((n.op == Op::StoreI16 || n.op == Op::StoreI32 || n.op == Op::StoreI64)
-                 && !(n.flags & kTruncate))) && !(n.aux & 0x100);
-            if (is_rc && (++rc_count >= 2 || seen_storecw)) { rc_cache = true; break; }
-        }
-    }
+int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached,
+                   bool cache_outlives) {
+    // Determine if RC caching will be active (same local decision as
+    // lower(); a carried RC pin is invisible here — see the helper's note).
+    const bool rc_cache = compute_rc_cache_local(ctx);
 
-    int pinned = gprs_cached ? 1 : 4;  // Wd_tmp [+ Xbase, Wd_top, Xst_base]
+    // Pinned preamble registers (R3-6): derive from the same demand walk
+    // lower() allocates by, instead of the historical flat 4. Superset
+    // arguments where the caller's entry state is coarser than lower()'s:
+    // entry_deferred covers entry_top_stale and forces the push/pop tag
+    // batches; base_x18's base elision is ignored (over-estimates by 1).
+    // Mid-run entry (gprs_cached) reuses the cache's pins — only Wd_tmp is
+    // new; a cache that outlives this run materializes the full set
+    // regardless (mirrors lower()'s force-all).
+    int pinned;
+    if (gprs_cached) {
+        pinned = 1;                    // Wd_tmp
+    } else if (cache_outlives ||
+               (g_rosetta_config && g_rosetta_config->disable_pinned_demand)) {
+        pinned = 4;                    // Xbase + Wd_top + Xst_base + Wd_tmp
+    } else {
+        const StateNeeds nd = compute_state_needs(
+            ctx, /*entry_top_dirty=*/entry_deferred,
+            /*entry_push_count=*/entry_deferred ? 8 : 0,
+            /*entry_pop_count=*/entry_deferred ? 8 : 0,
+            compute_top0_specialize(ctx), /*rc_covers_stores=*/rc_cache);
+        pinned = (nd.base ? 1 : 0) + (nd.top ? 1 : 0) +
+                 (nd.st_base ? 1 : 0) + (nd.tmp ? 1 : 0);
+    }
     if (rc_cache) pinned++;            // Wd_rc_cached
 
     // NZCV hoisting/elision mirror (same predicates as lower()): when hoisting,
@@ -3895,7 +3934,8 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
         // predicate), so the model must not charge for them — the caller
         // already removed them from free_gpr_mask.
         const bool gprs_cached = cache.run_remaining > 0 && cache.gprs_valid;
-        const int peak = peak_live_gprs(ctx, entry_deferred, gprs_cached);
+        const int peak = peak_live_gprs(ctx, entry_deferred, gprs_cached,
+                                        cache.run_remaining > ctx.consumed);
         if (peak > gpr_available) {
             // OPT-BC: carried pins are an optimization, releasable at will —
             // give their registers back and retry before declining the run.

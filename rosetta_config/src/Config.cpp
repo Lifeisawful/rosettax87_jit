@@ -322,6 +322,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_GUEST_SETCC"))
         cfg.disable_guest_setcc = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: flat pinned=4 in the GPR pressure model instead of
+    // the demand-derived count (R3-6).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_PINNED_DEMAND"))
+        cfg.disable_pinned_demand = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;
