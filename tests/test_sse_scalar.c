@@ -202,6 +202,40 @@ __attribute__((noinline)) static double seam_xmm12(double a, double b) {
     return r;
 }
 
+/* F/ stale-xmm overwrite: an fld forwarded to a RESIDENT movsd load, then
+ * the xmm overwritten in-run — the fld's value must be the ORIGINAL (the
+ * copy-out fix; without it the fstp read the overwritten register). */
+static double stale_t = 1.5;
+static double stale_xmm_overwrite(double b, double *dout) {
+    double c;
+    __asm__ volatile(
+        "fld1\n"               /* window opens */
+        "fstp %%st(0)\n"
+        "movsd %2, %%xmm0\n"   /* resident load: v0 = stale_t */
+        "fldl %2\n"            /* forwards to the resident value */
+        "movsd %3, %%xmm0\n"   /* overwrite v0 = b */
+        "fstpl %0\n"           /* must store stale_t's value */
+        "movsd %%xmm0, %1\n"   /* must store b */
+        : "=m"(c), "=m"(*dout) : "m"(stale_t), "m"(b) : "xmm0", "st");
+    return c;
+}
+
+/* F2/ f32 variant: the widened CSE entry survives eviction — a movss after
+ * the overwrite must NOT re-forward the stale register. */
+static float stale_ft = 2.5f;
+static float stale_xmm_overwrite_f32(float b) {
+    float c;
+    __asm__ volatile(
+        "fld1\n"
+        "fstp %%st(0)\n"
+        "movss %1, %%xmm1\n"   /* resident f32 load: v1 = stale_ft */
+        "flds %1\n"            /* forwards through the widened view */
+        "movss %2, %%xmm1\n"   /* overwrite v1 = b */
+        "fstps %0\n"           /* must store stale_ft's value */
+        : "=m"(c) : "m"(stale_ft), "m"(b) : "xmm1", "st");
+    return c;
+}
+
 int main(void) {
     check_d("A/fstp->movsd->movsd seam", seam_fstp_movsd(1.5, 2.25), 3.75);
     check_d("A/movsd store forwarded into fld", movsd_store_then_fld(2.5), 5.0);
@@ -232,6 +266,15 @@ int main(void) {
 
     check_d("D/store from un-tracked xmm", movsd_store_unknown(4.5), 4.5);
     check_d("E/xmm12 seam (REX)", seam_xmm12(3.0, 7.0), 21.0);
+
+    {
+        double dd = 0.0;
+        check_d("F/stale-xmm overwrite: fld keeps original",
+                stale_xmm_overwrite(99.0, &dd), 1.5);
+        check_d("F/stale-xmm overwrite: xmm holds new", dd, 99.0);
+        check_f("F2/stale-xmm f32 overwrite", stale_xmm_overwrite_f32(7.0f),
+                2.5f);
+    }
 
     if (failures) {
         printf("%d test(s) FAILED.\n", failures);

@@ -1346,6 +1346,24 @@ static void sse_overwrite_xmm(Context& ctx, int k) {
         }
         ctx.mem_cse_count = static_cast<int8_t>(kept);
         ctx.mem_cse_next = 0;
+        // Stale-xmm fix: the resident node's value IS the guest register,
+        // but a reference that outlives this overwrite reads the register at
+        // ITS OWN emission point — a forwarded fld still on the stack at the
+        // epilogue, a consumer node after this one, a sunk store pair, or
+        // (f32) the widened CSE entry that survives the eviction above and
+        // re-forwards later. Mark the node for copy-out (aux bit 5): the
+        // lowering lands the value in a pool FPR at birth instead of binding
+        // the guest register.
+        bool referenced = false;
+        for (int i = 0; i < ctx.num_nodes && !referenced; i++) {
+            const auto& n = ctx.nodes[i];
+            if (n.flags & kDead) continue;
+            for (int j = 0; j < 3; j++)
+                if (n.inputs[j] == v) { referenced = true; break; }
+        }
+        for (int d = 0; d < 8 && !referenced; d++)
+            if (ctx.slot_val[d] == v) referenced = true;
+        if (referenced) ctx.nodes[v].aux |= 0x20u;
     }
     ctx.xmm_val[k] = -1;
     ctx.xmm_f32_mask &= static_cast<uint16_t>(~(1u << k));

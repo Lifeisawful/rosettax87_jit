@@ -2913,9 +2913,18 @@ void lower(Context& ctx, TranslationResult* result) {
                     emit_fp_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
                                        size, /*is_load=*/1, xmm);
             }
-            // The value lives in the guest register — never pool-freed.
-            fprs.node_fpr[i] = static_cast<int8_t>(xmm);
-            fprs.pinned_mask |= 1u << xmm;
+            if (n.aux & 0x20) {
+                // Stale-xmm fix (see sse_overwrite_xmm): a reference to this
+                // value outlives an in-run overwrite of the guest register —
+                // copy the value into a pool FPR at birth and bind that.
+                const int Dd = alloc_free_fpr(*result);
+                emit_fp_dp1(buf, /*type=*/is_f32 ? 0 : 1, /*FMOV=*/0, Dd, xmm);
+                fprs.node_fpr[i] = static_cast<int8_t>(Dd);
+            } else {
+                // The value lives in the guest register — never pool-freed.
+                fprs.node_fpr[i] = static_cast<int8_t>(xmm);
+                fprs.pinned_mask |= 1u << xmm;
+            }
             break;
         }
         case Op::SseStore: {
@@ -3781,6 +3790,11 @@ int peak_live_fprs(const Context& ctx) {
             case Op::CvtF32ToF64: case Op::CvtF64ToF32:
                 produces_fpr = true;
                 can_reuse = true;
+                break;
+            case Op::SseLoad:
+                // Resident form lives in the guest register (no pool); the
+                // copy-out form (stale-xmm fix, aux bit 5) holds a pool FPR.
+                produces_fpr = (n.aux & 0x20) != 0;
                 break;
             default:
                 break;
