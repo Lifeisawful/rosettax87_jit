@@ -64,6 +64,121 @@ static bool const_is(const Context& ctx, int16_t c, int alias_op,
     return cn.op == Op::ConstF64 && cn.imm_bits == f64_bits;
 }
 
+// ── OPT-CE: exact integer-only constant evaluation ──────────────────────────
+//
+// `fld1; faddp` chains (how old compilers materialize small constants) lower
+// as SERIAL FADD dependency chains and hide the divisor from the reciprocal
+// rewrite below. Folding them needs constant arithmetic — but host FP is
+// banned at translation time (the HookSafeFP bug class: an fdiv here runs
+// inside the translation hook on live guest register state). So constants
+// are decoded to ±m·2^e integers, folded in 128-bit integer arithmetic, and
+// ONLY exact results are kept. An exact result is identical in every x87
+// rounding mode, making the fold mode-blind — with one trap: an exact ZERO
+// takes its sign from the mode (x + (-x) is -0 under round-toward-−∞), so
+// zero operands and zero results bail. Inf/NaN inputs bail (decode fails);
+// subnormal or overflowing results bail (encode fails).
+
+static bool f64_decode_exact(uint64_t bits, bool* neg, uint64_t* m, int* e) {
+    const uint64_t exp = (bits >> 52) & 0x7FF;
+    const uint64_t frac = bits & 0x000FFFFFFFFFFFFFULL;
+    if (exp == 0x7FF) return false;  // inf / NaN
+    if (exp == 0) {
+        if (frac == 0) return false;  // ±0
+        *m = frac;                    // subnormal
+        *e = -1074;
+    } else {
+        *m = frac | (1ULL << 52);
+        *e = static_cast<int>(exp) - 1075;
+    }
+    *neg = (bits >> 63) != 0;
+    return true;
+}
+
+// Encode mag·2^e as a NORMAL f64 iff exactly representable.
+static bool f64_encode_exact(bool neg, unsigned __int128 mag, int e,
+                             uint64_t* out) {
+    if (mag == 0) return false;
+    while ((mag & 1) == 0) { mag >>= 1; e++; }
+    if (mag >> 53) return false;  // more than 53 significant bits — inexact
+    const uint64_t m = static_cast<uint64_t>(mag);
+    const int p = 63 - __builtin_clzll(m);  // position of the leading bit
+    const int be = e + p + 1023;            // biased exponent
+    if (be < 1 || be > 2046) return false;  // subnormal / overflow — bail
+    *out = (neg ? (1ULL << 63) : 0) | (static_cast<uint64_t>(be) << 52) |
+           ((m << (52 - p)) & 0x000FFFFFFFFFFFFFULL);
+    return true;
+}
+
+static bool const_eval_binary(Op op, uint64_t a, uint64_t b, uint64_t* out) {
+    bool na, nb;
+    uint64_t ma, mb;
+    int ea, eb;
+    if (!f64_decode_exact(a, &na, &ma, &ea) ||
+        !f64_decode_exact(b, &nb, &mb, &eb))
+        return false;
+    __int128 va = na ? -static_cast<__int128>(ma) : static_cast<__int128>(ma);
+    __int128 vb = nb ? -static_cast<__int128>(mb) : static_cast<__int128>(mb);
+    __int128 v;
+    int e;
+    switch (op) {
+        case Op::FAdd:
+        case Op::FSub: {
+            if (op == Op::FSub) vb = -vb;
+            // Align to the smaller exponent (operands ≤ 2^53, so a ≤70-bit
+            // shift stays far inside __int128).
+            if (ea > eb) {
+                if (ea - eb > 70) return false;
+                va <<= (ea - eb);
+                e = eb;
+            } else {
+                if (eb - ea > 70) return false;
+                vb <<= (eb - ea);
+                e = ea;
+            }
+            v = va + vb;
+            break;
+        }
+        case Op::FMul:
+        case Op::FNMul:
+            v = va * vb;  // ≤ 2^106 — fits
+            if (op == Op::FNMul) v = -v;
+            e = ea + eb;
+            break;
+        case Op::FDiv: {
+            // Exact iff the divisor's odd part divides the dividend
+            // (powers of two move into the exponent).
+            uint64_t d = mb;
+            int sh = 0;
+            while ((d & 1) == 0) { d >>= 1; sh++; }
+            if (ma % d != 0) return false;
+            v = static_cast<__int128>(ma / d);
+            if (na != nb) v = -v;
+            e = ea - eb - sh;
+            break;
+        }
+        default:
+            return false;
+    }
+    if (v == 0) return false;  // zero's sign is rounding-mode-dependent
+    const bool neg = v < 0;
+    return f64_encode_exact(neg,
+                            neg ? static_cast<unsigned __int128>(-v)
+                                : static_cast<unsigned __int128>(v),
+                            e, out);
+}
+
+static bool const_node_bits(const Context& ctx, int16_t id, uint64_t* bits) {
+    if (id < 0 || id >= ctx.num_nodes) return false;
+    const auto& n = ctx.nodes[id];
+    if (n.flags & kDead) return false;
+    switch (n.op) {
+        case Op::ConstZero: *bits = 0; return true;
+        case Op::ConstOne:  *bits = 0x3FF0000000000000ULL; return true;
+        case Op::ConstF64:  *bits = n.imm_bits; return true;
+        default: return false;
+    }
+}
+
 static void pass_const_arith(Context& ctx) {
     int16_t use_count[kMaxNodes] = {};
     for (int d = 0; d < 8; d++) {
@@ -103,6 +218,43 @@ static void pass_const_arith(Context& ctx) {
     for (int i = 0; i < ctx.num_nodes; i++) {
         auto& n = ctx.nodes[i];
         if (n.flags & kDead) continue;
+
+        // OPT-CE: exact constant evaluation. Nodes are visited in order, so a
+        // chain folds bottom-up in one pass (each folded node IS a ConstF64
+        // when its consumer is reached), and a fully-folded divisor then
+        // feeds the FDiv reciprocal rewrite below.
+        if (n.op == Op::FNeg || n.op == Op::FAbs) {
+            uint64_t a;
+            if (const_node_bits(ctx, n.inputs[0], &a)) {
+                // Pure sign-bit ops — exact for every input incl. 0/inf/NaN.
+                const int16_t c = n.inputs[0];
+                const uint64_t out = (n.op == Op::FNeg)
+                                         ? (a ^ (1ULL << 63))
+                                         : (a & ~(1ULL << 63));
+                n.op = Op::ConstF64;
+                n.imm_bits = out;
+                n.inputs[0] = -1;
+                if (--use_count[c] <= 0) ctx.nodes[c].flags |= kDead;
+                continue;
+            }
+        } else if (n.op == Op::FAdd || n.op == Op::FSub || n.op == Op::FMul ||
+                   n.op == Op::FNMul || n.op == Op::FDiv) {
+            uint64_t a, b, out;
+            if (const_node_bits(ctx, n.inputs[0], &a) &&
+                const_node_bits(ctx, n.inputs[1], &b) &&
+                const_eval_binary(n.op, a, b, &out)) {
+                const int16_t c0 = n.inputs[0], c1 = n.inputs[1];
+                n.op = Op::ConstF64;
+                n.imm_bits = out;
+                n.inputs[0] = -1;
+                n.inputs[1] = -1;
+                --use_count[c0];
+                --use_count[c1];
+                if (use_count[c0] <= 0) ctx.nodes[c0].flags |= kDead;
+                if (use_count[c1] <= 0) ctx.nodes[c1].flags |= kDead;
+                continue;
+            }
+        }
 
         // Identity folds.
         {
