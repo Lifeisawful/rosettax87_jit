@@ -663,17 +663,22 @@ static void pass_f32_fma(Context& ctx) {
 // CC-modifying node, mark both with kFcomFused. The lowering keeps packed CC
 // in a GPR between the two nodes, avoiding one LDRH in FStsw.
 //
-// "CC-modifying" includes the trig/pow value calls, not just other compares:
-// each of them clears C1 (|C2) in status_word at its own program position, and
-// a fused FStsw stores the compare's packed CC over the whole halfword — which
-// would re-impose the compare's C1/C2 on top of the call's clear. Visible
-// whenever the compare was unordered (C1 set) and a call sits between it and
-// the FSTSW. F2XM1Call touches no status bits and does not break the run.
+// "CC-modifying" splits in two (OPT-SW):
+//   - another FCmp/FTst redefines the packed CC — hard break.
+//   - trig/pow value calls clear C1 (|C2) in status_word at their program
+//     position. A fused FStsw storing the raw pack over that would re-impose
+//     the compare's C2 (visible when the compare was unordered), so fusion
+//     historically broke here. Instead the window now fuses ACROSS them
+//     (kFusedClears): the value stubs never touch status_word themselves
+//     (their C1|C2 effect is entirely our RMW), so the clear can be applied
+//     to the held pack register — C1 is structurally 0 in the pack, leaving
+//     one AND for the trig C2 clear and nothing for the C1-only family —
+//     and the calls' own status_word RMWs die (subsumed by the fused store).
+// F2XM1Call touches no status bits and never broke the run.
 // Another FStsw between is harmless: it stores the same packed CC.
 
-static bool clobbers_cc(Op op) {
+static bool is_sw_value_call(Op op) {
     switch (op) {
-        case Op::FCmp: case Op::FTst:
         case Op::FCosCall: case Op::FSinCall: case Op::FPtanCall:
         case Op::FSinCosCall: case Op::FScaleCall:
         case Op::FYl2xCall: case Op::FYl2xp1Call: case Op::FPatanCall:
@@ -694,18 +699,22 @@ static void pass_fcom_fstsw_fusion(Context& ctx) {
         auto& fcmp_node = ctx.nodes[fcmp_id];
         if (fcmp_node.op != Op::FCmp && fcmp_node.op != Op::FTst) continue;
 
-        // Check no intervening CC-modifying instruction between fcmp and fstsw.
+        // No intervening compare between fcmp and fstsw; value calls are
+        // admitted but mark the window (their clears move onto the register).
         bool clean = true;
+        bool has_calls = false;
         for (int j = fcmp_id + 1; j < i; j++) {
             auto& between = ctx.nodes[j];
             if (between.flags & kDead) continue;
-            if (clobbers_cc(between.op)) {
+            if (between.op == Op::FCmp || between.op == Op::FTst) {
                 clean = false;
                 break;
             }
+            if (is_sw_value_call(between.op)) has_calls = true;
         }
         if (clean) {
             fcmp_node.flags |= kFcomFused;
+            if (has_calls) fcmp_node.flags |= kFusedClears;
             n.flags |= kFcomFused;
         }
     }

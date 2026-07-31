@@ -1819,6 +1819,37 @@ void lower(Context& ctx, TranslationResult* result) {
     // would have made the earlier pack dead in plan_fcomi_raw.
     int pack_after = -1;
 
+    // OPT-SW: the pack register of an open kFusedClears window (compare fused
+    // to its FStsw across value calls) — in-window calls AND their clear onto
+    // it instead of RMWing status_word. -1 = no window open. When no BL-safe
+    // register was available, the window is broken: the compare stored
+    // immediately and the in-window calls must keep their RMWs even when
+    // OPT-TS proved them dead against the fused store that no longer exists.
+    int fused_pack_reg = -1;
+    bool sw_fused_fallback = false;
+
+    // Fused FCmp/FTst tail: keep the packed CC alive for the FStsw. The GPR
+    // number rides in node_fpr[] (repurposed). kFusedClears windows must hold
+    // it in a register the value stubs preserve (x22–x26/x28 — the runtime-BL
+    // audit; x27/x29 are clobbered), else fall back to the non-fused store.
+    auto hold_fused_pack = [&](int i, Node& n, int Wd_packed, int top_known) {
+        if (n.flags & kFusedClears) {
+            constexpr uint32_t kBlSafeMask = (1u << 22) | (1u << 23) |
+                                             (1u << 24) | (1u << 25) |
+                                             (1u << 26) | (1u << 28);
+            if (!((kBlSafeMask >> Wd_packed) & 1u)) {
+                emit_fcom_cc_store_sw(buf, Xbase, Wd_packed,
+                                      (top_known == 0) ? GPR::XZR : Wd_top);
+                free_gpr(*result, Wd_packed);
+                fprs.node_fpr[i] = -1;
+                sw_fused_fallback = true;
+                return;
+            }
+            fused_pack_reg = Wd_packed;
+        }
+        fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
+    };
+
     // Guest-EFLAGS pack from the FCCMP-normalized flag state (unordered →
     // Z=1,C=0,V=1): CSET EQ is already ZF (equal|unordered) and CSET CS is
     // already the CF complement (ge-only), so the legacy Z|V and C&~V merges
@@ -2092,18 +2123,32 @@ void lower(Context& ctx, TranslationResult* result) {
             // clears C1|C2 (~0x600: immr=21, imms=29); FScale/FYl2x/FYl2xp1
             // clear C1 (~0x200: immr=22, imms=30); F2XM1 clears nothing
             // (classic helper parity).
-            if (n.op != Op::F2XM1Call && !sw_clear_dead[i]) {
+            if (n.op != Op::F2XM1Call) {
                 const bool c1_only = (n.op == Op::FScaleCall || n.op == Op::FYl2xCall ||
                                       n.op == Op::FYl2xp1Call || n.op == Op::FPatanCall);
-                const int immr = c1_only ? 22 : 21;
-                const int imms = c1_only ? 30 : 29;
-                int Wd = alloc_free_gpr(*result);
-                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
-                                 kX87StatusWordImm12, Xbase, Wd);
-                emit_and_imm(buf, /*is_64bit=*/0, Wd, /*N=*/0, immr, imms, Wd);
-                emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
-                                 kX87StatusWordImm12, Xbase, Wd);
-                free_gpr(*result, Wd);
+                if (fused_pack_reg >= 0) {
+                    // OPT-SW: inside a kFusedClears window the clear lands on
+                    // the held pack register the fused FStsw will store. C1 is
+                    // structurally 0 in the pack, so the C1-only family emits
+                    // nothing and the trig C1|C2 clear is one AND (bit 10).
+                    if (!c1_only)
+                        emit_and_imm(buf, /*is_64bit=*/0, fused_pack_reg,
+                                     /*N=*/0, /*immr=*/21, /*imms=*/29,
+                                     fused_pack_reg);
+                } else if (!sw_clear_dead[i] || sw_fused_fallback) {
+                    // sw_fused_fallback: OPT-TS proved this clear dead against
+                    // a fused store that fell back to a store-at-compare — the
+                    // FStsw now reads the halfword, so the clear must stay.
+                    const int immr = c1_only ? 22 : 21;
+                    const int imms = c1_only ? 30 : 29;
+                    int Wd = alloc_free_gpr(*result);
+                    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=LDR*/1,
+                                     kX87StatusWordImm12, Xbase, Wd);
+                    emit_and_imm(buf, /*is_64bit=*/0, Wd, /*N=*/0, immr, imms, Wd);
+                    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*opc=STR*/0,
+                                     kX87StatusWordImm12, Xbase, Wd);
+                    free_gpr(*result, Wd);
+                }
             }
             break;
         }
@@ -2254,9 +2299,9 @@ void lower(Context& ctx, TranslationResult* result) {
             }
 
             if (n.flags & kFcomFused) {
-                // Fused: keep packed CC alive for FStsw to consume.
-                // Store the GPR number in node_fpr[] (repurposed for GPR tracking).
-                fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
+                // Fused: keep packed CC alive for FStsw to consume (OPT-SW
+                // windows constrain the register and may fall back).
+                hold_fused_pack(i, n, Wd_packed, top_known);
             } else {
                 // Non-fused: write CC to status_word now, with no LDRH. TOP
                 // is the value memory holds at this point — a constant in the
@@ -2294,7 +2339,7 @@ void lower(Context& ctx, TranslationResult* result) {
             }
 
             if (n.flags & kFcomFused) {
-                fprs.node_fpr[i] = static_cast<int8_t>(Wd_packed);
+                hold_fused_pack(i, n, Wd_packed, top_known);
             } else {
                 emit_fcom_cc_store_sw(buf, Xbase, Wd_packed,
                                       (top_known == 0) ? GPR::XZR : Wd_top);
@@ -2514,7 +2559,16 @@ void lower(Context& ctx, TranslationResult* result) {
                 }
             };
 
-            if (n.flags & kFcomFused) {
+            // OPT-SW: however this FStsw lowers, it closes any fused-clears
+            // window (fused: the held register is consumed here; fallback:
+            // the forced-RMW regime ends with the window).
+            const bool fused_live =
+                (n.flags & kFcomFused) && n.inputs[0] >= 0 &&
+                fprs.node_fpr[n.inputs[0]] >= 0;
+            fused_pack_reg = -1;
+            sw_fused_fallback = false;
+
+            if (fused_live) {
                 // Fused: the CC bits are still in the register the FCmp left
                 // them in, so status_word is never read back.
                 const int16_t fcmp_id = n.inputs[0];

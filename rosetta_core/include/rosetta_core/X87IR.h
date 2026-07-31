@@ -194,6 +194,11 @@ enum NodeFlags : uint8_t {
     kPackSink     = 1 << 6,    // FCSel: its FComI's guest-EFLAGS pack is
                                // emitted after this node (raw flags stay live
                                // through it; CSET/FCSEL don't write NZCV)
+    kFusedClears  = 1 << 7,    // FCmp/FTst: the fused window to its FStsw
+                               // spans trig/pow value calls — their C1|C2
+                               // status clears apply to the held pack register
+                               // (an AND) instead of a status_word RMW; the
+                               // held register must survive the BLs (OPT-SW)
 };
 
 // ── Guest* node payload ─────────────────────────────────────────────────────
