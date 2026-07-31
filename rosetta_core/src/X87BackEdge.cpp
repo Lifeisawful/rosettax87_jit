@@ -2,6 +2,7 @@
 
 #include "rosetta_core/CoreConfig.h"
 #include "rosetta_core/CoreLog.h"
+#include "rosetta_core/IRBlock.h"
 #include "rosetta_core/TranslationResult.h"
 #include <rosetta_config/Config.h>
 
@@ -21,6 +22,50 @@
 // never emit NEON (live guest FP state) — volatile keeps every access scalar.
 
 static uint64_t g_backedge_module_count = 0;
+
+// ── Stage 1: per-module block records ───────────────────────────────────────
+// Filled by x87_backedge_note_block (translation is serialized under the
+// runtime's heap/translation locks — same assumption as the existing global
+// X87Cache state). Owner-keyed so a module that never reaches the post-pass
+// (error path) can't leak stale records into the next module's analysis.
+
+namespace {
+
+struct BlockRec {
+    uint32_t arm_off;   // insn_buf.end when the block's first insn translates
+    uint32_t start_pc;  // guest pc of the block head
+    uint8_t self_loop;  // terminator is JCC targeting this block
+};
+
+constexpr uint32_t kMaxBlockRecs = 8192;
+
+}  // namespace
+
+static TranslationResult* g_rec_owner = nullptr;
+static BlockRec g_block_recs[kMaxBlockRecs];
+static uint32_t g_num_block_recs = 0;
+static bool g_block_recs_overflow = false;
+
+void x87_backedge_note_block(TranslationResult* result, IRBlock* block) {
+    const RosettaConfig* cfg = g_rosetta_config;
+    if (!cfg || !cfg->log_backedge)
+        return;
+    if (result != g_rec_owner) {
+        g_rec_owner = result;
+        g_num_block_recs = 0;
+        g_block_recs_overflow = false;
+    }
+    if (g_num_block_recs >= kMaxBlockRecs) {
+        g_block_recs_overflow = true;
+        return;
+    }
+    const IRTerminator& t = block->terminator;
+    const bool self_loop = t.kind == TK_JCC &&
+                           t.data.target.block.kind == BasicBlock &&
+                           t.data.target.block.block == block;
+    g_block_recs[g_num_block_recs++] = {
+        (uint32_t)result->insn_buf.end, block->start_pc, (uint8_t)(self_loop ? 1 : 0)};
+}
 
 namespace {
 
@@ -46,6 +91,229 @@ int32_t cond_branch_offset_words(uint32_t insn) {
     if (imm19 & 0x40000)
         imm19 -= 0x80000;
     return imm19;
+}
+
+// ── Stage 1: self-loop candidate analysis, entirely by decode ───────────────
+//
+// The load-skip transform (retarget the back edge past the priming st[] load)
+// is sound iff, at the moment the back edge is taken:
+//   (a) every register the SKIPPED region defines would be recomputed to the
+//       value it already holds — guaranteed when each skipped word computes
+//       deterministically from x18, X87State memory, or earlier region defs
+//       (all loop-invariant here: no state store survives the checks below),
+//       AND no body/gap word writes a region-defined GPR;
+//   (b) the pinned FPR equals mem[slot] — guaranteed by store-through: the
+//       body's single st[] store writes that FPR to the SAME address the
+//       skipped load reads (same base reg, same key reg, key unmodified),
+//       and nothing writes the FPR after that store.
+// Everything is checked against the actual emitted words with default-deny:
+// any unrecognized instruction, extra branch, BL, or state-word store
+// declines the block. A decline costs nothing (stock code).
+
+inline int rd_of(uint32_t w) { return (int)(w & 31); }
+inline int rn_of(uint32_t w) { return (int)((w >> 5) & 31); }
+inline int rm_of(uint32_t w) { return (int)((w >> 16) & 31); }
+
+// ADD Xd, Xn, #imm12 (64-bit, shift 0)
+inline bool is_add_x_imm(uint32_t w) { return (w & 0xFFC00000u) == 0x91000000u; }
+// LDRH Wt, [Xn, #imm12*2]
+inline bool is_ldrh_imm(uint32_t w) { return (w & 0xFFC00000u) == 0x79400000u; }
+// STRH Wt, [Xn, #imm12*2]
+inline bool is_strh_imm(uint32_t w) { return (w & 0xFFC00000u) == 0x79000000u; }
+// UBFM/alias (ubfx / lsl-imm / lsr-imm, 32-bit)
+inline bool is_ubfm_w(uint32_t w) { return (w & 0xFFC00000u) == 0x53000000u; }
+// ORR Wd, Wn, Wm (shifted-register, includes MOV Wd,Wm)
+inline bool is_orr_w_reg(uint32_t w) { return (w & 0xFF200000u) == 0x2A000000u; }
+// ADD/SUB Wd, Wn, #imm12 (32-bit, no flags)
+inline bool is_addsub_w_imm(uint32_t w) { return (w & 0xBF800000u) == 0x11000000u; }
+// LSLV/LSRV/ASRV/RORV Wd, Wn, Wm (dp-2src shift-by-register)
+inline bool is_shiftv_w(uint32_t w) { return (w & 0xFFE0F000u) == 0x1AC02000u; }
+// MOVZ/MOVN/MOVK (32/64)
+inline bool is_movwide(uint32_t w) { return (w & 0x1F800000u) == 0x12800000u; }
+// Body-side integer ALU classes (reads don't matter there — only the Rd
+// write is checked against the pins): ADD/SUB[S] imm any width, add/sub reg,
+// logical reg, logical imm, dp-2src/cond-select, dp-3src, bitfield.
+inline bool is_int_alu_rd(uint32_t w) {
+    const uint32_t cls = w & 0x1F000000u;
+    return cls == 0x11000000u ||  // ADD/SUB[S] imm (32/64)
+           cls == 0x0B000000u ||  // ADD/SUB[S] shifted/extended reg
+           cls == 0x0A000000u ||  // AND/ORR/EOR/ANDS shifted reg
+           cls == 0x12000000u ||  // logical imm / movwide
+           cls == 0x1A000000u ||  // dp-2src, CSEL family, ADC
+           cls == 0x1B000000u ||  // MADD/MSUB
+           cls == 0x13000000u;    // SBFM/BFM/UBFM/extract
+}
+// LDR Dt, [Xn, Xm] (option LSL, S=0 or S=1)
+inline bool is_ldr_d_regoff(uint32_t w) { return (w & 0xFFE0EC00u) == 0xFC606800u; }
+// STR Dt, [Xn, Xm] (option LSL, S=0 or S=1)
+inline bool is_str_d_regoff(uint32_t w) { return (w & 0xFFE0EC00u) == 0xFC206800u; }
+// Any load/store class touching memory (used to sort remaining mem ops):
+// top-level op0 x1x0 at bits 28-25.
+inline bool is_ldst_class(uint32_t w) { return (w & 0x0A000000u) == 0x08000000u; }
+// Loads write a register; bit 22 distinguishes load within most ldst classes
+// we accept below (unsigned-imm, unscaled, reg-offset, literal excluded).
+inline bool ldst_is_load(uint32_t w) { return (w & 0x00400000u) != 0; }
+// SIMD/FP register file destination? (V bit 26 in the ldst classes)
+inline bool ldst_is_fpr(uint32_t w) { return (w & 0x04000000u) != 0; }
+// Scalar FP data-processing (1-src/2-src/3-src/convert): op0 pattern
+// x111_1010..x111_1110 → accept 0x1E/0x1F/0x5E/0x7E leading bytes plus SIMD
+// 0x0E/0x2E/0x4E/0x6E. All write Vd = w&31.
+inline bool is_fp_simd_dp(uint32_t w) {
+    const uint32_t hi = w >> 24;
+    switch (hi & 0xDFu) {  // fold bit 29 (0x20)
+        case 0x1E: case 0x1F: case 0x5E: case 0x0E: case 0x4E:
+            return true;
+        default:
+            return false;
+    }
+}
+// Unconditional branch-class or system-class word (BL/BLR/B/RET/TBZ/etc.):
+// op0 101x at bits 28-25 (branches, exception, system).
+inline bool is_branch_or_sys(uint32_t w) { return (w & 0x1C000000u) == 0x14000000u; }
+inline bool is_nop_hint(uint32_t w) { return (w & 0xFFFFF01Fu) == 0xD503201Fu; }
+
+struct SelfLoopVerdict {
+    bool qualify = false;
+    const char* reason = "";  // decline reason (or "" on qualify)
+    uint32_t detail_word = 0;
+    uint32_t detail_off = 0;  // byte offset within the region
+    uint32_t skip_off = 0;    // byte offset of the skip target within region
+    int fpr = -1;
+    int base_gpr = -1;
+    int key_gpr = -1;
+};
+
+// words[0..n_words) = the block region [head .. next block head); the block's
+// terminator back edge must be the region's last word.
+SelfLoopVerdict analyze_self_loop(volatile uint32_t* words, uint64_t n_words) {
+    SelfLoopVerdict v;
+    auto decline = [&](const char* r, uint64_t idx) {
+        v.qualify = false;
+        v.reason = r;
+        v.detail_off = (uint32_t)(idx * 4);
+        v.detail_word = (idx < n_words) ? words[idx] : 0;
+        return v;
+    };
+    if (n_words < 4)
+        return decline("too-short", 0);
+
+    // 1. Terminator: last word must be a conditional branch back to word 0.
+    const uint64_t be = n_words - 1;
+    const uint32_t be_w = words[be];
+    if (!is_cond_branch(be_w))
+        return decline("terminator-not-cond", be);
+    if ((int64_t)be + cond_branch_offset_words(be_w) != 0)
+        return decline("backedge-target-not-head", be);
+
+    // 2. Skipped region: walk from the head through the priming load.
+    //    Every word must derive only from x18 / X87State memory / earlier
+    //    region defs; the region ends at the first st[] load (reg-offset D
+    //    form based on the state base).
+    uint32_t region_gpr_defs = 0;  // bit per GPR defined in the region
+    auto region_reads_ok = [&](int r) {
+        return r == 18 || r == 31 || (region_gpr_defs >> r) & 1u;
+    };
+    int base_gpr = -1;
+    uint64_t ldr_idx = 0;
+    bool found_load = false;
+    for (uint64_t i = 0; i < be && !found_load; i++) {
+        const uint32_t w = words[i];
+        if (is_add_x_imm(w) && rn_of(w) == 18) {
+            region_gpr_defs |= 1u << rd_of(w);
+            base_gpr = rd_of(w);  // latest x18-derived base
+        } else if (is_ldrh_imm(w) &&
+                   (rn_of(w) == 18 || (base_gpr >= 0 && rn_of(w) == base_gpr))) {
+            region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_ubfm_w(w)) {
+            if (!region_reads_ok(rn_of(w)))
+                return decline("prefix-reads-outside", i);
+            region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_orr_w_reg(w)) {
+            if (!region_reads_ok(rn_of(w)) || !region_reads_ok(rm_of(w)))
+                return decline("prefix-reads-outside", i);
+            region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_addsub_w_imm(w)) {
+            if (!region_reads_ok(rn_of(w)))
+                return decline("prefix-reads-outside", i);
+            region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_shiftv_w(w)) {
+            if (!region_reads_ok(rn_of(w)) || !region_reads_ok(rm_of(w)))
+                return decline("prefix-reads-outside", i);
+            region_gpr_defs |= 1u << rd_of(w);
+        } else if (is_ldr_d_regoff(w)) {
+            if (base_gpr < 0 || rn_of(w) != base_gpr)
+                return decline("prime-load-base", i);
+            if (!((region_gpr_defs >> rm_of(w)) & 1u))
+                return decline("prime-load-key", i);
+            ldr_idx = i;
+            found_load = true;
+        } else {
+            return decline("prefix-unrecognized", i);
+        }
+    }
+    if (!found_load)
+        return decline("no-priming-load", 0);
+
+    const int fpr = rd_of(words[ldr_idx]);
+    const int key_gpr = rm_of(words[ldr_idx]);
+
+    // 3. Body + gap: [ldr_idx+1 .. be). One st[] store of the same FPR to the
+    //    same base+key; no writes to region-defined GPRs; no FPR write after
+    //    the store; no other state access; default-deny.
+    bool store_seen = false;
+    for (uint64_t i = ldr_idx + 1; i < be; i++) {
+        const uint32_t w = words[i];
+        if (is_str_d_regoff(w)) {
+            if (rn_of(w) != base_gpr)
+                return decline("stray-state-store", i);
+            if (rd_of(w) != fpr || rm_of(w) != key_gpr)
+                return decline("writeback-mismatch", i);
+            if (store_seen)
+                return decline("double-writeback", i);
+            store_seen = true;
+        } else if (is_strh_imm(w) &&
+                   (rn_of(w) == 18 || rn_of(w) == base_gpr)) {
+            return decline("state-halfword-store", i);  // TOP/tag writeback
+        } else if (is_fp_simd_dp(w)) {
+            if (rd_of(w) == fpr && store_seen)
+                return decline("fpr-write-after-store", i);
+        } else if (is_nop_hint(w)) {
+            // fine
+        } else if (is_branch_or_sys(w) || is_cond_branch(w)) {
+            return decline("branch-in-body", i);
+        } else if (is_ldst_class(w)) {
+            if (rn_of(w) == base_gpr || rn_of(w) == 18)
+                return decline("state-access-in-body", i);
+            if (ldst_is_load(w)) {
+                const int t = rd_of(w);
+                if (ldst_is_fpr(w)) {
+                    if (t == fpr)
+                        return decline("pin-fpr-load", i);
+                } else {
+                    if ((region_gpr_defs >> t) & 1u)
+                        return decline("pin-gpr-load", i);
+                }
+            }
+            // Stores to non-state bases are guest memory — cannot alias
+            // X87State (it lives in the runtime thread context).
+        } else if (is_int_alu_rd(w)) {
+            // Rd==31 is WZR/XZR (or SP for ADD imm — Rosetta never retargets
+            // SP mid-block through this path); never a pin.
+            if (rd_of(w) != 31 && ((region_gpr_defs >> rd_of(w)) & 1u))
+                return decline("pin-gpr-write", i);
+        } else {
+            return decline("body-unrecognized", i);
+        }
+    }
+    if (!store_seen)
+        return decline("no-writeback", 0);
+
+    v.qualify = true;
+    v.skip_off = (uint32_t)((ldr_idx + 1) * 4);
+    v.fpr = fpr;
+    v.base_gpr = base_gpr;
+    v.key_gpr = key_gpr;
+    return v;
 }
 
 }  // namespace
@@ -93,6 +361,45 @@ void x87_backedge_module_post(TranslationResult* result) {
                  (unsigned long long)scan.backward_cond,
                  (unsigned long long)scan.zero_off_cond,
                  cfg->backedge_noop_probe ? " probe=on" : "");
+
+    // ── Stage 1: analyze recorded self-loop blocks (log-only) ──────────────
+    if (cfg->log_backedge && result == g_rec_owner) {
+        if (g_block_recs_overflow)
+            CORE_LOG("backedge-cand: block records overflowed, module skipped");
+        else {
+            for (uint32_t bi = 0; bi < g_num_block_recs; bi++) {
+                const BlockRec& rec = g_block_recs[bi];
+                if (!rec.self_loop)
+                    continue;
+                const uint32_t end_off = (bi + 1 < g_num_block_recs)
+                                             ? g_block_recs[bi + 1].arm_off
+                                             : (uint32_t)(n_words * 4);
+                if (rec.arm_off >= end_off || (rec.arm_off & 3) ||
+                    end_off > n_words * 4) {
+                    CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x DECLINE "
+                             "reason=bad-region",
+                             rec.start_pc, rec.arm_off);
+                    continue;
+                }
+                SelfLoopVerdict v = analyze_self_loop(
+                    words + rec.arm_off / 4, (end_off - rec.arm_off) / 4);
+                if (v.qualify)
+                    CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x QUALIFY "
+                             "skip=+0x%x fpr=d%d base=x%d key=x%d",
+                             rec.start_pc, rec.arm_off, v.skip_off, v.fpr,
+                             v.base_gpr, v.key_gpr);
+                else
+                    CORE_LOG("backedge-cand: pc=0x%x arm=+0x%x DECLINE "
+                             "reason=%s at=+0x%x word=0x%08x",
+                             rec.start_pc, rec.arm_off, v.reason, v.detail_off,
+                             v.detail_word);
+            }
+        }
+    }
+    // Consume the records — a module that skips its post-pass must not leak
+    // records into the next module's analysis.
+    if (result == g_rec_owner)
+        g_rec_owner = nullptr;
 }
 
 void x87_backedge_apply_fixups_audit(TranslationResult* result,

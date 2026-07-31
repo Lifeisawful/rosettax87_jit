@@ -9,6 +9,7 @@
 #include "rosetta_core/TranslatorX87.h"
 #include "rosetta_core/TranslatorX87Fusion.h"
 #include "rosetta_core/TranslatorX87Helpers.hpp"
+#include "rosetta_core/X87BackEdge.h"
 #include "rosetta_core/X87Cache.h"
 #include "rosetta_core/X87IR.h"
 #include "rosetta_config/Config.h"
@@ -209,6 +210,10 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
             }
             cache.invalidate(translation_result->free_gpr_mask, kGprScratchMask);
             cache.prev_block = block;
+            // OPT-BE stage 1: record block start offset + self-loop-ness for
+            // the post-translate candidate analysis (inert unless
+            // ROSETTA_X87_LOG_BACKEDGE=1).
+            x87_backedge_note_block(translation_result, block);
         }
         if (!cache.active()) {
             const bool cache_disabled = g_rosetta_config && g_rosetta_config->disable_x87_cache;
