@@ -525,6 +525,54 @@ static uint32_t sahf_ah_direct(void) {
     return (r1 << 4) | r2;   /* expect 0x01 */
 }
 
+/* ── Stage 6: reg-reg ALU / cmp-mem / imul (GuestAluRR, R3-9) ───────────── */
+
+/* Reg-reg add/xor/sub interleaved with x87; flags die at the trailing test. */
+static uint32_t alu_rr_chain(uint32_t x, uint32_t y, double *d) {
+    uint32_t r = x;
+    __asm__ volatile(
+        "fldl (%2)\n"
+        "addl %1, %0\n"
+        "fchs\n"
+        "xorl %1, %0\n"
+        "fldl 8(%2)\n"
+        "subl %1, %0\n"
+        "faddp\n"
+        "fstpl (%2)\n"
+        "testl %0, %0\n"
+        : "+r"(r) : "r"(y), "r"(d) : "memory", "cc");
+    return r;   /* ((x+y)^y)-y */
+}
+
+/* imul r,r,imm (3-op) and imul r,r (2-op) mid-run. */
+static uint32_t imul_forms(uint32_t x, uint32_t y, double *d) {
+    uint32_t r = 0;
+    __asm__ volatile(
+        "fldl (%3)\n"
+        "imull $10, %1, %0\n"   /* r = x*10 */
+        "fchs\n"
+        "imull %2, %0\n"        /* r *= y */
+        "fstpl (%3)\n"
+        "testl %0, %0\n"
+        : "=r"(r) : "r"(x), "r"(y), "r"(d) : "memory", "cc");
+    return r;   /* x*10*y */
+}
+
+/* cmp reg, [m] mid-run, consumed setb reads the borrow. */
+static uint32_t cmp_mem_setb(uint32_t x, double *d) {
+    uint32_t m = 5, r = 0;
+    __asm__ volatile(
+        "fldl (%3)\n"
+        "cmpl %2, %1\n"         /* flags of x - m */
+        "setb %%al\n"
+        "fchs\n"
+        "fstpl (%3)\n"
+        "movzbl %%al, %0\n"
+        "testl %0, %0\n"
+        : "=r"(r) : "r"(x), "m"(m), "r"(d) : "eax", "memory", "cc");
+    return r;   /* 1 iff x < 5 */
+}
+
 int main(void) {
     float v[4] = {2.0f, 3.0f, 4.0f, 55.5f};
     uint32_t z = 0x12345678;
@@ -651,8 +699,21 @@ int main(void) {
     check_u("fnstsw/sahf/setb+sete (2 == 2)", fnstsw_sahf_tail(2.0, 2.0), 0x01);
     check_u("sahf from raw AH: seta=0, setp=1", sahf_ah_direct(), 0x01);
 
+    /* ── Stage 6: reg-reg ALU / cmp-mem / imul ── */
+    {
+        double dd[2] = {2.0, 3.0};
+        check_u("reg-reg add/xor/sub chain mid-run",
+                alu_rr_chain(1000, 77, dd), ((1000u + 77u) ^ 77u) - 77u);
+        check_u("  (fp results intact)", dd[0] == 1.0 && dd[1] == 3.0, 1);
+        double dv = 4.0;
+        check_u("imul 3-op + 2-op mid-run", imul_forms(7, 3, &dv), 210);
+        check_u("  (fchs applied)", dv == -4.0, 1);
+        check_u("cmp r,[m]; setb (3 < 5)", cmp_mem_setb(3, &dv), 1);
+        check_u("cmp r,[m]; setb (9 > 5)", cmp_mem_setb(9, &dv), 0);
+    }
+
     if (failures == 0)
-        printf("ALL TESTS PASSED (53 tests)\n");
+        printf("ALL TESTS PASSED (59 tests)\n");
     else
         printf("%d TESTS FAILED\n", failures);
     return failures != 0;

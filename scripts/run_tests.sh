@@ -165,6 +165,12 @@ check_output() {
         echo -e "${YELLOW}SKIP${NC}  $name"
         ERRORS=$((ERRORS + 1))
         echo "$out" | grep -E 'SKIP' | head -1 | sed 's/^/      /'
+    elif ! echo "$out" | grep -qE 'PASS'; then
+        # No PASS marker at all: the binary crashed or printed nothing —
+        # a translation-time segfault produced a green suite once (a crash
+        # kills the process before any test output flushes). Count as FAIL.
+        echo -e "${RED}FAIL${NC}  $name (no output — crash?)"
+        FAILED=$((FAILED + 1))
     else
         echo -e "${GREEN}PASS${NC}  $name"
         PASSED=$((PASSED + 1))

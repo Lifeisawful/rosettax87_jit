@@ -548,6 +548,21 @@ auto emit_fccmp_f64(AssemblerBuffer& buf, int Dn, int Dm, int nzcv, int cond) ->
 }
 
 // =============================================================================
+// MADD Rd, Rn, Rm, Ra — Rd = Ra + Rn*Rm (MUL when Ra = ZR)
+// Encoding: sf | 00 | 11011 | 000 | Rm | 0 | Ra | Rn | Rd — base 0x1B000000
+// =============================================================================
+auto emit_madd(AssemblerBuffer& buf, int is_64bit, int Rd, int Rn, int Rm,
+               int Ra) -> void {
+    uint32_t insn = 0x1B000000u;
+    insn |= (uint32_t)(is_64bit & 1) << 31;
+    insn |= (uint32_t)(Rm & 0x1F) << 16;
+    insn |= (uint32_t)(Ra & 0x1F) << 10;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(Rd & 0x1F);
+    buf.emit(insn);
+}
+
+// =============================================================================
 // CFINV — invert PSTATE.C (ARMv8.4 FlagM; Rosetta itself emits it after its
 // ADDS translations to keep the stored guest convention C = ¬CF).
 // =============================================================================

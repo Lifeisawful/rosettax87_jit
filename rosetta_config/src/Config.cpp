@@ -335,6 +335,10 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_GUEST_SAHF"))
         cfg.disable_guest_sahf = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: no reg-reg ALU / imul consumption (GuestAluRR, R3-9).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_GUEST_ALU_RR"))
+        cfg.disable_guest_alu_rr = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

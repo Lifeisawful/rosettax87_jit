@@ -103,7 +103,7 @@ static uint64_t push_rsp_semantics(double *m) {
         "fchs\n"
         "popq %0\n"
         "fstpl (%2)\n"
-        : "=r"(pushed), "=r"(before) : "r"(m) : "memory");
+        : "=&r"(pushed), "=&r"(before) : "r"(m) : "memory");
     return pushed == before;  /* x86: push rsp stores the pre-push value */
 }
 
@@ -119,7 +119,11 @@ static uint64_t pushed_slot_visible(double *m) {
         "movq (%%rsp), %0\n"     /* read the slot the push just wrote */
         "fstpl (%1)\n"
         "popq %%rcx\n"
-        : "=r"(seen) : "r"(m) : "rcx", "memory");
+        /* "=&r": %0 is written before the last read of %1 — without the
+         * early-clobber clang shared rax between them (fstpl through the
+         * 0xC0FFEE it had just loaded into %0; crashed since the test was
+         * introduced, masked by the empty-output suite hole). */
+        : "=&r"(seen) : "r"(m) : "rcx", "memory");
     return seen;
 }
 

@@ -705,6 +705,7 @@ static bool pair_node_skippable(Op op, bool lead_is_load) {
         // as does GuestRmwR which both reads and writes it.)
         case Op::GuestMovRR: case Op::GuestMovRI:
         case Op::GuestLea: case Op::GuestExt: case Op::GuestAluRI:
+        case Op::GuestAluRR:
             return true;
         default:
             return false;
@@ -1140,6 +1141,8 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
                                              /*LSL*/0, p.dst, 0, GPR::XZR,
                                              p.dst);
                     break;
+                case GuestAlu::Mul:
+                    break;  // GuestAluRR-only selector — unreachable here
             }
             break;
         }
@@ -1151,6 +1154,8 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             // aux bit 5 (test only): append CFINV — x86 TEST defines CF=0,
             // and the stored guest convention is C = ¬CF, so a live/consumed
             // C-reader needs C=1 where ANDS left 0 (see build_guest_cmp).
+            // aux bit 6: mem RHS — handled by the MAIN lower switch (it
+            // needs the cached-access lambdas); unreachable here.
             const bool cf_fix = (n.aux & 0x20) != 0;
             if (n.aux & 0x10) {
                 // OPT-PS (plan_test_shortcut): the tested value is the FSTSW
@@ -1283,6 +1288,51 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             emit_msr_nzcv(buf, Wt);
             free_gpr(result, Wp);
             free_gpr(result, Wt);
+            break;
+        }
+        case Op::GuestAluRR: {
+            // Reg-reg ALU / imul (R3-9): flag-free shifted-reg forms and
+            // MADD-with-XZR (MUL). The 3-operand imul materializes its
+            // immediate into a scratch (XZR hint: imm 0 multiplies by ZR).
+            const int is64 = p.is64 ? 1 : 0;
+            switch (static_cast<GuestAlu>(n.aux & 0xF)) {
+                case GuestAlu::Add:
+                case GuestAlu::Sub:
+                    emit_add_sub_shifted_reg(
+                        buf, is64,
+                        (static_cast<GuestAlu>(n.aux & 0xF) == GuestAlu::Sub)
+                            ? 1 : 0,
+                        /*S=*/0, /*LSL*/0, p.src, 0, p.dst, p.dst);
+                    break;
+                case GuestAlu::And:
+                case GuestAlu::Or:
+                case GuestAlu::Xor: {
+                    const auto a = static_cast<GuestAlu>(n.aux & 0xF);
+                    const int opc = (a == GuestAlu::And) ? 0
+                                    : (a == GuestAlu::Or) ? 1
+                                                          : 2;  // EOR
+                    emit_logical_shifted_reg(buf, is64, opc, 0, /*LSL*/0,
+                                             p.src, 0, p.dst, p.dst);
+                    break;
+                }
+                case GuestAlu::Mul:
+                default: {
+                    if (n.aux & 0x10) {
+                        // imul dst, src, imm (r64 sign-extends the imm32).
+                        const uint64_t v =
+                            p.is64 ? static_cast<uint64_t>(static_cast<int64_t>(
+                                         static_cast<int32_t>(p.imm)))
+                                   : p.imm;
+                        const int Rt =
+                            emit_load_immediate(result, is64, v, GPR::XZR);
+                        emit_madd(buf, is64, p.dst, p.src, Rt, GPR::XZR);
+                        free_gpr(result, Rt);
+                    } else {
+                        emit_madd(buf, is64, p.dst, p.dst, p.src, GPR::XZR);
+                    }
+                    break;
+                }
+            }
             break;
         }
         case Op::GuestSetcc: {
@@ -1459,8 +1509,10 @@ static void plan_test_shortcut(Context& ctx) {
 
             // Guest-register writers (all NZCV-transparent): invalidate the
             // captured image when they redefine its register.
+            // (GuestAluRR forms are flag-free lowerings — consumption gated
+            // them on flag-deadness — so they are NZCV-transparent too.)
             case Op::GuestMovRR: case Op::GuestMovRI: case Op::GuestExt:
-            case Op::GuestLea: case Op::GuestAluRI: {
+            case Op::GuestLea: case Op::GuestAluRI: case Op::GuestAluRR: {
                 const GuestPayload p = guest_unpack(n.imm_bits);
                 if (p.dst == ax_reg) ax_reg = -1;
                 break;
@@ -2876,9 +2928,30 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::GuestPushR:
         case Op::GuestPushI:
         case Op::GuestPop:
-        case Op::GuestCmpF:
+        case Op::GuestAluRR:
         case Op::GuestSetcc:
         case Op::GuestSahf:
+            emit_guest_node(*result, buf, n);
+            break;
+
+        case Op::GuestCmpF:
+            if (n.aux & 0x40) {
+                // cmp r, [m] (R3-9): scratch load + SUBS. Lives here (not in
+                // emit_guest_node) for the cached-access lambdas. The union
+                // holds mem_operand, so the register rides in aux ([11:8] =
+                // lhs reg, bit 12 = 64-bit).
+                const int lhs = static_cast<int>((n.aux >> 8) & 0xF);
+                const int is64 = (n.aux & 0x1000) ? 1 : 0;
+                const int sz = guest_mem_size_log2(n.mem_operand);
+                const int Wt = alloc_free_gpr(*result);
+                if (!emit_cached_gpr_access(n, sz, /*is_load=*/1, Wt))
+                    emit_gpr_mem_access(*result, /*is_64bit=*/1, n.mem_operand,
+                                        sz, /*is_load=*/1, Wt);
+                emit_add_sub_shifted_reg(buf, is64, /*is_sub=*/1, /*S=*/1,
+                                         /*LSL*/0, Wt, 0, lhs, GPR::XZR);
+                free_gpr(*result, Wt);
+                break;
+            }
             emit_guest_node(*result, buf, n);
             break;
 
@@ -3720,10 +3793,13 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached,
         // Imm stores also materialize the value into a scratch: 2. RMW
         // holds its value scratch across the uncached address computation: 2.
         // Scalar-SSE moves (OPT-A3) are the same shape: data lives in the
-        // guest xmm, only the address computation allocates.
+        // guest xmm, only the address computation allocates. SseGetXmm is a
+        // pure register binding — no GPRs at all.
         case Op::GuestLoad: case Op::GuestStoreR:
         case Op::SseLoad: case Op::SseStore:
             transient = 1;
+            break;
+        case Op::SseGetXmm:
             break;
         case Op::GuestStoreI: case Op::GuestRmwR:
             transient = 2;
@@ -3737,8 +3813,15 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached,
             transient = 1;
             break;
 
-        // cmp/test: one scratch when the immediate fits no SUBS/ANDS form.
+        // cmp/test: one scratch when the immediate fits no SUBS/ANDS form;
+        // the mem-RHS form (aux bit 6) loads into a scratch through a
+        // possibly-uncached address: 2.
         case Op::GuestCmpF:
+            transient = (n.aux & 0x40) ? 2 : 1;
+            break;
+
+        // reg-reg ALU / imul: one scratch for the 3-operand immediate.
+        case Op::GuestAluRR:
             transient = 1;
             break;
 

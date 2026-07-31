@@ -256,6 +256,10 @@ auto emit_ccmn_imm(AssemblerBuffer& buf, int is_64bit, int Rn, int imm5,
 // CFINV — invert PSTATE.C (ARMv8.4 FlagM)
 auto emit_cfinv(AssemblerBuffer& buf) -> void;
 
+// MADD Rd, Rn, Rm, Ra — Rd = Ra + Rn*Rm (MUL when Ra = ZR)
+auto emit_madd(AssemblerBuffer& buf, int is_64bit, int Rd, int Rn, int Rm,
+               int Ra) -> void;
+
 // FCMP Dn, #0.0 — compare FP register against zero, sets NZCV
 auto emit_fcmp_zero_f64(AssemblerBuffer& buf, int Dn) -> void;
 

@@ -379,7 +379,7 @@ static void pass_dse(Context& ctx) {
             case Op::GuestMovRR: case Op::GuestMovRI:
             case Op::GuestLea: case Op::GuestExt:
             case Op::GuestLoad: case Op::GuestStoreR: case Op::GuestStoreI:
-            case Op::GuestAluRI: case Op::GuestRmwR:
+            case Op::GuestAluRI: case Op::GuestAluRR: case Op::GuestRmwR:
             case Op::GuestPushR: case Op::GuestPushI: case Op::GuestPop:
             case Op::GuestCmpF:   // defines live guest flags
             case Op::GuestSahf:   // installs guest flags from AH

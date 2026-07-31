@@ -147,6 +147,11 @@ enum class Op : uint8_t {
     GuestAluRI,     // add/sub/and/or/xor r32/r64, imm; shl/shr/sar r32/r64, imm;
                     // inc/dec r (imm=1); neg r; not r (flag-neutral, INT tier)
                     // (payload in imm_bits, GuestAlu selector in aux)
+    GuestAluRR,     // reg-reg forms (R3-9): add/sub/and/or/xor r32/r64, r
+                    // (dst op= src), imul r,r (dst *= src, GuestAlu::Mul),
+                    // and imul r,r,imm (dst = src*imm; aux bit 4). Same
+                    // flag-dead gate as the reg-imm forms; flag-free
+                    // shifted-reg / MUL lowerings. aux[3:0] = GuestAlu.
     GuestRmwR,      // {add,sub,and,or,xor} [m32/m64], r — load/ALU/store
                     // (mem_operand + aux: bits[3:0] src reg, bits[6:4] GuestAlu)
 
@@ -220,7 +225,8 @@ enum class Op : uint8_t {
 // GuestRmwR's 3-bit field only ever carries Add..Xor; the unary selectors
 // (Neg = SUB from XZR, Not = ORN from XZR) are GuestAluRI-only.
 enum class GuestAlu : uint8_t { Add = 0, Sub, And, Or, Xor, Shl, Shr, Sar,
-                                Neg, Not };
+                                Neg, Not,
+                                Mul };  // GuestAluRR only (imul forms)
 
 enum NodeFlags : uint8_t {
     kNone         = 0,

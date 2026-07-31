@@ -809,9 +809,29 @@ static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
     if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr()) return false;
     const bool is64 = dst.reg.size == IROperandSize::S64;
     if (!is64 && dst.reg.size != IROperandSize::S32) return false;
+    // Reg-reg add/sub/and/or/xor (R3-9): one flag-free shifted-reg insn
+    // under the same flag-dead gate (already checked above). Shifts by CL
+    // stay declined (count register, different semantics).
+    if (src.kind == IROperandKind::Register &&
+        static_cast<GuestAlu>(alu) <= GuestAlu::Xor) {
+        if (g_rosetta_config->disable_guest_alu_rr) return false;
+        if (!src.reg.reg.is_gpr() || src.reg.size != dst.reg.size)
+            return false;
+        GuestPayload p = {};
+        p.dst = dst.reg.reg.index();
+        p.src = src.reg.reg.index();
+        p.is64 = is64;
+        auto id = ctx.add_node(Op::GuestAluRR);
+        if (id < 0) return false;
+        ctx.nodes[id].imm_bits = guest_pack(p);
+        ctx.nodes[id].aux = static_cast<uint64_t>(alu);
+        ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+        mem_cse_evict_reg(ctx, p.dst);
+        return true;
+    }
     if (src.kind == IROperandKind::Register || src.kind == IROperandKind::MemRef ||
         src.kind == IROperandKind::AbsMem)
-        return false;  // shift-by-CL / reg-reg ALU / mem source
+        return false;  // shift-by-CL / mem source
     if (src.kind == IROperandKind::Immediate && src.imm.mem_flags != 0)
         return false;  // fixup: the payload is the target, not the literal
     uint32_t imm = static_cast<uint32_t>(src.imm.value);
@@ -846,6 +866,56 @@ static bool build_guest_alu(Context& ctx, IRInstr* instr, uint16_t op) {
     if (id < 0) return false;
     ctx.nodes[id].imm_bits = guest_pack(p);
     ctx.nodes[id].aux = static_cast<uint64_t>(alu);
+    ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
+    mem_cse_evict_reg(ctx, p.dst);
+    return true;
+}
+
+// ── imul r,r / imul r,r,imm (TRANSPARENT_FLAGS, R3-9) ──────────────────────
+//
+// The report's "full run killer": imul was neither consumable nor (until
+// the mul-imul family audit) bridgeable. Register forms lower flag-free —
+// MUL (MADD with XZR accumulator), plus an immediate materialization for
+// the 3-operand form. imul defines OF/CF (SF/ZF/AF/PF architecturally
+// undefined, but Rosetta's rows model them defined) → full kEflagsArith
+// gate, same stance as the binary ALU forms. Memory sources decline
+// (bridge covers them); 8/16-bit forms decline (partial-register merge).
+static bool build_guest_imul(Context& ctx, IRInstr* instr) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
+    if (g_rosetta_config->disable_guest_alu_rr) return false;
+    if (instr->flag_liveness & kEflagsArith) return false;
+    if (instr->num_operands < 2) return false;
+    const IROperand& dst = instr->operands[0];
+    const IROperand& src = instr->operands[1];
+    if (dst.kind != IROperandKind::Register || !dst.reg.reg.is_gpr())
+        return false;
+    const bool is64 = dst.reg.size == IROperandSize::S64;
+    if (!is64 && dst.reg.size != IROperandSize::S32) return false;
+    if (src.kind != IROperandKind::Register || !src.reg.reg.is_gpr() ||
+        src.reg.size != dst.reg.size)
+        return false;
+
+    GuestPayload p = {};
+    p.dst = dst.reg.reg.index();
+    p.src = src.reg.reg.index();
+    p.is64 = is64;
+    uint64_t aux = static_cast<uint64_t>(GuestAlu::Mul);
+    if (instr->num_operands >= 3) {
+        // imul r, r, imm — dst = src * imm (dst not read).
+        const IROperand& im = instr->operands[2];
+        if (im.kind == IROperandKind::Register ||
+            im.kind == IROperandKind::MemRef ||
+            im.kind == IROperandKind::AbsMem)
+            return false;
+        if (im.kind == IROperandKind::Immediate && im.imm.mem_flags != 0)
+            return false;
+        p.imm = static_cast<uint32_t>(im.imm.value);
+        aux |= 0x10u;
+    }
+    auto id = ctx.add_node(Op::GuestAluRR);
+    if (id < 0) return false;
+    ctx.nodes[id].imm_bits = guest_pack(p);
+    ctx.nodes[id].aux = aux;
     ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
     mem_cse_evict_reg(ctx, p.dst);
     return true;
@@ -1031,7 +1101,27 @@ static bool build_guest_cmp(Context& ctx, IRInstr* instr, uint16_t op) {
             reg_rhs = true;
         } else if (rhs.kind == IROperandKind::MemRef ||
                    rhs.kind == IROperandKind::AbsMem) {
-            return false;
+            // cmp r, [m] (R3-9): scratch LDR + SUBS under the existing
+            // gates. cmp only — no x86 `test r, m` form reaches here with
+            // a mem RHS worth the width games use. Width must match the
+            // 32/64-bit register side.
+            if (is_test) return false;
+            const IROperandSize msz = guest_mem_size(rhs);
+            if (msz != lhs.reg.size) return false;
+            if (!guest_mem_operand_ok(rhs,
+                                      /*allow64=*/msz == IROperandSize::S64))
+                return false;
+            auto id = ctx.add_node(Op::GuestCmpF);
+            if (id < 0) return false;
+            // imm_bits and mem_operand share the Node union — the mem form
+            // carries its register metadata in aux (bit 6 = mem-rhs cmp,
+            // [11:8] = lhs reg, bit 12 = 64-bit).
+            ctx.nodes[id].mem_operand = &instr->operands[1];
+            ctx.nodes[id].aux = 0x40u |
+                                (static_cast<uint64_t>(p.dst & 0xF) << 8) |
+                                (p.is64 ? 0x1000u : 0u);
+            ctx.last_guest_flagdef = id;
+            return true;
         } else {
             if (rhs.kind == IROperandKind::Immediate && rhs.imm.mem_flags != 0)
                 return false;  // fixup: payload is the relocation target
@@ -2109,6 +2199,11 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
             // ── Guest flag definer from AH: sahf (FLAGS tier, R3-1) ─────
             case kOpcodeName_sahf:
                 ok = build_guest_sahf(ctx, instr);
+                break;
+
+            // ── imul r,r / imul r,r,imm (FLAGS tier, R3-9) ──────────────
+            case kOpcodeName_imul:
+                ok = build_guest_imul(ctx, instr);
                 break;
 
             // ── push/pop (opt-in TRANSPARENT_PUSHPOP) ───────────────────
