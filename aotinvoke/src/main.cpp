@@ -19,6 +19,7 @@
 #include "rosetta_core/ModuleResult.h"
 #include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/TranslationResult.h"
+#include "rosetta_core/X87BackEdge.h"
 #include "rosetta_core/X87Cache.h"
 #include "rosetta_core/hook.h"
 #include <rosetta_config/Config.h>
@@ -151,6 +152,12 @@ int main(int argc, char** argv) {
 
     auto translate_result = g_rosetta_aot.translate(module_result);
 
+    // OPT-BE post-module hook. aotinvoke calls libRosettaAot's translate
+    // directly (no runtime-dylib export in the path), so invoke the shared
+    // post-pass explicitly — same point in the pipeline as the production
+    // translator_translate wrapper: after all blocks, before get_data/fixups.
+    x87_backedge_module_post(translate_result);
+
     if (demand) {
         ModulePrintHooks hooks;
         hooks.annotate_block = [](const IRBlock& block) {
@@ -183,6 +190,10 @@ int main(int argc, char** argv) {
     g_rosetta_aot.apply_internal_fixups(translate_result, 0x1000, (std::uint8_t*)translate_data);
     g_rosetta_aot.apply_segmented_runtime_routine_fixups(translate_result,
                                                          (std::uint8_t*)translate_data, 0x1000);
+
+    // OPT-BE G0.4 audit (AOT flavor): did the fixup passes rewrite any
+    // backward conditional branch in the published copy?
+    x87_backedge_apply_fixups_audit(translate_result, (std::uint8_t*)translate_data);
 
     auto out = std::ofstream(out_path, std::ios::binary);
     out.write((const char*)translate_data, translate_data_size);

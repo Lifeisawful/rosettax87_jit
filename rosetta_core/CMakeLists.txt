@@ -27,6 +27,7 @@ set(ROSETTA_CORE_SOURCES
     src/TranslatorX87Helpers.cpp
     src/X87Cache.cpp
     src/X87BridgeDemand.cpp
+    src/X87BackEdge.cpp
     src/X87IRBuild.cpp
     src/X87IROptimize.cpp
     src/X87IRLower.cpp

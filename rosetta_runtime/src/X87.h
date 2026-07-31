@@ -59,7 +59,12 @@ using module_is_bad_access_t = decltype(&module_is_bad_access);
 void module_print();
 using module_print_t = decltype(&module_print);
 
-void translator_translate();
+// Wrapped (not trampolined): OPT-BE needs a post-block patch point, and this
+// export — the sole caller of translate_block — is it. Signature verified
+// against the runtime binary's call site (x0 = ModuleResult*, w1 = mode byte,
+// result pointer consumed by translator_get_size).
+struct TranslationResult;
+TranslationResult* translator_translate(const void* module_result, int mode);
 using translator_translate_t = decltype(&translator_translate);
 
 void translator_free();
@@ -83,7 +88,13 @@ using translator_get_branch_entries_t = decltype(&translator_get_branch_entries)
 void translator_get_instruction_offsets();
 using translator_get_instruction_offsets_t = decltype(&translator_get_instruction_offsets);
 
-void translator_apply_fixups();
+// Wrapped for the OPT-BE stage-0 publication audit (G0.4): logs whether fixup
+// application rewrites any backward conditional branch in the published copy.
+// Signature from the mangled export (TranslationResult*, unsigned char*,
+// unsigned long long); the runtime's single call site ignores the return, but
+// forward it anyway in case other builds differ.
+void* translator_apply_fixups(TranslationResult* result, unsigned char* dest,
+                              unsigned long long addr);
 using translator_apply_fixups_t = decltype(&translator_apply_fixups);
 
 void x87_init(X87State*);

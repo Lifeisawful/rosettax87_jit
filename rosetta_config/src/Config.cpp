@@ -299,6 +299,13 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_WINDOW_DEFER"))
         cfg.disable_window_defer = (*v == '1') ? 1 : 0;
 
+    // OPT-BE stage 0 spike: post-translate hook evidence logging + no-op
+    // buffer-write probe (see X87BackEdge.cpp).
+    if (const char* v = std::getenv("ROSETTA_X87_LOG_BACKEDGE"))
+        cfg.log_backedge = (*v == '1') ? 1 : 0;
+    if (const char* v = std::getenv("ROSETTA_X87_BACKEDGE_NOOP_PROBE"))
+        cfg.backedge_noop_probe = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

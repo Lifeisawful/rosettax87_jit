@@ -42,6 +42,7 @@
 #include "rosetta_core/Opcode.h"
 #include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
+#include "rosetta_core/X87BackEdge.h"
 
 X87_TRAMPOLINE(translator_use_t8027_codegen, x9)
 X87_TRAMPOLINE(translator_reset, x9)
@@ -51,7 +52,17 @@ X87_TRAMPOLINE(module_free, x9)
 X87_TRAMPOLINE(module_get_size, x9)
 X87_TRAMPOLINE(module_is_bad_access, x9)
 X87_TRAMPOLINE(module_print, x9)
-X87_TRAMPOLINE(translator_translate, x9)
+// OPT-BE: real wrapper, not a trampoline — the returned TranslationResult is
+// complete (all blocks + terminators emitted, internal fixups committed in
+// JIT mode) but not yet published via translator_get_data/apply-fixups, so
+// x87_backedge_module_post may inspect and patch it in place. Translation
+// context: guest FP state is live — no FP/SIMD on this path.
+TranslationResult* translator_translate(const void* module_result, int mode) {
+    TranslationResult* result = orig_translator_translate(module_result, mode);
+    x87_backedge_module_post(result);
+    return result;
+}
+
 X87_TRAMPOLINE(translator_free, x9)
 X87_TRAMPOLINE(translator_get_data, x9)
 X87_TRAMPOLINE(translator_get_size, x9)
@@ -59,7 +70,16 @@ X87_TRAMPOLINE(translator_get_branch_slots_offset, x9)
 X87_TRAMPOLINE(translator_get_branch_slots_count, x9)
 X87_TRAMPOLINE(translator_get_branch_entries, x9)
 X87_TRAMPOLINE(translator_get_instruction_offsets, x9)
-X87_TRAMPOLINE(translator_apply_fixups, x9)
+
+// OPT-BE stage-0 G0.4 audit wrapper (inert unless ROSETTA_X87_LOG_BACKEDGE=1):
+// after the original applies fixups to the published copy, diff it against the
+// pre-publication buffer to prove back-edge branch words survive byte-exact.
+void* translator_apply_fixups(TranslationResult* result, unsigned char* dest,
+                              unsigned long long addr) {
+    void* ret = orig_translator_apply_fixups(result, dest, addr);
+    x87_backedge_apply_fixups_audit(result, dest);
+    return ret;
+}
 
 
 void x87_init(X87State* state) {
