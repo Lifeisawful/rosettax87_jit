@@ -2555,6 +2555,60 @@ int demand_sse_arith(const IRInstr* instr) {
     return seq.demand();
 }
 
+// =============================================================================
+// family: sahf  — kOpcodeName_sahf
+// Audit: research/bridge_demand/families/sahf/AUDIT.md (2026-07-31)
+//
+// SPLIT REQUIRED? — NO. One opcode, one case group of two lines (case_slice.c
+// 15328-15329: `translate_sahf(a1); goto LABEL_705;`), one handler
+// translate_sahf (decomp 25063-25095).
+//
+// sahf has NO explicit operands (implicit AH → EFLAGS) and the handler reads
+// no IROperand field at all — grep over the whole package finds no `operands`,
+// `mem_flags`, `disp`, `kind`, `addr_size`, `shift_amount`, `seg_override`.
+// So there is exactly ONE shape and demand is a constant: no kind axis, no
+// Immediate/AbsMem-destination corner, no S32-addressing (ADDR32) corner, and
+// compute_operand_address / translate_prefetch_impl are never reached (hence
+// the GS slot-7 / get_tls_base exclusion is not even relevant here).
+//
+// The handler performs TWO first-free __clz(__rbit32(free_gpr_mask)) allocs:
+//   25074  v3       (the AH source scratch, consumed last by emit_msr 25094)
+//   25080  dst_gpr  (the NZCV assembly scratch, used 25082-25093)
+// They are concurrent — v3 is still live at 25094 — and there is NO
+// free_temporary_gpr anywhere in the package, so both are held until the
+// LABEL_705 epilogue mask reset (15118). Rosetta itself requires two: 25072
+// aborts if the pool is empty before the first alloc and 25077 aborts if it is
+// empty after it ("no temporary GPR available to allocate", 25079).
+//
+// Everything between the two allocs and the return is a pure AArch64 word
+// encoder with cost {0,0}: emit_bitfield (2818-2846, ten calls), emit_csel
+// (2922-2935), emit_msr (3320-3325) and emit_logical_shifted_reg (2699-2729,
+// pruned from the package as a known allocation-free encoder — body verified
+// against the same pinned decomp sha; see the AUDIT's manifest note).
+//
+// DISPOSITIONS. rep_prefix: NO access anywhere in the package (flags.txt
+// "(none)"); sahf has no LOCK/REP encoding and is not in lockable_rmw.
+// flag_liveness: NO access (flags.txt "(none)") — notable because sahf is a
+// pure flag writer, yet the emit block 25082-25094 is unconditional
+// straight-line code with no flag gate, so demand is 2 for every liveness
+// value. No fixed-slot alloc, no runtime BL, no X22/slot-0 fast path (the
+// handler takes no register hint at all). No shape refuses ⇒ plain int.
+// HELPER_COSTS table v3.1 consumed; discrepancy flags: NONE (this family calls
+// no tabled helper).
+// -----------------------------------------------------------------------------
+
+int demand_sahf(const IRInstr* /*instr*/) {
+    Seq seq;
+    // 25074 v3 = __clz(__rbit32(free_gpr_mask)) — first-free, held to 15118.
+    seq.step(Cost{1, 1});
+    // 25080 dst_gpr = __clz(__rbit32(v4)) — first-free, held to 15118, live
+    // concurrently with v3 (both feed emit_bitfield 25093 / emit_msr 25094).
+    seq.step(Cost{1, 1});
+    // 25082-25094 emit_bitfield / emit_csel / emit_logical_shifted_reg /
+    // emit_msr — pure AssemblerBuffer::emit encoders, {0,0}. No free.
+    return seq.demand();
+}
+
 }  // namespace
 
 // =============================================================================
@@ -2851,6 +2905,18 @@ std::optional<int> X87Cache::gap_gpr_demand(const IRInstr* instr) {
         case kOpcodeName_rsqrtss:
         case kOpcodeName_rcpss:
             return demand_sse_arith(instr);
+
+        // ============================ family: sahf =========================
+        // Audit: research/bridge_demand/families/sahf/AUDIT.md (2026-07-31)
+        // Single case group (case_slice.c 15328-15329) → translate_sahf
+        // (decomp 25063-25095): TWO concurrent first-free allocs (25074 v3,
+        // 25080 dst_gpr), both held to the LABEL_705 epilogue (no
+        // free_temporary_gpr in the package); everything else is pure
+        // AssemblerBuffer::emit. No operand fields read → exactly one shape,
+        // constant demand 2. No rep_prefix / flag_liveness access, no
+        // fixed-slot alloc, no runtime BL. Never refused.
+        case kOpcodeName_sahf:
+            return demand_sahf(instr);
 
         // ---- un-audited opcodes: refuse outright, no guessing ----
         default:
