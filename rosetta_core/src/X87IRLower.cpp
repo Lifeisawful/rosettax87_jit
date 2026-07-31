@@ -528,12 +528,13 @@ static void plan_fcomi_raw(Context& ctx) {
             cur = i;
             cur_sink = -1;
             cur_has_eqne = false;
-        } else if (n.op == Op::GuestCmpF) {
-            // A consumed guest cmp/test redefines the guest EFLAGS at its
-            // position: the pending FComI's pack becomes dead (its PF slots
-            // included — the GuestCmpF build gate proved PF dead out of it,
-            // and any in-run fcmovu before here reads the raw VS), and later
-            // FCSels read the SUBS/ANDS flags with their stored x86
+        } else if (n.op == Op::GuestCmpF || n.op == Op::GuestSahf) {
+            // A consumed guest cmp/test (or a sahf install) redefines the
+            // guest EFLAGS at its position: the pending FComI's pack becomes
+            // dead (its PF slots included — the GuestCmpF build gate proved
+            // PF dead out of it, sahf materializes PF itself, and any in-run
+            // fcmovu before here reads the raw VS), and later FCSels read
+            // the SUBS/ANDS (or sahf-installed) flags with their stored x86
             // convention, unmapped.
             finalize(/*overwritten=*/true);
             cur = -1;
@@ -1252,6 +1253,38 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             }
             break;
         }
+        case Op::GuestSahf: {
+            // sahf (R3-1): install SF/ZF/CF/PF from guest AH (w0 bits 15:8)
+            // into the guest-EFLAGS NZCV convention — N=SF, Z=ZF, C=¬CF,
+            // V=PF with the bit-26 mirror (the FComI pack layout; Rosetta's
+            // jp/setp read bit 26 through the MSR handoff). AF/OF gated
+            // dead at build.
+            const int Wt = alloc_free_gpr(result);
+            const int Wp = alloc_free_gpr(result);
+            // SF:ZF sit at w0 bits 15:14 → UBFX pair, LSL to NZCV 31:30.
+            emit_bitfield(buf, 0, /*UBFM*/2, 0, /*immr=*/14, /*imms=*/15,
+                          /*Rn=w0*/0, Wt);
+            emit_bitfield(buf, 0, /*UBFM*/2, 0, /*immr=*/2, /*imms=*/1,
+                          Wt, Wt);                       // LSL Wt, #30
+            // ¬CF: AH.0 = w0 bit 8, inverted into bit 29.
+            emit_bitfield(buf, 0, /*UBFM*/2, 0, /*immr=*/8, /*imms=*/8,
+                          /*Rn=w0*/0, Wp);
+            emit_logical_imm(buf, 0, /*EOR*/2, 0, /*immr=*/0, /*imms=*/0,
+                             Wp, Wp);                    // EOR Wp, Wp, #1
+            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wp, 29,
+                                     Wt, Wt);
+            // PF: AH.2 = w0 bit 10, mirrored at bits 28 and 26.
+            emit_bitfield(buf, 0, /*UBFM*/2, 0, /*immr=*/10, /*imms=*/10,
+                          /*Rn=w0*/0, Wp);
+            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wp, 28,
+                                     Wt, Wt);
+            emit_logical_shifted_reg(buf, 0, /*ORR*/1, 0, /*LSL*/0, Wp, 26,
+                                     Wt, Wt);
+            emit_msr_nzcv(buf, Wt);
+            free_gpr(result, Wp);
+            free_gpr(result, Wt);
+            break;
+        }
         case Op::GuestSetcc: {
             // cls: 0=r8lo, 1=r8hi (AH class), 2=r16 (fused movzx), 3=r32/64
             // full write. The condition was resolved against the producing
@@ -1417,6 +1450,12 @@ static void plan_test_shortcut(Context& ctx) {
                 if (p.dst == ax_reg) ax_reg = -1;
                 break;
             }
+
+            // sahf: the MSR install redefines NZCV — a later test can no
+            // longer read a compare's raw flags. AX itself is only read.
+            case Op::GuestSahf:
+                last_cmp = -1;
+                break;
 
             // Guest-register writers (all NZCV-transparent): invalidate the
             // captured image when they redefine its register.
@@ -1937,7 +1976,14 @@ void lower(Context& ctx, TranslationResult* result) {
             auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
-            if (n.op == Op::GuestCmpF) { has_guest_cmp = true; last_flagdef = i; }
+            if (n.op == Op::GuestCmpF || n.op == Op::GuestSahf) {
+                // GuestSahf: its install reads AX (not NZCV), so like a
+                // consumed cmp/test it proves earlier compares' raw flags
+                // dead; no hoisting across it (the deferred restore would
+                // clobber the installed state).
+                has_guest_cmp = true;
+                last_flagdef = i;
+            }
             if (n.op == Op::FCmp || n.op == Op::FTst) {
                 if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
                 nzcv_last_cmp = i;
@@ -2832,6 +2878,7 @@ void lower(Context& ctx, TranslationResult* result) {
         case Op::GuestPop:
         case Op::GuestCmpF:
         case Op::GuestSetcc:
+        case Op::GuestSahf:
             emit_guest_node(*result, buf, n);
             break;
 
@@ -3526,7 +3573,14 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached,
             const auto& n = ctx.nodes[i];
             if (n.flags & kDead) continue;
             if (n.op == Op::FComI || n.op == Op::FCSel) { has_nzcv_user = true; break; }
-            if (n.op == Op::GuestCmpF) { has_guest_cmp = true; last_flagdef = i; }
+            if (n.op == Op::GuestCmpF || n.op == Op::GuestSahf) {
+                // GuestSahf: its install reads AX (not NZCV), so like a
+                // consumed cmp/test it proves earlier compares' raw flags
+                // dead; no hoisting across it (the deferred restore would
+                // clobber the installed state).
+                has_guest_cmp = true;
+                last_flagdef = i;
+            }
             if (n.op == Op::FCmp || n.op == Op::FTst) {
                 if (nzcv_first_cmp < 0) nzcv_first_cmp = i;
                 nzcv_last_cmp = i;
@@ -3693,6 +3747,11 @@ int peak_live_gprs(const Context& ctx, bool entry_deferred, bool gprs_cached,
         // uniformly, safe direction).
         case Op::GuestSetcc:
             transient = 1;
+            break;
+
+        // sahf: two scratch GPRs for the NZCV-convention pack + MSR.
+        case Op::GuestSahf:
+            transient = 2;
             break;
         }
 

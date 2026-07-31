@@ -222,6 +222,24 @@ static clock_t bench_fcomp_fnstsw_and(void) {
     return clock() - start;
 }
 
+/* The pre-P6 idiom: fcomp; fnstsw; sahf; setcc (R3-1 repro). */
+static clock_t bench_fcomp_fnstsw_sahf(void) {
+    clock_t start = clock();
+    volatile double cmp = 5.0;
+    volatile uint16_t r;
+    for (int i = 0; i < TIMES; i++)
+        __asm__ volatile (
+            "fld1\n\t"
+            "fcompl %1\n\t"
+            "fnstsw %%ax\n\t"
+            "sahf\n\t"
+            "setb %%al\n\t"
+            "movzbw %%al, %%ax\n\t"
+            "movw %%ax, %0\n\t"
+            : "=m"(r) : "m"(cmp) : "ax", "cc");
+    return clock() - start;
+}
+
 int main(void) {
     struct { const char *name; clock_t (*fn)(void); } benches[] = {
         {"fcom_st",   bench_fcom_st},
@@ -238,6 +256,7 @@ int main(void) {
         {"fstsw",     bench_fstsw},
         {"fcomp_fnstsw_test", bench_fcomp_fnstsw_test},
         {"fcomp_fnstsw_and",  bench_fcomp_fnstsw_and},
+        {"fcomp_fnstsw_sahf", bench_fcomp_fnstsw_sahf},
     };
     int n = (int)(sizeof(benches) / sizeof(benches[0]));
     for (int i = 0; i < n; i++) {

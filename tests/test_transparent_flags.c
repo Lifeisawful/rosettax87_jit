@@ -486,6 +486,45 @@ static double test_fcmovb_nomove(double a, double b) {
     return r;   /* always a */
 }
 
+/* ── Stage 5: sahf consumption (GuestSahf, R3-1) ────────────────────────── */
+
+/* The pre-P6 compare idiom: fcomp; fnstsw; sahf; setcc — the trailing
+ * definer+setcc tail absorbs; the setccs resolve against the installed
+ * convention (N=SF, Z=ZF, C=~CF, V=PF). */
+static uint32_t fnstsw_sahf_tail(double x, double y) {
+    uint32_t r1, r2;
+    __asm__ volatile(
+        "fldl %2\n"
+        "fcompl %3\n"
+        "fnstsw %%ax\n"
+        "sahf\n"
+        "setb %%al\n"          /* CF = C0 = x < y */
+        "sete %%cl\n"          /* ZF = C3 = x == y */
+        "movzbl %%al, %0\n"
+        "movzbl %%cl, %1\n"
+        "testl %0, %0\n"
+        : "=r"(r1), "=r"(r2) : "m"(x), "m"(y) : "ax", "ecx", "cc");
+    return (r1 << 4) | r2;
+}
+
+/* Arbitrary AH (not from fnstsw): CF/ZF/PF installed verbatim; seta reads
+ * carry through the convention, setp reads the PF slot. */
+static uint32_t sahf_ah_direct(void) {
+    uint32_t r1, r2;
+    __asm__ volatile(
+        "movb $0x47, %%ah\n"   /* CF=1, ZF=1, PF=1, SF=0 */
+        "fld1\n"
+        "fstp %%st(0)\n"
+        "sahf\n"
+        "seta %%al\n"          /* !CF && !ZF -> 0 */
+        "setp %%cl\n"          /* PF -> 1 */
+        "movzbl %%al, %0\n"
+        "movzbl %%cl, %1\n"
+        "testl %0, %0\n"
+        : "=r"(r1), "=r"(r2) :: "eax", "ecx", "cc");
+    return (r1 << 4) | r2;   /* expect 0x01 */
+}
+
 int main(void) {
     float v[4] = {2.0f, 3.0f, 4.0f, 55.5f};
     uint32_t z = 0x12345678;
@@ -606,8 +645,14 @@ int main(void) {
         check_u("fcmovb after test: no move", test_fcmovb_nomove(1.5, 9.5) == 1.5, 1);
     }
 
+    /* ── Stage 5: sahf consumption ── */
+    check_u("fnstsw/sahf/setb+sete (1 < 5)", fnstsw_sahf_tail(1.0, 5.0), 0x10);
+    check_u("fnstsw/sahf/setb+sete (5 > 1)", fnstsw_sahf_tail(5.0, 1.0), 0x00);
+    check_u("fnstsw/sahf/setb+sete (2 == 2)", fnstsw_sahf_tail(2.0, 2.0), 0x01);
+    check_u("sahf from raw AH: seta=0, setp=1", sahf_ah_direct(), 0x01);
+
     if (failures == 0)
-        printf("ALL TESTS PASSED (49 tests)\n");
+        printf("ALL TESTS PASSED (53 tests)\n");
     else
         printf("%d TESTS FAILED\n", failures);
     return failures != 0;

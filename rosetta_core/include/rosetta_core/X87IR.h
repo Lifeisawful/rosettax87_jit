@@ -194,6 +194,16 @@ enum class Op : uint8_t {
     // test (ANDS) vs cmp (SUBS), bit1 = register rhs.
     GuestCmpF,
 
+    // Guest flag definer from AH (opt-in TRANSPARENT_FLAGS, R3-1): sahf
+    // installs SF/ZF/CF/PF from the guest AH byte into the guest-EFLAGS
+    // NZCV convention (N=SF, Z=ZF, C=¬CF, V=PF with the bit-26 mirror —
+    // the FComI pack layout, so every packed-convention consumer works:
+    // bridged jcc/setcc, in-run fcmovcc, consumed setcc via its own map).
+    // Universally correct wherever AH is (the fnstsw pairing is just the
+    // hot idiom); gated at build on AF|OF dead — AF has no NZCV slot and
+    // OF, which sahf architecturally PRESERVES, is overwritten with PF.
+    GuestSahf,
+
     // Guest flag CONSUMER (opt-in TRANSPARENT_FLAGS): setcc r8, admitted
     // only when every node after the producing GuestCmpF is another
     // GuestSetcc — the producer's SUBS/ANDS (or OPT-PS CCMN) state is then

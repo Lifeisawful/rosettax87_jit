@@ -331,6 +331,10 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_SSE_LEAD"))
         cfg.disable_sse_lead = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: don't consume sahf (GuestSahf AH→NZCV install, R3-1).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_GUEST_SAHF"))
+        cfg.disable_guest_sahf = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

@@ -1096,16 +1096,34 @@ static constexpr int8_t kSetccCondCmp[16] = {
         6,   7,  3,   2,  0,   1,   9,  8,   4,   5, -1,  -1,  11,  10,  13, 12};
 static constexpr int8_t kSetccCondTest[16] = {
         6,   7,  3,   2,  0,   1,   9,  8,   4,   5, -1,  -1,  11,  10,  13, 12};
+// sahf producer (GuestSahf install: N=SF, Z=ZF, C=¬CF, V=PF): the
+// C-reading conditions map through the convention directly (no CFINV — the
+// install writes ¬CF itself), p/np ARE representable (PF sits in V), and
+// the V-mixing signed conditions plus o/no decline (V holds PF, not OF).
+static constexpr int8_t kSetccCondSahf[16] = {
+       -1,  -1,  3,   2,  0,   1,   9,  8,   4,   5,  6,   7,  -1,  -1,  -1, -1};
 
-static int guest_setcc_cond(uint8_t cc, bool producer_is_test) {
+// Producer kind for flag consumers keyed off ctx.last_guest_flagdef.
+enum class FlagProducer : uint8_t { Cmp, Test, Sahf };
+
+static FlagProducer flag_producer_kind(const Context& ctx, int fd) {
+    if (ctx.nodes[fd].op == Op::GuestSahf) return FlagProducer::Sahf;
+    return (ctx.nodes[fd].aux & 1) ? FlagProducer::Test : FlagProducer::Cmp;
+}
+
+static int guest_setcc_cond(uint8_t cc, FlagProducer prod) {
     if (cc >= 16) return -1;
-    return producer_is_test ? kSetccCondTest[cc] : kSetccCondCmp[cc];
+    switch (prod) {
+        case FlagProducer::Test: return kSetccCondTest[cc];
+        case FlagProducer::Sahf: return kSetccCondSahf[cc];
+        default:                 return kSetccCondCmp[cc];
+    }
 }
 
 // Form + condition admissibility. Shared with the trailing-tail absorb,
 // which must validate the setcc BEFORE consuming its test (a bare absorbed
 // test is the measured-regression shape the lookahead note warns about).
-static bool guest_setcc_admissible(const IRInstr* instr, bool producer_is_test) {
+static bool guest_setcc_admissible(const IRInstr* instr, FlagProducer prod) {
     if (instr->num_operands < 2) return false;
     const IROperand& c = instr->operands[0];
     const IROperand& d = instr->operands[1];
@@ -1114,32 +1132,34 @@ static bool guest_setcc_admissible(const IRInstr* instr, bool producer_is_test) 
     if (d.reg.size != IROperandSize::S8) return false;
     // Register-byte class nibble: 0x0X = low byte, 0x1X = AH/CH/DH/BH.
     if ((d.reg.reg.value & 0xF0) > 0x10) return false;
-    return guest_setcc_cond(c.cc.cc, producer_is_test) >= 0;
+    return guest_setcc_cond(c.cc.cc, prod) >= 0;
 }
 
 static bool build_guest_setcc(Context& ctx, IRInstr* instr) {
     if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
     if (g_rosetta_config->disable_guest_setcc) return false;
-    // Producer discipline: every node after the GuestCmpF must be another
-    // GuestSetcc (setcc chains off one test are common) — CSET writes no
-    // flags and nothing else may sit between, so the producer's NZCV is
-    // physically current when this one reads it.
+    // Producer discipline: every node after the flag definer (GuestCmpF or
+    // GuestSahf) must be another GuestSetcc (setcc chains off one test are
+    // common) — CSET writes no flags and nothing else may sit between, so
+    // the producer's NZCV is physically current when this one reads it.
     const int fd = ctx.last_guest_flagdef;
     if (fd < 0) return false;
     for (int i = fd + 1; i < ctx.num_nodes; i++)
         if (ctx.nodes[i].op != Op::GuestSetcc) return false;
-    const bool producer_is_test = (ctx.nodes[fd].aux & 1) != 0;
-    if (!guest_setcc_admissible(instr, producer_is_test)) return false;
+    const FlagProducer prod = flag_producer_kind(ctx, fd);
+    if (!guest_setcc_admissible(instr, prod)) return false;
 
     const IROperand& d = instr->operands[1];
     GuestPayload p = {};
     p.dst = d.reg.reg.index();
     p.cls = ((d.reg.reg.value & 0xF0) == 0x10) ? 1 : 0;
     p.imm = static_cast<uint32_t>(
-        guest_setcc_cond(instr->operands[0].cc.cc, producer_is_test));
+        guest_setcc_cond(instr->operands[0].cc.cc, prod));
     // C-reading conditions after a test are resolved against the ¬CF
     // convention — force the producer's CFINV regardless of liveness.
-    if (producer_is_test && cond_reads_carry(static_cast<int>(p.imm)))
+    // (The sahf install writes ¬CF itself — no fix needed there.)
+    if (prod == FlagProducer::Test &&
+        cond_reads_carry(static_cast<int>(p.imm)))
         ctx.nodes[fd].aux |= 0x20u;
     auto id = ctx.add_node(Op::GuestSetcc);
     if (id < 0) return false;
@@ -1148,6 +1168,26 @@ static bool build_guest_setcc(Context& ctx, IRInstr* instr) {
     // point at a different location, and it may not serve as a cached base.
     ctx.guest_written_mask |= static_cast<uint16_t>(1u << p.dst);
     mem_cse_evict_reg(ctx, p.dst);
+    return true;
+}
+
+// ── sahf: guest flag definer from AH (TRANSPARENT_FLAGS tier, R3-1) ────────
+//
+// Installs SF/ZF/CF/PF from guest AH into the guest-EFLAGS NZCV convention
+// (N=SF, Z=ZF, C=¬CF, V=PF + the bit-26 mirror — the FComI pack layout, so
+// every packed-convention consumer works: bridged jcc/setcc, in-run fcmovcc
+// via build_fcmov's dispatch conds, consumed setcc via kSetccCondSahf).
+// Reads AH wherever it came from — the `fcom; fnstsw ax; sahf` idiom is
+// just the hot case; a standalone sahf is equally correct. Gates: AF has no
+// NZCV slot, and OF — which sahf architecturally PRESERVES — is overwritten
+// with PF, so both must be dead.
+static bool build_guest_sahf(Context& ctx, IRInstr* instr) {
+    if (!(g_rosetta_config && g_rosetta_config->transparent_flags)) return false;
+    if (g_rosetta_config->disable_guest_sahf) return false;
+    if (instr->flag_liveness & (FLAG_AF | FLAG_OF)) return false;
+    auto id = ctx.add_node(Op::GuestSahf);
+    if (id < 0) return false;
+    ctx.last_guest_flagdef = id;
     return true;
 }
 
@@ -2066,6 +2106,11 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
                 ok = build_guest_setcc(ctx, instr);
                 break;
 
+            // ── Guest flag definer from AH: sahf (FLAGS tier, R3-1) ─────
+            case kOpcodeName_sahf:
+                ok = build_guest_sahf(ctx, instr);
+                break;
+
             // ── push/pop (opt-in TRANSPARENT_PUSHPOP) ───────────────────
             case kOpcodeName_push:
             case kOpcodeName_pushd:
@@ -2106,59 +2151,72 @@ bool build(Context& ctx, IRInstr* instr_array, int64_t num_instrs, int64_t start
         }
     }
 
-    // R3-11: absorb a TRAILING `test/cmp; setcc [; movzx]` compare tail.
-    // X87Cache::lookahead never counts a trailing cmp/test, and consuming
-    // the test ALONE was measured a regression (duplicated into both dual
-    // bodies for zero structural gain — see the lookahead note). A setcc
-    // consumer flips the economics: the predicate resolves as one CSET off
-    // the producer's NZCV instead of Rosetta's packed-AX materialization
-    // (mov+tst+cset+bfxil+uxtb+bfxil), and for the fnstsw idiom the OPT-PS
-    // shortcut drops the whole pack→AX→TST dependency from the critical
-    // path. So the tail is absorbed only when BOTH halves consume — the
-    // setcc is validated before the test is touched.
+    // R3-11/R3-1: absorb a TRAILING `test/cmp/sahf; setcc [; setcc…]` flag
+    // tail. X87Cache::lookahead never counts a trailing flag definer, and
+    // consuming one ALONE was measured a regression (duplicated into both
+    // dual bodies for zero structural gain — see the lookahead note). A
+    // setcc consumer flips the economics: the predicate resolves as one
+    // CSET off the producer's NZCV instead of Rosetta's packed-AX
+    // materialization, and for the fnstsw idiom the OPT-PS shortcut drops
+    // the whole pack→AX→TST dependency from the critical path. So the tail
+    // is absorbed only when the FIRST setcc also consumes — it is validated
+    // before the definer is touched. Each absorbed setcc may fold a
+    // same-register movzx widening (`setz al; movzx {ax,eax,rax}, al`) into
+    // its write width: the CSET value is already zero-extended, so the
+    // movzx is one width field, not a uxtb+bfxil pair.
     if (run_complete &&
         !(g_rosetta_config && g_rosetta_config->disable_guest_setcc)) {
         const int64_t ti = start_idx + ctx.consumed;
-        if (ti + 1 < num_instrs) {
-            auto* tcmp = &instr_array[ti];
-            auto* tset = &instr_array[ti + 1];
-            const auto tcop = tcmp->opcode();
-            if ((tcop == kOpcodeName_test || tcop == kOpcodeName_cmp) &&
-                tset->opcode() == kOpcodeName_setcc &&
-                guest_setcc_admissible(tset, tcop == kOpcodeName_test) &&
-                build_guest_cmp(ctx, tcmp, tcop)) {
+        auto* tdef = (ti + 1 < num_instrs) ? &instr_array[ti] : nullptr;
+        auto* tset = tdef ? &instr_array[ti + 1] : nullptr;
+        const auto tdop = tdef ? tdef->opcode() : 0;
+        FlagProducer prod = FlagProducer::Cmp;
+        bool def_ok = false;
+        if (tdef && tset && tset->opcode() == kOpcodeName_setcc) {
+            if (tdop == kOpcodeName_test || tdop == kOpcodeName_cmp) {
+                prod = (tdop == kOpcodeName_test) ? FlagProducer::Test
+                                                  : FlagProducer::Cmp;
+                def_ok = guest_setcc_admissible(tset, prod) &&
+                         build_guest_cmp(ctx, tdef, tdop);
+            } else if (tdop == kOpcodeName_sahf) {
+                prod = FlagProducer::Sahf;
+                def_ok = guest_setcc_admissible(tset, prod) &&
+                         build_guest_sahf(ctx, tdef);
+            }
+        }
+        if (def_ok) {
+            ctx.consumed++;
+            constexpr int kMaxTailSetcc = 3;
+            for (int t = 0; t < kMaxTailSetcc; t++) {
+                const int64_t si = start_idx + ctx.consumed;
+                if (si >= num_instrs) break;
+                auto* sc = &instr_array[si];
+                if (sc->opcode() != kOpcodeName_setcc) break;
+                if (!build_guest_setcc(ctx, sc)) break;
+                const int16_t sid = static_cast<int16_t>(ctx.num_nodes - 1);
                 ctx.consumed++;
-                if (build_guest_setcc(ctx, tset)) {
-                    const int16_t sid =
-                        static_cast<int16_t>(ctx.num_nodes - 1);
-                    ctx.consumed++;
-                    // Fold a same-register widening (`setz al;
-                    // movzx {ax,eax,rax}, al`) into the setcc write: the
-                    // CSET value is already zero-extended, so the movzx is
-                    // one width field, not a uxtb+bfxil pair.
-                    const int64_t mi = start_idx + ctx.consumed;
-                    GuestPayload sp = guest_unpack(ctx.nodes[sid].imm_bits);
-                    if (mi < num_instrs && sp.cls == 0) {
-                        auto* mext = &instr_array[mi];
-                        if (mext->opcode() == kOpcodeName_movzx &&
-                            mext->num_operands >= 2) {
-                            const IROperand& md = mext->operands[0];
-                            const IROperand& ms = mext->operands[1];
-                            if (md.kind == IROperandKind::Register &&
-                                ms.kind == IROperandKind::Register &&
-                                md.reg.reg.is_gpr() && ms.reg.reg.is_gpr() &&
-                                ms.reg.size == IROperandSize::S8 &&
-                                (ms.reg.reg.value & 0xF0) == 0 &&
-                                ms.reg.reg.index() == sp.dst &&
-                                md.reg.reg.index() == sp.dst &&
-                                (md.reg.size == IROperandSize::S16 ||
-                                 md.reg.size == IROperandSize::S32 ||
-                                 md.reg.size == IROperandSize::S64)) {
-                                sp.cls = (md.reg.size == IROperandSize::S16)
-                                             ? 2 : 3;
-                                ctx.nodes[sid].imm_bits = guest_pack(sp);
-                                ctx.consumed++;
-                            }
+                const int64_t mi = start_idx + ctx.consumed;
+                GuestPayload sp = guest_unpack(ctx.nodes[sid].imm_bits);
+                if (mi < num_instrs && sp.cls == 0) {
+                    auto* mext = &instr_array[mi];
+                    if (mext->opcode() == kOpcodeName_movzx &&
+                        mext->num_operands >= 2) {
+                        const IROperand& md = mext->operands[0];
+                        const IROperand& ms = mext->operands[1];
+                        if (md.kind == IROperandKind::Register &&
+                            ms.kind == IROperandKind::Register &&
+                            md.reg.reg.is_gpr() && ms.reg.reg.is_gpr() &&
+                            ms.reg.size == IROperandSize::S8 &&
+                            (ms.reg.reg.value & 0xF0) == 0 &&
+                            ms.reg.reg.index() == sp.dst &&
+                            md.reg.reg.index() == sp.dst &&
+                            (md.reg.size == IROperandSize::S16 ||
+                             md.reg.size == IROperandSize::S32 ||
+                             md.reg.size == IROperandSize::S64)) {
+                            sp.cls = (md.reg.size == IROperandSize::S16)
+                                         ? 2 : 3;
+                            ctx.nodes[sid].imm_bits = guest_pack(sp);
+                            ctx.consumed++;
                         }
                     }
                 }
