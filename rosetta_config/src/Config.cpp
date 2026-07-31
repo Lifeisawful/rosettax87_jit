@@ -267,6 +267,12 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_TEST_SHORTCUT"))
         cfg.disable_test_shortcut = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: keep pairing stores whose bytes a same-run load or a
+    // block-tail instruction reloads (OPT-SS suppresses those STPs — an
+    // STP-sourced store->load forward costs 11 cyc vs 5 for a single STR).
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_STP_SUPPRESS"))
+        cfg.disable_stp_suppress = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

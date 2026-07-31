@@ -715,6 +715,79 @@ static bool pair_disp_ok(int64_t disp, int scale) {
     return disp % scale == 0 && disp >= -64 * scale && disp <= 63 * scale;
 }
 
+// ── OPT-SS: STP-reload suppression ──────────────────────────────────────────
+//
+// On Firestorm a load forwarded from a pair STORE costs 11 cycles regardless
+// of which half it reads; forwarded from a single STR it costs 5. Pairing two
+// stores saves one instruction (~0.3 cyc of slot throughput), so any store
+// pair whose bytes are reloaded while still in the store buffer is a net
+// loss. Detect the two shapes the evidence shows (loop-carried same-run
+// loads, and the `fstp locals; movsd xmm,m` block-tail reload) and keep those
+// stores as singles. Load pairing stays untouched — LDP sourcing from one or
+// two stores forwards at full speed.
+//
+// A missed veto costs 6 cycles per dynamic reload; a spurious veto costs one
+// instruction — so every check below may be approximate in the veto-happy
+// direction, and none of this affects correctness.
+
+static bool stp_suppress_on() {
+    return !(g_rosetta_config && g_rosetta_config->disable_stp_suppress);
+}
+
+// Base-key-relative byte offset of an operand (comparable only between
+// operands that are addr_base_key_equal).
+static int64_t pair_operand_off(const IROperand* op) {
+    return op->kind == IROperandKind::Immediate ? op->imm.value : op->mem.disp;
+}
+
+// True when a load anywhere in the run, or a memory operand in a bounded
+// window of the block tail, provably overlaps the byte window [wlo, whi)
+// relative to `mo`'s base key. Loads BEFORE the stores count too: in a loop
+// the whole body is one run, and an early load re-executes right after the
+// late store on the back edge (the 5.2x st-slot round-trip shape).
+static bool pair_store_reloaded(const Context& ctx, const IROperand* mo,
+                                int64_t wlo, int64_t whi) {
+    for (int k = 0; k < ctx.num_nodes; k++) {
+        const auto& m = ctx.nodes[k];
+        if (m.flags & kDead) continue;
+        switch (m.op) {
+            case Op::LoadF64: case Op::LoadF32Raw:
+            case Op::LoadI16: case Op::LoadI32: case Op::LoadI64:
+            case Op::GuestLoad: case Op::GuestRmwR:
+                break;
+            default:
+                continue;
+        }
+        const IROperand* q = m.mem_operand;
+        if (!addr_operand_base_cacheable(q) || !addr_base_key_equal(mo, q))
+            continue;
+        const int64_t qo = pair_operand_off(q);
+        if (qo < whi && qo + (1 << guest_mem_size_log2(q)) > wlo) return true;
+    }
+    // Block tail: MemRef operands only. Immediate-kind operands in the raw
+    // instruction stream are usually plain immediates, not text-base memory
+    // — matching them would veto on value coincidences.
+    if (mo->kind != IROperandKind::MemRef || !ctx.tail_instrs) return false;
+    constexpr int kTailWindow = 12;
+    const int n = ctx.tail_count < kTailWindow ? ctx.tail_count : kTailWindow;
+    for (int t = 0; t < n; t++) {
+        const IRInstr* instr = &ctx.tail_instrs[t];
+        for (int o = 0; o < instr->num_operands; o++) {
+            const IROperand* q = &instr->operands[o];
+            if (q->kind != IROperandKind::MemRef) continue;
+            if (!addr_base_key_equal(mo, q)) continue;
+            const int64_t qo = q->mem.disp;
+            if (qo < whi && qo + (1 << guest_mem_size_log2(q)) > wlo)
+                return true;
+        }
+        // Stop once the base (or index) register is redefined — later
+        // matching operands address somewhere else.
+        if (addr_uses_written_reg(mo, X87Cache::gap_written_gpr_mask(instr)))
+            break;
+    }
+    return false;
+}
+
 static void compute_pairs(const Context& ctx, IROperand* const* reps, int nreps,
                           int16_t* pair_with, bool* pair_skip) {
     for (int i = 0; i < ctx.num_nodes; i++) {
@@ -756,6 +829,17 @@ static void compute_pairs(const Context& ctx, IROperand* const* reps, int nreps,
                 const int64_t d2 = addr_cached_disp(m.mem_operand, rp);
                 if (pair_disp_ok(d2, scale) &&
                     (d2 == d1 + scale || d2 == d1 - scale)) {
+                    // OPT-SS: keep reloaded stores as singles (lowering only
+                    // — reps == nullptr is the pressure model, which stays a
+                    // superset: pairing extends the first store input's live
+                    // range, so modeling the pair over-counts, never under).
+                    if (!is_load && reps && stp_suppress_on()) {
+                        const int64_t a = pair_operand_off(mo);
+                        const int64_t b = pair_operand_off(m.mem_operand);
+                        const int64_t wlo = a < b ? a : b;
+                        if (pair_store_reloaded(ctx, mo, wlo, wlo + 2 * scale))
+                            break;
+                    }
                     if (is_load) {
                         pair_with[i] = static_cast<int16_t>(j);
                         pair_skip[j] = true;
@@ -2758,8 +2842,15 @@ void lower(Context& ctx, TranslationResult* result) {
             emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
         }
     }
+    // OPT-SS: st[] write-backs feed the next run's preamble loads — in a loop
+    // that is a store->load forward every iteration, and an STP source makes
+    // it 11 cyc instead of 5 (the measured 5.2x back-edge round trip was
+    // paying the pair penalty). Emit singles; the saved instruction never
+    // pays for the forwarding cliff.
+    const bool pair_writebacks = !stp_suppress_on();
     for (int k = 0; k < stp_cnt;) {
-        if (k + 1 < stp_cnt && stp_phys[k + 1] == stp_phys[k] + 1) {
+        if (pair_writebacks && k + 1 < stp_cnt &&
+            stp_phys[k + 1] == stp_phys[k] + 1) {
             emit_fldp_fstp_d(buf, /*is_load=*/0,
                              static_cast<int16_t>((kX87RegFileOff >> 3) + stp_phys[k]),
                              Xbase, stp_fpr[k], stp_fpr[k + 1]);
@@ -3420,6 +3511,12 @@ int compile_run(TranslationResult* result, IRInstr* instr_array, int64_t num_ins
     // FCmp/FTst NZCV save/restore is elided in lowering.
     ctx.nzcv_dead = nzcv_dead_after_run(instr_array, num_instrs,
                                         start_idx + ctx.consumed) ? 1 : 0;
+
+    // OPT-SS: hand the pairing pass the block tail so store pairs whose
+    // bytes a following instruction reloads stay singles.
+    ctx.tail_instrs = instr_array + start_idx + ctx.consumed;
+    ctx.tail_count =
+        static_cast<int32_t>(num_instrs - (start_idx + ctx.consumed));
 
     // OPT-CR: decide raw-condition FCMOV and pack sinking/elision per FComI.
     // Needs nzcv_dead; must precede the pressure gates (peak_live_gprs reads

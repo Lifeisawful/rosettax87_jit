@@ -363,6 +363,14 @@ struct Context {
     // preamble, before any inlined write could happen).
     uint16_t guest_written_mask;
 
+    // OPT-SS: view of the decoded instructions after the consumed run (same
+    // block), set by compile_run. The pairing pass scans a bounded window of
+    // it for reloads of a candidate store pair's bytes — an STP-sourced
+    // store->load forward costs 11 cyc vs 5 for a single STR on Firestorm,
+    // so provably-reloaded stores stay singles. Null/0 in unit contexts.
+    IRInstr* tail_instrs;
+    int32_t  tail_count;
+
     void init() {
         num_nodes = 0;
         top_delta = 0;
@@ -376,6 +384,8 @@ struct Context {
         nzcv_dead = 0;
         const_promote = 0;
         guest_written_mask = 0;
+        tail_instrs = nullptr;
+        tail_count = 0;
         last_narrow_input = -1;
         last_narrow_node = -1;
         const_zero_node = -1;
