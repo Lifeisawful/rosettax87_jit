@@ -312,6 +312,11 @@ RosettaConfig parse_config_from_env() {
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_BACKEDGE"))
         cfg.disable_backedge = (*v == '1') ? 1 : 0;
 
+    // Bisection lever: OPT-PS raw-FCMP test shortcut via the two-insn
+    // CSET+ANDS pair instead of one integer CCMN.
+    if (const char* v = std::getenv("ROSETTA_X87_DISABLE_TEST_CCMN"))
+        cfg.disable_test_ccmn = (*v == '1') ? 1 : 0;
+
     if (const char* v = std::getenv("ROSETTA_X87_DISABLE_ALL_OPS"))
         if (*v == '1') {
             cfg.disabled_ops_mask = ~0ULL;

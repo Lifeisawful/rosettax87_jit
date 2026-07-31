@@ -1150,16 +1150,25 @@ static void emit_guest_node(TranslationResult& result, AssemblerBuffer& buf,
             if (n.aux & 0x10) {
                 // OPT-PS (plan_test_shortcut): the tested value is the FSTSW
                 // image of the compare whose raw NZCV is still live, and the
-                // mask asks a single FCMP condition. CSET the inverse, then
-                // ANDS #1 — Z = the predicate, N=C=V=0: the exact x86 TEST
-                // flag state for this mask (sign bit of the tested width is
-                // outside every supported mask).
+                // mask asks a single FCMP condition. One CCMN gives the exact
+                // x86 TEST flag state for this mask: cond → flags of 0+0
+                // (Z=1, N=C=V=0), !cond → the literal #0b0000 (all clear).
+                // CCMN, not CCMP — the subtract form would set C on the true
+                // arm, but x86 TEST clears CF. Sign bit of the tested width
+                // is outside every supported mask, so N=0 is correct on both
+                // arms.
                 const int cond = static_cast<int>((n.aux >> 8) & 0xF);
-                const int Rt = alloc_free_gpr(result);
-                emit_cset(buf, /*is_64bit=*/0, cond ^ 1, Rt);
-                emit_logical_imm(buf, /*is_64bit=*/0, /*ANDS*/3, /*N=*/0,
-                                 /*immr=*/0, /*imms=*/0, Rt, GPR::XZR);
-                free_gpr(result, Rt);
+                if (g_rosetta_config && g_rosetta_config->disable_test_ccmn) {
+                    // Bisection fallback: the original two-insn form.
+                    const int Rt = alloc_free_gpr(result);
+                    emit_cset(buf, /*is_64bit=*/0, cond ^ 1, Rt);
+                    emit_logical_imm(buf, /*is_64bit=*/0, /*ANDS*/3, /*N=*/0,
+                                     /*immr=*/0, /*imms=*/0, Rt, GPR::XZR);
+                    free_gpr(result, Rt);
+                } else {
+                    emit_ccmn_imm(buf, /*is_64bit=*/0, GPR::XZR, /*imm5=*/0,
+                                  /*nzcv=*/0, cond);
+                }
                 break;
             }
             const int is64 = p.is64 ? 1 : 0;

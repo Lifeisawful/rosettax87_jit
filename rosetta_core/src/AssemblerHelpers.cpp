@@ -548,6 +548,25 @@ auto emit_fccmp_f64(AssemblerBuffer& buf, int Dn, int Dm, int nzcv, int cond) ->
 }
 
 // =============================================================================
+// CCMN Rn, #imm5, #nzcv, cond — if cond holds, NZCV = flags of (Rn + imm5);
+// else NZCV = #nzcv.
+// Encoding (conditional compare immediate, op=0 for CCMN):
+//   sf | 0 | 1 | 11010010 | imm5 | cond | 1 | 0 | Rn | 0 | nzcv
+// Base: 0x3A400800 (CCMP is the op=1 sibling at 0x7A400800 — different C
+// semantics on the subtract; do not conflate)
+// =============================================================================
+auto emit_ccmn_imm(AssemblerBuffer& buf, int is_64bit, int Rn, int imm5,
+                   int nzcv, int cond) -> void {
+    uint32_t insn = 0x3A400800u;
+    insn |= (uint32_t)(is_64bit & 1) << 31;
+    insn |= (uint32_t)(imm5 & 0x1F) << 16;
+    insn |= (uint32_t)(cond & 0xF) << 12;
+    insn |= (uint32_t)(Rn & 0x1F) << 5;
+    insn |= (uint32_t)(nzcv & 0xF);
+    buf.emit(insn);
+}
+
+// =============================================================================
 // FCMP Dn, #0.0 — compare FP register against zero
 //
 // Encoding: same as FCMP but bit[3]=1, Rm field=00000

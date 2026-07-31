@@ -141,17 +141,19 @@ struct RosettaConfig {
     uint8_t  log_backedge;           // ROSETTA_X87_LOG_BACKEDGE=1 — log every module seen by the post-translate hook (OPT-BE stage 0: interception + branch-scan evidence)
     uint8_t  backedge_noop_probe;    // ROSETTA_X87_BACKEDGE_NOOP_PROBE=1 — rewrite every backward conditional-branch word in the post-translate hook with its own value (OPT-BE stage 0 G0.2: buffer writability, must be a byte-identical no-op)
     uint8_t  disable_backedge;       // ROSETTA_X87_DISABLE_BACKEDGE=1 — don't retarget self-loop back edges past the priming st[] load in decode-verified accumulator blocks (OPT-BE; bisection lever)
+    uint8_t  disable_test_ccmn;      // ROSETTA_X87_DISABLE_TEST_CCMN=1 — lower the OPT-PS raw-FCMP test shortcut through the two-insn CSET+ANDS pair instead of one integer CCMN (bisection lever)
     uint64_t disabled_ops_mask;      // ROSETTA_X87_DISABLE_OPS=fadd,fsub,...
     uint64_t disabled_fusions_mask;  // ROSETTA_X87_DISABLE_FUSIONS=fld_arithp,...
 };
 // Grown 0x20 → 0x28 when the 17th byte-flag (bridge_carry) crossed the old
 // size, 0x28 → 0x30 when the 25th (disable_fyl2x_val) crossed again,
-// 0x30 → 0x38 when the 33rd (transparent_flags) crossed again, and
-// 0x38 → 0x40 when the 41st (disable_x18_state) crossed again.
+// 0x30 → 0x38 when the 33rd (transparent_flags) crossed again,
+// 0x38 → 0x40 when the 41st (disable_x18_state) crossed again, and
+// 0x40 → 0x48 when the 49th (disable_test_ccmn) crossed again.
 // The loader writes this struct into the runtime's __DATA,config by
 // sizeof — both sides compile from this header, so they stay in sync as long
 // as loader and runtime dylib come from the same build.
-static_assert(sizeof(RosettaConfig) == 0x40);
+static_assert(sizeof(RosettaConfig) == 0x48);
 
 inline bool op_is_disabled(const RosettaConfig& cfg, OpcodeId id) {
     return (cfg.disabled_ops_mask >> static_cast<int>(id)) & 1u;
