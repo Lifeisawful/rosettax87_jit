@@ -915,3 +915,24 @@ void emit_x87_rc_dispatch_frint(AssemblerBuffer& buf, int Wd_rc, int Dd, int Dn)
     emit_b(buf, 2);
     emit_fp_dp1(buf, /*type=f64*/1, /*FRINTZ*/11, Dd, Dn);
 }
+
+void emit_x87_tag_mark_valid(AssemblerBuffer& buf, int Xbase, int Wd_top, int depth,
+                             int Wd_tmp, int Wd_tmp2) {
+    // Wd_tmp2 = ((TOP + depth) & 7) * 2   — bit position of this slot's tag pair
+    if (depth)
+        emit_add_imm(buf, /*is_64bit=*/0, /*is_sub=*/0, /*is_set_flags=*/0,
+                     /*shift=*/0, depth & 7, Wd_top, Wd_tmp2);
+    else  // MOV Wd_tmp2, Wd_top   (ORR Wd_tmp2, WZR, Wd_top)
+        emit_logical_shifted_reg(buf, 0, /*ORR=*/1, 0, 0, Wd_top, 0, 31, Wd_tmp2);
+    emit_and_imm(buf, /*is_64bit=*/0, Wd_tmp2, /*N=*/0, /*immr=*/0, /*imms=*/2, Wd_tmp2);
+    emit_bitfield(buf, /*is_64=*/0, /*UBFM*/ 2, /*N*/ 0, /*immr*/ 31, /*imms*/ 30,
+                  Wd_tmp2, Wd_tmp2);                       // LSL #1
+
+    emit_movn(buf, /*is_64=*/0, /*MOVZ*/ 2, /*hw*/ 0, 3, Wd_tmp);   // mask seed = 0b11
+    emit_lslv(buf, 0, Wd_tmp2, Wd_tmp, Wd_tmp);                     // mask = 3 << pos
+
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1, kX87TagWordImm12, Xbase, Wd_tmp2);
+    emit_logical_shifted_reg(buf, /*is_64=*/0, /*AND*/ 0, /*N=invert (BIC)*/ 1,
+                             /*LSL*/ 0, Wd_tmp, /*shift*/ 0, Wd_tmp2, Wd_tmp2);
+    emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0, kX87TagWordImm12, Xbase, Wd_tmp2);
+}

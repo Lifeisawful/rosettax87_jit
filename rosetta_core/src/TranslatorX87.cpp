@@ -1277,8 +1277,21 @@ auto translate_fst(TranslationResult* a1, IRInstr* a2) -> void {
 
         if (depth_dst != 0) {
             // Load ST(0), store into ST(depth_dst).
+            const int phys_dst = resolve_depth(*a1, depth_dst);
             emit_load_st(buf, Xbase, Wd_top, resolve_depth(*a1, 0), Wd_tmp, Dd_src, Xst_base);
-            emit_store_st(buf, Xbase, Wd_top, resolve_depth(*a1, depth_dst), Wd_tmp, Dd_src, Xst_base);
+            emit_store_st(buf, Xbase, Wd_top, phys_dst, Wd_tmp, Dd_src, Xst_base);
+            // The destination may have been tagged kEmpty (Delphi's ArcCos parks a
+            // value in an unused slot this way).  Handlers read through getSt(),
+            // which returns a quiet NaN for kEmpty, so the tag must be updated or
+            // any later fpatan/fsin/fcos/fscale/fprem/fxtract reads NaN.
+            // Pool slot 3 is the conventional second scratch here (same as the
+            // Wd_tmp2 every push/pop path takes).  Taking one off the FREE list
+            // instead would blow the translator's transient-GPR budget in
+            // register-starved runs — observed as the "no temporary GPR
+            // available to allocate" assert under bridged runs.
+            const int Wd_tagtmp = alloc_gpr(*a1, 3);
+            emit_x87_tag_mark_valid(buf, Xbase, Wd_top, phys_dst, Wd_tagtmp, Wd_tmp);
+            free_gpr(*a1, Wd_tagtmp);
         }
         // else: ST(0) → ST(0) is a no-op, skip load+store.
     } else {
