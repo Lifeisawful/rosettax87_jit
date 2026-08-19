@@ -1427,6 +1427,8 @@ void lower(Context& ctx, TranslationResult* result) {
     // In the specialized body every slot address is a static [Xbase, #imm];
     // gather the dirty slots and pair consecutive physical indices into STPs.
     int stp_phys[8], stp_fpr[8], stp_cnt = 0;
+    // Slots this run WRITES (see the tag fix after step 4).
+    uint32_t written_depths = 0;
     for (int d = 0; d < 8; d++) {
         int16_t val = ctx.slot_val[d];
         if (val < 0) continue;  // initial slot, unchanged (no store needed)
@@ -1451,6 +1453,7 @@ void lower(Context& ctx, TranslationResult* result) {
         } else {
             emit_store_st(buf, Xbase, Wd_top, d, Wd_tmp, Dd, Xst_base);
         }
+        written_depths |= 1u << d;
     }
     for (int k = 0; k < stp_cnt;) {
         if (k + 1 < stp_cnt && stp_phys[k + 1] == stp_phys[k] + 1) {
@@ -1519,6 +1522,54 @@ void lower(Context& ctx, TranslationResult* result) {
             free_gpr(*result, Wd_tagw);
             free_gpr(*result, Wd_tmp2);
         }
+    }
+
+    // 4b. Tag the slots this run WROTE as not-empty.
+    //
+    // Step 4 derives tags purely from TOP deltas, so a slot written WITHOUT a
+    // push -- `FST ST(i)` into a currently-empty slot -- was left tagged kEmpty.
+    // JIT-generated loads ignore tags, so this stayed invisible inside JIT'd
+    // code, but the six ops the JIT never translates (fsin fcos fscale fprem
+    // fxtract fpatan) exit to the C++ handlers, and X87State::getSt() returns a
+    // QUIET NaN for a kEmpty slot.
+    //
+    // Delphi's RTL depends on this exact idiom: ArcCos/ArcSin (Omsi.exe:0x45a3bc)
+    // parks x in an unused ST(2) via `fst %st(2)`, pops twice, then reads it back
+    // as ST(1) for `fpatan`.  Under the JIT that read produced NaN, ArcCos
+    // returned NaN, and OMSI's angle-normalisation loop (0x7f3a1c) spun on it
+    // forever -- NaN compares unordered, so FCOMPS sets CF and the `jb` back-edge
+    // is always taken.
+    //
+    // FEX does the same thing: x87StackOptimizationPass's
+    // StoreStackValueAtOffset_Slow() calls SetX87ValidTag(Offset, true) for
+    // OP_STORESTACKTOSTACK.  (box64 is not exposed -- it has a single
+    // implementation, so a slot read never synthesises a NaN.)
+    if (written_depths) {
+        // Reuse Wd_tmp (pool slot 2, live for the whole epilogue) as the second
+        // scratch so this phase costs ONE transient GPR, not two — the epilogue
+        // budget documented above only reserves two in total.
+        const int Wd_m   = alloc_free_gpr(*result);
+        const int Wd_tag = Wd_tmp;
+        if (top_known >= 0) {
+            // Static TOP: fold every written slot into one constant mask.
+            uint32_t mask = 0;
+            for (int d = 0; d < 8; d++)
+                if (written_depths & (1u << d))
+                    mask |= 3u << ((((final_top_known + d) & 7)) * 2);
+            emit_movn(buf, /*is_64=*/0, /*MOVZ*/ 2, /*hw=*/0,
+                      static_cast<uint16_t>(mask), Wd_m);
+            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*LDR*/ 1,
+                             kX87TagWordImm12, Xbase, Wd_tag);
+            emit_logical_shifted_reg(buf, /*is_64=*/0, /*AND*/ 0, /*N=invert (BIC)*/ 1,
+                                     /*LSL*/ 0, Wd_m, /*shift*/ 0, Wd_tag, Wd_tag);
+            emit_ldr_str_imm(buf, /*size=*/1, /*is_fp=*/0, /*STR*/ 0,
+                             kX87TagWordImm12, Xbase, Wd_tag);
+        } else {
+            for (int d = 0; d < 8; d++)
+                if (written_depths & (1u << d))
+                    emit_x87_tag_mark_valid(buf, Xbase, Wd_top, d, Wd_m, Wd_tag);
+        }
+        free_gpr(*result, Wd_m);
     }
 
     // 5. Free all remaining FPRs held by node values.
