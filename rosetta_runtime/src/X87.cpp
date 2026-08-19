@@ -677,12 +677,93 @@ void x87_fidivr(X87State* state, int val) {
     // Store result back in ST(0)
     state->setSt(0, value);
 }
+// ── exact int64 shadow for the x87 block-copy idiom ─────────────────────────
+// FILD m64 followed by FISTP m64 with no arithmetic between them is a bit-exact
+// 8-byte move on real x87, because an 80-bit register has a full 64-bit
+// mantissa.  Our slots are f64, so the exact integer has to be carried
+// alongside or every qword with more than 53 significant bits comes back
+// rounded — which silently corrupts Delphi's and Free Pascal's Move().
+//
+// Ported from DOSBox-X's fpu_regs_memcpy (src/fpu/fpu_instructions.h), which
+// fixed the same bug for the same reason.  Its validity test is the good part:
+// instead of a tag that every arithmetic op must remember to clear, compare the
+// live double against the shadow's own double projection.  Agreement means the
+// register has not been touched since the load, so the shadow is trusted;
+// anything that modified it (arithmetic, FXCH, a push reusing the slot) moves
+// the double and the shadow is ignored.  That costs nothing on register writes,
+// which matters here because most writes happen in JIT-generated code this
+// runtime never sees.
+//
+// Indexed by physical register index, matching DOSBox-X.  DOSBox-X can use a
+// plain global (`static FPU_Reg fpu_regs_memcpy[9]`) because it emulates one
+// DOS machine with one FPU; we are called from every guest thread at once.
+// thread_local is not available either: this runtime links -static -nostdlib,
+// so a thread_local fails to link with an undefined __tlv_bootstrap.
+//
+// So the table is keyed on the X87State pointer, which is a stable per-thread
+// identity (each thread's x87 state lives in its own Rosetta thread context).
+// Direct-mapped with an owner tag; a bucket claimed by another thread is simply
+// reset.  A collision therefore costs correctness only by *reverting to the
+// existing lossy path* for that store — never worse than today's behaviour —
+// and the table is sized so that is rare.
+//
+// Residual, inherited from the DOSBox-X design: if some operation happens to
+// leave the slot holding a double bit-identical to (double)shadow, a stale
+// shadow is trusted and the low bits of the older integer are stored instead of
+// the correctly-rounded value.  Narrow enough that DOSBox-X ships it.
+namespace {
+struct X87IntShadow {
+    X87State const* owner;
+    uint64_t v[8];
+    uint8_t valid;  // bitmask over physical slots
+};
+constexpr uintptr_t kIntShadowSlots = 64;
+X87IntShadow g_int_shadow[kIntShadowSlots];
+
+inline X87IntShadow& int_shadow_for(X87State const* state) {
+    // Fibonacci hashing, mixing ALL the pointer bits into the top of the word.
+    //
+    // A plain shift-and-mask is wrong here and was observed corrupting data:
+    // thread contexts are allocated at page-multiple strides, so with
+    // (ptr >> 6) & 63 a 4096-byte stride maps every thread onto the *same*
+    // bucket (4096 >> 6 == 64 == 0 mod 64).  Every thread then evicted every
+    // other one, the shadow was almost never valid, and stores silently fell
+    // back to the lossy path — intermittent single-byte corruption in strings
+    // copied by Move().
+    const uintptr_t h = reinterpret_cast<uintptr_t>(state) * 0x9E3779B97F4A7C15ull;
+    X87IntShadow& e = g_int_shadow[(h >> 58) & (kIntShadowSlots - 1)];
+    if (e.owner != state) {
+        e.owner = state;
+        e.valid = 0;
+    }
+    return e;
+}
+}  // namespace
+
+// Returns the exact integer if this slot still holds an unmodified FILD result.
+static inline bool x87_int_shadow_get(X87State const* state, double live, int64_t* out) {
+    X87IntShadow& e = int_shadow_for(state);
+    const uint32_t idx = state->getStIndex(0);
+    if (((e.valid >> idx) & 1u) == 0)
+        return false;
+    const int64_t exact = static_cast<int64_t>(e.v[idx]);
+    if (static_cast<double>(exact) != live)
+        return false;
+    *out = exact;
+    return true;
+}
+
 void x87_fild(X87State* state, int64_t value) {
     SIMDGuard simdGuard;
     LOG(1, "x87_fild\n", 10);
 
     state->push();
     state->setSt(0, static_cast<double>(value));
+
+    X87IntShadow& e = int_shadow_for(state);
+    const uint32_t idx = state->getStIndex(0);
+    e.v[idx] = static_cast<uint64_t>(value);
+    e.valid |= static_cast<uint8_t>(1u << idx);
 }
 
 void x87_fimul(X87State* state, int val) {
@@ -778,6 +859,14 @@ X87ResultStatusWord x87_fist_i64(X87State const* state) {
     // Get value in ST(0)
     auto [value, statusWord] = state->getStConst(0);
 
+    // Unmodified FILD m64 result — return the exact integer rather than its f64
+    // projection.  This is the block-copy path (fild qword / fistp qword), where
+    // real x87 is lossless because an 80-bit register holds a full 64-bit
+    // mantissa.  See the int64 shadow above.
+    int64_t exact = 0;
+    if (x87_int_shadow_get(state, value, &exact))
+        return {.signedResult = exact, .statusWord = statusWord};
+
     X87ResultStatusWord result{0, statusWord};
 
     const double rounded = x87_round_by_rc(value, state->controlWord);
@@ -838,6 +927,14 @@ X87ResultStatusWord x87_fistt_i64(X87State const* state) {
     LOG(1, "x87_fistt_i64\n", 15);
     // Get value in ST(0)
     auto [value, statusWord] = state->getStConst(0);
+
+    // Unmodified FILD m64 result — return the exact integer rather than its f64
+    // projection.  This is the block-copy path (fild qword / fistp qword), where
+    // real x87 is lossless because an 80-bit register holds a full 64-bit
+    // mantissa.  See the int64 shadow above.
+    int64_t exact = 0;
+    if (x87_int_shadow_get(state, value, &exact))
+        return {.signedResult = exact, .statusWord = statusWord};
 
     // Truncate, then range-check: out-of-range/Inf/NaN → indefinite (the
     // bare cast would saturate to INT64_MAX on AArch64 instead).
