@@ -133,3 +133,9 @@ struct X87Cache {
                          uint64_t disabled_ops_mask = 0, bool bridge = false,
                          bool runtime_keepalive = false);
 };
+
+// True for FILD m64 / FISTP m64 / FISTTP m64 — the encodings that move a full
+// 64-bit integer through an x87 slot.  An f64 slot cannot carry a 64-bit
+// mantissa, so these are declined and handled by the runtime, which keeps an
+// exact int64 shadow.  See the definition in X87Cache.cpp.
+bool x87_is_m64_int_memop(const IRInstr& ins);

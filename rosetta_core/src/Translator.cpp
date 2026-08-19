@@ -268,6 +268,18 @@ auto Translator::translate_instruction(TranslationResult* translation_result, IR
     if (cache.carried_any() && X87Cache::is_handled(opcode))
         cache.carried_release(translation_result->free_gpr_mask);
 
+    // ── FILD/FISTP/FISTTP m64: decline to the runtime ───────────────────────
+    // An f64 stack slot cannot hold a full 64-bit mantissa, so these must reach
+    // x87_fild / x87_fist_i64 / x87_fistt_i64, which carry an exact int64
+    // shadow.  Declined before try_peephole so a fusion cannot swallow the
+    // encoding and re-introduce the lossy SCVTF path.
+    if (x87_is_m64_int_memop(*cur_instr)) {
+        cache.invalidate(translation_result->free_gpr_mask, kGprScratchMask);
+        translation_result->free_fpr_mask =
+            translation_result->_unoccupied_temporary_fprs_for_xmm_scalars;
+        return std::nullopt;
+    }
+
     // ── Peephole: try 2-instruction fusion patterns ─────────────────────────
     const uint64_t fusions_mask = g_rosetta_config ? g_rosetta_config->disabled_fusions_mask : 0;
     const auto fused =
