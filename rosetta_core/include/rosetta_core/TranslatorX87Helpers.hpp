@@ -330,3 +330,22 @@ int emit_fcom_cc_write_sw_keep(AssemblerBuffer& buf, TranslationResult& a1,
 void emit_x87_rc_dispatch_fcvt(AssemblerBuffer& buf, int Wd_rc, int Wd_int,
                                 int Dd_val, int is_64bit_int);
 void emit_x87_rc_dispatch_frint(AssemblerBuffer& buf, int Wd_rc, int Dd, int Dn);
+// =============================================================================
+// FST/FSTP ST(i) destination tag — mark the written slot NOT-EMPTY.
+//
+// The JIT's register-to-register copy writes the slot but never touched the tag
+// word, so a slot written by FST ST(i) stayed tagged kEmpty.  JIT-generated
+// loads ignore tags, so this was invisible inside JIT'd code -- but the six x87
+// ops the JIT never translates (fsin fcos fscale fprem fxtract fpatan) exit to
+// the C++ handlers, and those read through X87State::getSt(), which returns a
+// QUIET NaN for a slot tagged kEmpty.
+//
+// Delphi's RTL relies on exactly this pattern: ArcCos/ArcSin (Omsi.exe:0x45a3bc)
+// parks x in an EMPTY ST(2) with `fst %st(2)`, pops twice, then reads it back as
+// ST(1) for `fpatan`.  Under the JIT that read returned NaN, so ArcCos returned
+// NaN, and OMSI's angle-normalisation loop (0x7f3a1c) spun forever on it: NaN
+// compares unordered, so FCOMPS sets CF and the `jb` back-edge is always taken.
+//
+// Mirrors the tag clear emit_x87_push already does for a pushed slot.
+void emit_x87_tag_mark_valid(AssemblerBuffer& buf, int Xbase, int Wd_top, int depth,
+                             int Wd_tmp, int Wd_tmp2);
