@@ -255,7 +255,12 @@ void MachExceptionSession::restoreAndTearDown() {
         savedCount_ = 0;
     }
     if (exceptionPort_ != MACH_PORT_NULL) {
-        mach_port_deallocate(mach_task_self(), exceptionPort_);
+        // Drop the send right AND destroy the receive right. mach_port_deallocate
+        // alone only drops the send right, leaving the port alive for the
+        // loader's lifetime: an exception still queued (or raised before the
+        // restore landed) would then block a tracee thread forever awaiting a
+        // reply. Destroying the receive right fails any such RPC instead.
+        mach_port_destruct(mach_task_self(), exceptionPort_, -1, 0);
         exceptionPort_ = MACH_PORT_NULL;
     }
 }
