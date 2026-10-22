@@ -1235,9 +1235,21 @@ int main(int argc, char* argv[]) {
 
         uint64_t segOffset = segm->vmaddr - machoPreferredBase;
         uint64_t dest = machoBase + segOffset;
-        LOG("Protecting segment %s: dest=0x%llx vmsize=0x%llx initprot=0x%x\n",
-            segm->segname, dest, (uint64_t)segm->vmsize, segm->initprot);
-        dbg.adjustMemoryProtection(dest, segm->initprot, segm->vmsize);
+
+        // runtime_entry is declared rwx purely so ld will emit the chained-fixup
+        // rebases for the blob's absolute trig fallback literals; a rebase into a
+        // non-writable segment is an illegal text-relocation. Pass 2 above already
+        // applied those rebases while the region was still uniformly rw, so the
+        // blob never needs write again — mask it off, both to keep W^X and because
+        // allocate_chunk's mach_vm_remap propagates THIS protection into the JIT
+        // heap, where a writable stub page would be a regression.
+        vm_prot_t prot = segm->initprot;
+        if (strncmp(segm->segname, "runtime_", 8) == 0)
+            prot &= ~VM_PROT_WRITE;
+
+        LOG("Protecting segment %s: dest=0x%llx vmsize=0x%llx initprot=0x%x applied=0x%x\n",
+            segm->segname, dest, (uint64_t)segm->vmsize, segm->initprot, prot);
+        dbg.adjustMemoryProtection(dest, prot, segm->vmsize);
     });
 
     // Write the offsets we found to __DATA,offsets

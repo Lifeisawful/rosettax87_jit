@@ -76,7 +76,22 @@ target_link_options(libRuntimeRosettax87 PRIVATE
     # page, and the first branch into it died with
     # EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE on the instruction fetch.
     # maxprot must be rx too, else execute could never be granted later.
-    "-Wl,-segprot,runtime_entry,rx,rx"
+    #
+    # runtime_entry is the exception: it is declared rwx, and the loader drops
+    # the w again when it applies protections. The blob's trig fallback literals
+    # (`.quad _x87_trig_cos_value`, `_x87_exp2_tbl`, ...) are absolute pointers
+    # living inside this segment, so they are chained-fixup rebase targets, and
+    # ld refuses to emit a rebase into a segment that is not writable at load
+    # ("Found illegal text-relocations"). ld-1115 (Xcode 16) let it pass; the
+    # macos-26 runner's linker makes it fatal, which is what broke CI.
+    #
+    # Declaring it writable only changes the Mach-O header. Nothing maps this
+    # image through dyld: runtime_loader writes the segments itself, applies the
+    # chained-fixup rebases while the whole region is still rw (pass 2), and only
+    # then sets per-segment protections (pass 3) — where it masks w off every
+    # runtime_* segment. The live mapping stays r-x, so the protection that
+    # allocate_chunk's mach_vm_remap propagates into the JIT heap is unchanged.
+    "-Wl,-segprot,runtime_entry,rwx,rwx"
     "-Wl,-segprot,runtime_savedreg,rx,rx"
     "-Wl,-segprot,runtime_br_miss,rx,rx"
     "-Wl,-segprot,runtime_exit_ret,rx,rx"
