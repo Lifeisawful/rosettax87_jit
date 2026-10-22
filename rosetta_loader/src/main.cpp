@@ -235,28 +235,36 @@ public:
     }
 
     bool detach() {
-        // Literal 1:1 port of lldb debugserver's MachProcess::Detach()
-        // (llvm lldb/tools/debugserver/source/MacOSX/MachProcess.mm), in its
-        // exact order:
+        // Order (verified against xnu-12377 bsd/kern/mach_process.c, kern_sig.c
+        // and kern_exit.c):
         //
-        //   DoSIGSTOP(clear_bps, allow_running=true)   // run, then SIGSTOP-stop
-        //     -> PrivateResume(): reply held exception + task run
-        //     -> Signal(SIGSTOP, timeout=2s): kill(SIGSTOP), wait once for stop
-        //   ReplyToAllExceptions()   // reply, forwarding signal=-1 per thread
-        //   ShutDownExceptionThread()// restore original exception ports
-        //   ::ptrace(PT_DETACH)      // best-effort: logged, never fatal
-        //   m_task.Resume()          // task_resume only if suspend_count > 0
+        //   release BRK -> kill(SIGSTOP) -> wait for EXC_SOFT_SIGNAL(SIGSTOP)
+        //   -> restore exception ports -> PT_DETACH (SIGSTOP still held)
+        //   -> release the SIGSTOP exception
+        //
+        // The SIGSTOP exception must stay unreplied across PT_DETACH. While it
+        // is held the thread sits in do_bsdexception() with p_stat == SSTOP, so
+        // PT_DETACH passes its SSTOP gate, clears P_LTRACED|P_LSIGEXC, reparents
+        // to p_oppid and zeroes p_xstat. Released afterwards, issignal_locked()
+        // reads p_xstat == 0 and simply continues: no signal re-delivered, no
+        // job-control stop left behind.
+        //
+        // Replying BEFORE PT_DETACH (the debugserver order) is racy for us: the
+        // reply cannot clear p_xstat without also setting SRUN (which makes
+        // PT_DETACH EBUSY), and the released thread runs while still traced. A
+        // short-lived tracee can exit inside that window, becoming a zombie of
+        // the loader that is only handed back to its real parent when we reap
+        // it (reap_child_locked) — the CI hang.
 
         LOG("[detach] enter: p_stat=%d (SRUN=2 SSTOP=4)\n", readPstat(childPid_));
 
-        // 1. DoSIGSTOP / PrivateResume: reply to the held BRK so the task runs.
+        // 1. Reply to the held BRK so the task runs.
         exc_.release();
 
-        // 2. Signal(SIGSTOP): kill(SIGSTOP) on the running task, then wait ONCE
-        //    with a 2-second timeout for the SIGSTOP to come back as
-        //    EXC_SOFT_SIGNAL — matching debugserver's Signal(SIGSTOP, 2s). Any
-        //    other soft signal is suppressed and a genuine fault forwarded;
-        //    proceed regardless of whether the stop arrived (best-effort).
+        // 2. kill(SIGSTOP) on the running task, then wait ONCE with a 2-second
+        //    timeout for the SIGSTOP to come back as EXC_SOFT_SIGNAL. Any other
+        //    soft signal is suppressed and a genuine fault forwarded; proceed
+        //    regardless of whether the stop arrived (best-effort).
         kill(childPid_, SIGSTOP);
 
         bool gotSigstop = false;
@@ -277,28 +285,13 @@ public:
         LOG("[detach] after SIGSTOP-wait: gotSigstop=%d p_stat=%d\n", gotSigstop,
             readPstat(childPid_));
 
-        // 3. ReplyToAllExceptions: reply to the held SIGSTOP exception forwarding
-        //    signal = -1.
-        //
-        //    We must NOT let this SRUN the proc: PT_DETACH (step 5) is gated on
-        //    p_stat == SSTOP and returns EBUSY otherwise, leaving P_LTRACED set
-        //    (the worst failure — a still-traced tracee forces SIG_DFL on every
-        //    signal, freezing signal-driven apps, and no SIGCONT can fix it).
-        //    On this XNU, PT_THUPDATE bounds-checks `(unsigned)data >= NSIG`, so
-        //    -1 EINVALs and its `t->p_stat = SRUN` is skipped — the proc stays
-        //    SSTOP, PT_DETACH passes its gate and clears P_LTRACED. (data = 0
-        //    would instead succeed, SRUN the proc, and make PT_DETACH EBUSY —
-        //    verified.) The cost of keeping SSTOP is that the now-untraced tracee
-        //    can re-enter a job-control stop after detach; step 7 lifts that with
-        //    SIGCONT.
-        exc_.reply(-1);
-        LOG("[detach] after reply(-1): p_stat=%d\n", readPstat(childPid_));
-
-        // 4. ShutDownExceptionThread: restore original exception ports, drop ours.
+        // 3. Restore the original exception ports and destroy ours, so nothing
+        //    the tracee raises from here on can reach (and block on) our port.
         exc_.restoreAndTearDown();
 
-        // 5. PT_DETACH — best-effort, exactly as debugserver treats it: it logs
-        //    the return but never requires success, never retries, never branches.
+        // 4. PT_DETACH while the SIGSTOP exception is still held (p_stat ==
+        //    SSTOP). Without the held stop it EBUSYs and the tracee stays traced;
+        //    main()'s post-detach wait reaps it in that case.
         errno = 0;
         int pstatBeforeDetach = logsEnabled ? readPstat(childPid_) : -1;
         int detachRet = ptrace(PT_DETACH, childPid_, (caddr_t)1, 0);
@@ -313,11 +306,15 @@ public:
             pstatBeforeDetach, detachRet, detachErrno,
             detachRet != 0 ? strerror(detachErrno) : "OK", readPstat(childPid_));
 
-        // 6. m_task.Resume(): mirror MachTask::Resume — read the live suspend
-        //    count and task_resume only if suspend_count > 0 (task_resume is not
+        // 5. Release the held SIGSTOP exception (Mach reply only — ptrace is no
+        //    longer valid on the tracee). The thread returns from
+        //    do_bsdexception() untraced with p_xstat == 0 and carries on.
+        exc_.release();
+
+        // 6. task_resume only if suspend_count > 0 (task_resume is not
         //    ref-counted like task_suspend, so resuming a running task errors).
-        //    No manual task_suspend precedes this: debugserver does not suspend in
-        //    Detach().
+        //    Nothing here suspends the task; this only guards against an
+        //    external suspend left over from setup.
         struct task_basic_info taskInfo;
         mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
         bool resumed = false;
@@ -332,28 +329,11 @@ public:
         }
         LOG("[detach] resume: suspend_count=%d resumed=%d\n", suspendCount, resumed);
 
-        // 7. The tracee may re-enter a BSD job-control stop (p_stat == SSTOP,
-        //    "suspended (signal)") AFTER detach() returns.
-        //
-        //    We are forced to reply(-1) so PT_DETACH runs while the proc is still
-        //    SSTOP (else it EBUSYs and P_LTRACED is never cleared). The price is
-        //    that -1 EINVALs PT_THUPDATE, so its `p_stat = SRUN` is skipped and
-        //    the now-untraced tracee, on Golden Gate, INTERMITTENTLY re-enters a
-        //    job-control stop via SIGSTOP's default SA_STOP disposition. This
-        //    re-stop fires ASYNC and, as observed on a wedged process, AFTER this
-        //    function has already returned (the loader is by then parked in its
-        //    final kevent wait). So it cannot be lifted here — only SIGCONT lifts
-        //    a BSD SSTOP, and it must be sent whenever the stop actually fires.
-        //    That watch lives in main()'s post-detach wait loop (which polls the
-        //    tracee's p_stat and SIGCONTs any SSTOP for the tracee's lifetime),
-        //    since the loader is alive and idle there anyway. On Sequoia the proc
-        //    is SRUN throughout and no SIGCONT is ever sent.
-
         LOG("Debugger detached.\n");
         return true;
     }
 
-    // Public p_stat probe for the post-detach SSTOP watch loop in main().
+    // Public p_stat probe for the post-detach wait loop in main().
     static int tracePstat(pid_t pid) { return readPstat(pid); }
 
     bool setBreakpoint(uint64_t address) {
@@ -1316,14 +1296,13 @@ int main(int argc, char* argv[]) {
     // leftover BSD job-control stop on it.
     //
     // The tracee we detached from IS parentPid (the loader attached to the parent,
-    // which then exec'd wine). On Golden Gate, detach() is forced to reply(-1) so
-    // PT_DETACH succeeds from SSTOP (see detach() step 3/7); the cost is that the
-    // now-untraced tracee INTERMITTENTLY re-enters a job-control stop
-    // ("suspended (signal)") AFTER detach returns — asynchronously, past any
-    // in-detach window. Only SIGCONT lifts a BSD SSTOP. Rather than block
-    // indefinitely in kevent, we fold that watch into this wait: poll the tracee's
-    // p_stat on a short timeout and SIGCONT any SSTOP, until NOTE_EXIT fires. On
-    // Sequoia the proc is never SSTOP, so no SIGCONT is ever sent (a plain wait).
+    // which then exec'd wine). On Golden Gate (xnu-13432) the now-untraced tracee
+    // re-enters a job-control stop ("suspended (signal)") right after detach
+    // returns, even though PT_DETACH ran from the held SIGSTOP stop (cause not
+    // known; its sources are not published). On xnu-12377 PT_DETACH zeroes
+    // p_xstat and no stop is expected. Only SIGCONT lifts a BSD SSTOP, so rather
+    // than block indefinitely in kevent we poll the tracee's p_stat on a short
+    // timeout and SIGCONT any SSTOP, until NOTE_EXIT fires or the tracee is gone.
     int kq = kqueue();
     if (kq != -1) {
         struct kevent ev;
@@ -1344,6 +1323,14 @@ int main(int argc, char* argv[]) {
             // job-control stop. p_stat == -1 means the proc is gone.
             int ps = MuhDebugger::tracePstat(parentPid);
             if (ps == -1) {
+                break;
+            }
+            if (ps == 5 /* SZOMB */) {
+                // Exited (NOTE_EXIT may have fired before we registered). If
+                // PT_DETACH did not take, the zombie is still parented to us
+                // and only goes back to its original parent when we reap it
+                // (xnu reap_child_locked); otherwise this is a harmless ECHILD.
+                waitpid(parentPid, nullptr, WNOHANG);
                 break;
             }
             if (ps == 4 /* SSTOP */) {

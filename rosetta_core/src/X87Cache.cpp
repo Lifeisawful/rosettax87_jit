@@ -362,8 +362,13 @@ static bool op_disabled_for_run(uint16_t op, uint64_t disabled_ops_mask) {
 // uses x87_begin/x87_end like any handled op), or (OPT-KA) a keepalive
 // transcendental — Rosetta translates the latter as a runtime BL that
 // preserves the pinned cache GPRs. Shared by lookahead and seam_scan.
-static bool x87_run_member(uint16_t op, uint64_t disabled_ops_mask,
+static bool x87_run_member(const IRInstr& ins, uint64_t disabled_ops_mask,
                            bool runtime_keepalive) {
+    // Declined by the translator (see x87_is_m64_int_memop) — keep these out of
+    // runs so the cache's run accounting matches what is actually emitted.
+    if (x87_is_m64_int_memop(ins))
+        return false;
+    const uint16_t op = ins.opcode();
     if (g_rosetta_config) {
         if (op == kOpcodeName_fcos && trig_ir_fcos_enabled(*g_rosetta_config))
             return true;
@@ -481,7 +486,7 @@ bool X87Cache::seam_scan(IRInstr* instr_array, int64_t num_instrs,
     for (int64_t j = gap_start;
          j < num_instrs && j < gap_start + kMaxSeamGap; j++) {
         const uint16_t op = instr_array[j].opcode();
-        if (x87_run_member(op, disabled_ops_mask, runtime_keepalive)) {
+        if (x87_run_member(instr_array[j], disabled_ops_mask, runtime_keepalive)) {
             // The successor must be able to CONSUME the seam through the IR
             // pipeline — a run whose build is structurally guaranteed to
             // decline would pay a flush on top of the legacy path, turning
@@ -508,17 +513,45 @@ bool X87Cache::seam_scan(IRInstr* instr_array, int64_t num_instrs,
     return false;
 }
 
+// True for FILD m64 (DF /5), FISTP m64 (DF /7) and FISTTP m64 (DD /1) — the
+// three encodings that move a full 64-bit integer through an x87 slot.
+//
+// Our slots are f64 and translate_fild lowers the load as SCVTF Xn -> Dd, so any
+// qword with more than 53 significant bits comes back rounded.  Real x87 is
+// lossless here: an 80-bit register has a full 64-bit mantissa, which is why the
+// encoding exists.  That corrupts memory, not just arithmetic — Delphi's and Free
+// Pascal's RTL implement Move() as an x87 block copy ("Pentium memcpy trick"),
+// using fild qword / fistp qword purely as an 8-byte courier, so rounding the
+// cargo garbles every copy whose qwords exceed 53 significant bits.
+//
+// Declined by the translator so x87_fild / x87_fist_i64 / x87_fistt_i64 handle
+// them instead, keeping an exact int64 shadow.
+bool x87_is_m64_int_memop(const IRInstr& ins) {
+    switch (ins.opcode()) {
+        case Opcode::kOpcodeName_fild:
+        case Opcode::kOpcodeName_fistp:
+        case Opcode::kOpcodeName_fisttp:
+            break;
+        default:
+            return false;
+    }
+    const IROperand& op = ins.operands[0];
+    if (op.kind != IROperandKind::MemRef && op.kind != IROperandKind::AbsMem)
+        return false;
+    return op.mem.size == IROperandSize::S64;
+}
+
 int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_idx,
                         uint64_t disabled_ops_mask, bool bridge, bool runtime_keepalive) {
-    auto run_member = [&](uint16_t op) {
-        return x87_run_member(op, disabled_ops_mask, runtime_keepalive);
+    auto run_member = [&](const IRInstr& ins) {
+        return x87_run_member(ins, disabled_ops_mask, runtime_keepalive);
     };
     int count = 0;
     int64_t i = insn_idx;
     for (;;) {
         // Consume a maximal group of run-member instructions.
         int group = 0;
-        while (i < num_instrs && run_member(instr_array[i].opcode())) {
+        while (i < num_instrs && run_member(instr_array[i])) {
             i++;
             group++;
         }
@@ -536,7 +569,7 @@ int X87Cache::lookahead(IRInstr* instr_array, int64_t num_instrs, int64_t insn_i
             j++;
             gap++;
         }
-        if (gap == 0 || j >= num_instrs || !run_member(instr_array[j].opcode()))
+        if (gap == 0 || j >= num_instrs || !run_member(instr_array[j]))
             break;
         count += gap;
         i = j;
