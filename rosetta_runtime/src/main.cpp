@@ -7,14 +7,25 @@
 #include "RuntimeConfig.h"
 
 #include "ExecutableHeap.h"
+#include "Export.h"
 #include "TranslationCacheAbi.h"
 #include "Library.h"
 
 #include "rosetta_core/CoreConfig.h"
+#include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/RuntimeLibC.h"
 
 static void runtime_early_init() {
     rosetta_set_config(&kConfig);
+
+    // Publish the runtime version before anything that branches on it.
+    //
+    // rosetta_core_init() cannot run until init_library (it needs
+    // libRosettaRuntime's addresses), but the runtime's main() allocates the first
+    // ExecutableHeap chunk BEFORE calling init_library — so the allocate_chunk hook
+    // below has to pick its ABI now.  kImports.version is already valid: the loader
+    // writes it into __DATA,imports before it runs our _start.
+    rosetta_core_set_runtime_version(kImports.version);
 
     uintptr_t classify_arm_pc_ptr = kOffsets.runtime_base + kOffsets.classify_arm_pc_rva;
     // Both live in the runtime image (/usr/libexec/rosetta/runtime), not in
@@ -32,8 +43,15 @@ static void runtime_early_init() {
     init_translation_cache_abi_hooks(classify_arm_pc_ptr, kOffsets.rosettax87_base,
                                      kOffsets.rosettax87_size);
 
+    // Required on a 26.4+ runtime, where allocate_chunk no longer receives the
+    // heap; zero (and unused) on 15.  Same zero-guard as above: a 0 rva would
+    // otherwise resolve to runtime_base.
+    uintptr_t executable_heap_ptr = kOffsets.executable_heap_rva
+                                        ? kOffsets.runtime_base + kOffsets.executable_heap_rva
+                                        : 0;
+
     init_executable_heap_hooks(allocate_chunk_ptr, runtime_routines_for_address_ptr,
-                               trace_write_mapping_record_ptr);
+                               trace_write_mapping_record_ptr, executable_heap_ptr);
 
     uintptr_t bind_library_stubs_ptr =
         kOffsets.bind_library_stubs_rva
@@ -50,8 +68,11 @@ static void runtime_early_init() {
 // long before exports_fetch (0x1289c) where the loader used to first get
 // control, so hooks installed from init_library missed chunk 0 entirely.
 //
-// Nothing here may touch kImports — libRosettaRuntime is not mapped yet. See
-// runtime_early_init.
+// Nothing here may touch kImports' export TABLES — libRosettaRuntime is not
+// mapped yet, and those pointers are filled in-process later by the
+// bind_library_stubs hook. kImports.version is the exception: the loader writes it
+// into __DATA,imports before calling us, so runtime_early_init reads it to pick the
+// version-dependent allocate_chunk ABI.
 //
 // This is a plain call, not a constructor: with -nostdlib/-static and a custom
 // entry point the link emits no __mod_init_func array, so __attribute__((constructor))

@@ -18,6 +18,11 @@ struct OffsetFinder {
     uint64_t offsetTraceWriteMappingRecord_{};
     uint64_t offsetBindLibraryStubs_{};
 
+    // The ExecutableHeap global, decoded out of allocate_chunk's body. Stays 0 on
+    // a <= kVersion_15 runtime, which passes the heap in x0 and has no such
+    // sequence; main() enforces that it was found on 26.4+. See RosettaVersion.h.
+    uint64_t offsetExecutableHeapGlobal_{};
+
     // The three helpers our full classify_arm_pc_objc replacement calls. All are
     // internal (non-exported) runtime functions — see TranslationCacheAbi.h.
     uint64_t offsetAbiInfoForRuntime_{};

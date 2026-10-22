@@ -75,6 +75,45 @@ auto OffsetFinder::scanRuntime() -> bool {
         return aarch64::decodeBl(blInsn, blOffset);
     };
 
+    // The ExecutableHeap global — only present, and only needed, on a 26.4+
+    // runtime (see RosettaVersion.h).  There allocate_chunk takes x0 = lock_owner
+    // and reaches the heap as a global, so this address is the only way in.
+    //
+    // Anchored on the `initialized`/`heap_count`/`heap_base` store burst that
+    // immediately follows the mmap, which is identical in 26.4, 26.5b4 and 27.b3:
+    //
+    //     ADRP X8, #page          ; wildcarded whole — immlo lives in byte 3
+    //     ADD  X8, X8, #imm       ; == &heap.initialized (heap + 0x5C)
+    //     STUR X20, [X8,#12]      ; heap.heap_base = mmap result  (0x5C + 12 = 0x68)
+    //     MOV  X9, #0x100000001   ; heap.initialized = 1, heap.heap_count = 1
+    //     STR  X9, [X8]
+    //
+    // The STUR/MOV/STR triple is fully fixed and the ADD is pinned to Xd==Xn==X8,
+    // which makes the pattern unique in all three images; it matches nothing in
+    // the 15.8.1 runtime, whose allocate_chunk stores through the heap it was
+    // handed in x0 instead.  `heap + 0x5C` is what the ADD yields, so subtract
+    // that to get the object's base.
+    constexpr uint64_t kInitializedOffset = 0x5C;
+
+    auto findExecutableHeapGlobal = [&]() -> std::optional<uint64_t> {
+        auto match = findPattern(loader.buffer_, "08 ? ? 91 14 C1 00 F8 E9 03 00 B2 09 01 00 F9",
+                                 "executableHeapGlobal", /*optional=*/true);
+        if (!match)
+            return std::nullopt;
+        uint64_t adrpOffset = *match - 4;
+        uint32_t adrpInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[adrpOffset]);
+        // Refuse anything that is not actually an ADRP: a byte pattern that drifted
+        // onto an unrelated ADD would otherwise hand the runtime a garbage heap.
+        if ((adrpInsn & 0x9F000000) != 0x90000000)
+            return std::nullopt;
+        uint32_t addInsn = *reinterpret_cast<uint32_t*>(&loader.buffer_[*match]);
+        uint64_t initialized =
+            aarch64::decodeAdrp(adrpInsn, adrpOffset) + aarch64::decodeAddImm(addInsn);
+        if (initialized < kInitializedOffset)
+            return std::nullopt;
+        return initialized - kInitializedOffset;
+    };
+
     auto findTraceWriteMappingRecord = [&]() -> std::optional<uint64_t> {
         // MOV X1, X19; MOV W2, #0x4000
         // BL trace_write_mapping_record  <-- we decode the BL (2 insns / 8 after match)
@@ -153,6 +192,11 @@ auto OffsetFinder::scanRuntime() -> bool {
     auto sysCsrctl = findSysCsrctl();
     auto runtimeRoutinesForAddress = findRuntimeRoutinesForAddress();
     auto allocateChunk = findAllocateChunk();
+    // Deliberately NOT in the mandatory list below: on a <= kVersion_15 runtime
+    // this sequence does not exist and its absence is correct.  main() knows the
+    // runtime version (it comes from libRosettaRuntime, scanned afterwards) and
+    // makes it fatal there when the runtime is one that needs it.
+    auto executableHeapGlobal = findExecutableHeapGlobal();
     auto traceWriteMappingRecord = findTraceWriteMappingRecord();
     auto bindLibraryStubs = findBindLibraryStubs();
     auto abiInfoForRuntime = findAbiInfoForRuntime();
@@ -174,6 +218,7 @@ auto OffsetFinder::scanRuntime() -> bool {
     offsetAllocateChunk_ = *allocateChunk;
     offsetTraceWriteMappingRecord_ = *traceWriteMappingRecord;
     offsetBindLibraryStubs_ = *bindLibraryStubs;
+    offsetExecutableHeapGlobal_ = executableHeapGlobal.value_or(0);
     offsetAbiInfoForRuntime_ = *abiInfoForRuntime;
     offsetThreadEntryForPort_ = *threadEntryForPort;
     offsetInstructionExtentsForArmAddress_ = *instructionExtentsForArmAddress;

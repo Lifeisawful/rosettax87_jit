@@ -29,6 +29,14 @@ struct Offsets {
     uint64_t abi_info_for_runtime_rva;
     uint64_t thread_entry_for_port_rva;
     uint64_t instruction_extents_for_arm_address_rva;
+
+    // Address of the runtime's ExecutableHeap global, as an offset within the
+    // runtime image (0x3B510 on every 26.4+ build seen so far). Needed only when
+    // rosetta_heap_is_global(version): on those runtimes allocate_chunk no longer
+    // receives the heap as an argument, so this is the only way to reach it. The
+    // loader decodes it from the ADRP/ADD pair inside allocate_chunk itself; 0 on
+    // a <= 15 runtime, where it is unused. See RosettaVersion.h.
+    uint64_t executable_heap_rva;
 };
 
-static_assert(sizeof(Offsets) == 0x78, "Invalid size for Offsets");
+static_assert(sizeof(Offsets) == 0x80, "Invalid size for Offsets");

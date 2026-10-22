@@ -13,9 +13,33 @@
 #include "SlabAllocator.h"
 #include "TranslationCache.h"
 
-// The runtime's single global heap object (__bss, 0x3B390 in the reference
-// binary).  It owns the 128 MB RWX code heap plus every allocator, tree, cache
-// and lock the translator needs.  Constituent types live in their own headers:
+// The runtime's single global heap object (__bss, 0x3B390 in the 15.8.1 reference
+// binary, 0x3B510 on 26.4+).  It owns the 128 MB RWX code heap plus every
+// allocator, tree, cache and lock the translator needs.
+//
+// ── VERSION SPLIT: the tail of this struct moved ──────────────────────────────
+//
+// A 26.4-or-newer runtime inserted an 8-byte slot at offset 0x5C0 (a bool the new
+// runtime_xsave/runtime_xrstor handlers read), shifting every field from the old
+// 0x5C0 onward by +8 and growing sizeof from 0x614 to 0x61C.  Verified field-by-
+// field in IDA against 15.8.1, 26.4, 26.5b4 and 27.b3: everything up to and
+// including code_fragment_allocator's lock at 0x538 is byte-identical on all four,
+// and the shift is stable across all three newer builds.
+//
+// We keep modelling the 15 layout, because that is where every offset we actually
+// USE lives — allocator 0x00, chunk_list 0x30, free_by_size/addr 0x38/0x48,
+// allocator_lock 0x58, initialized/heap_count/heap_base 0x5C/0x60/0x68, arm_tree
+// 0x4F0, arm_tree_lock 0x500, code_fragment_allocator 0x508 — all below the shift
+// and therefore version-independent.
+//
+// The single exception is mach_port, the only field past 0x540 we read.  Both
+// spellings are declared (mach_port at 0x5E0, mach_port_v2 at 0x5E8) and
+// task_port() picks between them by runtime version.  Every field declared after
+// mach_port_v2 is wrong on 26.4+ and is never read; the sizeof assert below still
+// describes the 15 layout.  We never allocate one of these — we only ever point at
+// the runtime's — so the trailing mismatch is inert.
+//
+// Constituent types live in their own headers:
 //
 //   Chunk.h                 Chunk (a heap span; chained from chunk_list)
 //   FreeBlock.h             FreeBlock
@@ -72,7 +96,10 @@ struct ExecutableHeap
   uint32_t stat_invalidations;
   uint32_t pad_5ac;
   uint64_t mach_port;
-  uint8_t pad_5b8[8];
+  // Same field on a 26.4-or-newer runtime, which inserted an 8-byte slot at 0x5C0
+  // and so shifted everything from there on by +8 (see the header comment above).
+  // Read through task_port(), never directly.
+  uint64_t mach_port_v2;
   uint64_t field_5c0;
   uint64_t field_5c8;
   uint32_t field_5d0;
@@ -104,6 +131,11 @@ struct ExecutableHeap
   // `MOV X19,X2` (the searched address), `MOV X20,X1` (passed to
   // os_unfair_lock_unlock_no_tsd as `self`), `MOV X21,X0` (the heap).
   void* runtime_routines_for_address(uint32_t lock_owner, uint64_t addr);
+
+  // The task port the runtime cached in this heap, from whichever offset this
+  // runtime version keeps it at.  Defined out-of-line in ExecutableHeap.cpp so
+  // the version test lives next to the rest of the ABI selection.
+  uint32_t task_port() const;
 };
 #pragma pack(pop)
 
@@ -153,8 +185,8 @@ static_assert(offsetof(ExecutableHeap, stat_translations) == 0x5D0);
 static_assert(offsetof(ExecutableHeap, stat_retranslations) == 0x5D4);
 static_assert(offsetof(ExecutableHeap, stat_invalidations) == 0x5D8);
 static_assert(offsetof(ExecutableHeap, pad_5ac) == 0x5DC);
-static_assert(offsetof(ExecutableHeap, mach_port) == 0x5E0);
-static_assert(offsetof(ExecutableHeap, pad_5b8) == 0x5E8);
+static_assert(offsetof(ExecutableHeap, mach_port) == 0x5E0);      // <= kVersion_15
+static_assert(offsetof(ExecutableHeap, mach_port_v2) == 0x5E8);   // 26.4+
 static_assert(offsetof(ExecutableHeap, field_5c0) == 0x5F0);
 static_assert(offsetof(ExecutableHeap, field_5c8) == 0x5F8);
 static_assert(offsetof(ExecutableHeap, field_5d0) == 0x600);
@@ -173,9 +205,16 @@ extern ExecutableHeap* g_executable_heap;
 // called directly from our map_runtime_routines to emit the type-5
 // (RuntimeRoutinesMapped) trace record that our replacement would otherwise skip.
 // Pass 0 to disable that record.
+//
+// executable_heap_addr is the runtime's ExecutableHeap global (loader-decoded,
+// Offsets::executable_heap_rva rebased).  It is REQUIRED on a 26.4+ runtime and
+// selects which allocate_chunk thunk gets installed; it is ignored on a
+// <= kVersion_15 runtime, which passes the heap in x0 instead.  The version comes
+// from rosetta_core_runtime_version(), which main.cpp seeds before calling this.
 void init_executable_heap_hooks(uintptr_t allocate_chunk_addr,
                                 uintptr_t runtime_routines_for_address_addr,
-                                uintptr_t trace_write_mapping_record_addr);
+                                uintptr_t trace_write_mapping_record_addr,
+                                uintptr_t executable_heap_addr);
 
 void map_runtime_routines(uintptr_t dest, uint32_t task_port);
 CodeFragmentMetadata* register_code_fragment(uint32_t lock_owner, uint64_t arm_base,

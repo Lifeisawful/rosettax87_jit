@@ -24,6 +24,7 @@
 #include "rosetta_shared/LoaderTypes.h"
 #include "rosetta_shared/MachoLoader.h"
 #include "rosetta_shared/Offsets.h"
+#include "rosetta_shared/RosettaVersion.h"
 
 const char* logsEnabled = nullptr;
 
@@ -910,14 +911,16 @@ int main(int argc, char* argv[]) {
         "offset_runtime_routines_for_address=%llx offset_allocate_chunk=%llx "
         "offset_trace_write_mapping_record=%llx offset_bind_library_stubs=%llx "
         "offset_abi_info_for_runtime=%llx offset_thread_entry_for_port=%llx "
-        "offset_instruction_extents_for_arm_address=%llx\n",
+        "offset_instruction_extents_for_arm_address=%llx "
+        "offset_executable_heap_global=%llx\n",
         offsetFinder.offsetSvcCallEntry_,
         offsetFinder.offsetSvcCallRet_, offsetFinder.offsetClassifyArmPc_,
         offsetFinder.offsetSysCsrctl_, offsetFinder.offsetRuntimeRoutinesForAddress_,
         offsetFinder.offsetAllocateChunk_, offsetFinder.offsetTraceWriteMappingRecord_,
         offsetFinder.offsetBindLibraryStubs_, offsetFinder.offsetAbiInfoForRuntime_,
         offsetFinder.offsetThreadEntryForPort_,
-        offsetFinder.offsetInstructionExtentsForArmAddress_);
+        offsetFinder.offsetInstructionExtentsForArmAddress_,
+        offsetFinder.offsetExecutableHeapGlobal_);
 
     if (!offsetFinder.scanLibRosettaRuntime()) {
         fprintf(stderr, "Fatal: failed to scan libRosettaRuntime for offsets.\n");
@@ -925,9 +928,49 @@ int main(int argc, char* argv[]) {
     }
     LOG("Found libRosettaRuntime offsets successfully!\n");
     LOG("offset_translate_insn=%llx offset_transaction_result_size=%llx "
-        "offset_decode_opcode=%llx\n",
+        "offset_decode_opcode=%llx runtime_version=%llx\n",
         offsetFinder.offsetTranslateInsn_, offsetFinder.offsetTransactionResultSize_,
-        offsetFinder.offsetDecodeOpcode_);
+        offsetFinder.offsetDecodeOpcode_, offsetFinder.runtimeVersion_);
+
+    // The ExecutableHeap global is optional in scanRuntime() because a
+    // <= kVersion_15 runtime genuinely has no such sequence — it hands the heap to
+    // allocate_chunk in x0.  Now that libRosettaRuntime has been scanned we know
+    // the version, and on a 26.4+ runtime a missing heap global IS fatal: without
+    // it the runtime cannot install either allocate_chunk variant correctly, and
+    // launching half-hooked would map the reference stub blob under our rewritten
+    // runtime-routine offsets.  Fail loudly instead.  See RosettaVersion.h.
+    if (rosetta_heap_is_global(offsetFinder.runtimeVersion_) &&
+        offsetFinder.offsetExecutableHeapGlobal_ == 0) {
+        fprintf(stderr,
+                "Fatal: runtime version 0x%llx uses the global-heap allocate_chunk ABI, but the "
+                "ExecutableHeap global could not be located in /usr/libexec/rosetta/runtime. "
+                "The executableHeapGlobal pattern needs updating for this build.\n",
+                offsetFinder.runtimeVersion_);
+        return 1;
+    }
+
+    // And the converse.  Finding that sequence at all is direct evidence of the
+    // global-heap ABI — it only exists in an allocate_chunk that was not handed a
+    // heap — so a version claiming otherwise means the version itself is wrong (a
+    // misparsed libRosettaRuntime, or numbering we do not understand).  Trusting
+    // the version there would install the legacy thunk and let lock_owner be taken
+    // as `this`, the exact crash this split exists to prevent, so stop rather than
+    // guess which signal to believe.
+    if (!rosetta_heap_is_global(offsetFinder.runtimeVersion_) &&
+        offsetFinder.offsetExecutableHeapGlobal_ != 0) {
+        fprintf(stderr,
+                "Fatal: runtime version 0x%llx should use the legacy allocate_chunk ABI, but "
+                "/usr/libexec/rosetta/runtime contains the global-heap sequence (heap at 0x%llx). "
+                "The version token and the binary disagree; refusing to pick an ABI.\n",
+                offsetFinder.runtimeVersion_, offsetFinder.offsetExecutableHeapGlobal_);
+        return 1;
+    }
+
+    LOG("allocate_chunk ABI: %s (runtime_version=%llx)\n",
+        rosetta_heap_is_global(offsetFinder.runtimeVersion_)
+            ? "26.4+ (x0=lock_owner, heap global)"
+            : "15 (x0=heap, w1=lock_owner)",
+        offsetFinder.runtimeVersion_);
 
     const auto runtimeBase = dbg.findRuntime();
 
@@ -1271,6 +1314,7 @@ int main(int argc, char* argv[]) {
         .thread_entry_for_port_rva = offsetFinder.offsetThreadEntryForPort_,
         .instruction_extents_for_arm_address_rva =
             offsetFinder.offsetInstructionExtentsForArmAddress_,
+        .executable_heap_rva = offsetFinder.offsetExecutableHeapGlobal_,
     };
 
     dbg.writeMemory(machoOffsetsAddress, &machoOffsets, sizeof(machoOffsets));

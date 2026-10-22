@@ -7,7 +7,9 @@
 #include "MachIPC.h"
 #include "SIMDGuard.h"
 #include "ThreadSelfRestrict.h"
+#include "rosetta_core/RosettaCore.h"
 #include "rosetta_core/hook.h"
+#include "rosetta_shared/RosettaVersion.h"
 
 #ifdef ROSETTA_RUNTIME
 #include "rosetta_core/RuntimeLibC.h"
@@ -170,6 +172,19 @@ void map_runtime_routines(uintptr_t dest, uint32_t task_port) {
     }
 }
 
+// Which offset this runtime keeps the cached task port at.  26.4 inserted an
+// 8-byte slot at 0x5C0, moving mach_port 0x5E0 -> 0x5E8; see ExecutableHeap.h.
+//
+// Reading the wrong one yields a bogus port name, which makes mach_vm_remap fail
+// and silently drops map_runtime_routines onto its memmove fallback — our stubs
+// would still land, so this would not crash, it would just quietly stop being a
+// COW mapping.  Worth getting right rather than guessing.
+uint32_t ExecutableHeap::task_port() const {
+    const uint64_t port = rosetta_heap_is_global(rosetta_core_runtime_version()) ? mach_port_v2
+                                                                                : mach_port;
+    return static_cast<uint32_t>(port);
+}
+
 FreeBlock* ExecutableHeap::allocate_chunk(uint32_t lock_owner) {
     ExecutableHeap* const heap = this;
     g_executable_heap = heap;
@@ -186,7 +201,7 @@ FreeBlock* ExecutableHeap::allocate_chunk(uint32_t lock_owner) {
     heap->initialized = 1;
     heap->heap_count = 1;
 
-    map_runtime_routines(heap_base, static_cast<uint32_t>(heap->mach_port));
+    map_runtime_routines(heap_base, heap->task_port());
 
     uintptr_t jit_base = heap_base + runtime_routines_size();
 
@@ -266,15 +281,29 @@ namespace {
 // replacements are complete reimplementations), but the trampolines are kept so
 // the originals stay reachable for debugging and so hook_install has somewhere to
 // store them.
+//
+// allocate_chunk comes in two ABIs and init_executable_heap_hooks installs the one
+// this runtime uses (see RosettaVersion.h for where the split comes from):
+//
+//   <= kVersion_15   x0 = ExecutableHeap*, w1 = lock_owner
+//   >  kVersion_15   x0 = lock_owner, heap reached as a global
 using allocate_chunk_t = FreeBlock* (*)(ExecutableHeap*, uint32_t);
+using allocate_chunk_v2_t = FreeBlock* (*)(uint32_t);
 using runtime_routines_for_address_t = void* (*)(ExecutableHeap*, uint32_t, uint64_t);
 
 allocate_chunk_t g_original_allocate_chunk = nullptr;
+allocate_chunk_v2_t g_original_allocate_chunk_v2 = nullptr;
 runtime_routines_for_address_t g_original_runtime_routines_for_address = nullptr;
 
-// Free-function thunks with the exact register ABI of the reference methods
-// (X0 = heap, then the declared arguments).  hook_install needs a plain function
-// pointer, which a pointer-to-member is not.
+// The runtime's ExecutableHeap global, from the loader.  Only set — and only
+// meaningful — on a 26.4+ runtime, where it is how hook_allocate_chunk_v2 finds
+// the heap it was no longer handed.
+ExecutableHeap* g_reference_heap = nullptr;
+
+// Free-function thunks matching each reference entry point's register ABI exactly.
+// hook_install needs a plain function pointer, which a pointer-to-member is not.
+//
+// <= kVersion_15 variant: x0 is the heap, i.e. the method's own `this`.
 FreeBlock* hook_allocate_chunk(ExecutableHeap* heap, uint32_t lock_owner) {
     // allocate_chunk runs during translation on the guest thread, with guest
     // XMM state live in the caller-saved v registers — and the reference
@@ -286,6 +315,20 @@ FreeBlock* hook_allocate_chunk(ExecutableHeap* heap, uint32_t lock_owner) {
     return heap->allocate_chunk(lock_owner);
 }
 
+// 26.4+ variant: the reference signature is `FreeBlock* allocate_chunk(uint32_t
+// lock_owner)` — there is no `this`, so x0 is the lock owner and the heap comes
+// from the global the loader decoded for us.
+//
+// Installing the OTHER thunk here is exactly the bug this split fixes: x0 would be
+// taken as `this`, and `heap->heap_base = …` / `heap->allocator.alloc()` would read
+// and write through a small integer, killing the guest on the first translation.
+//
+// Same guest-live-XMM situation as hook_allocate_chunk above, hence the guard.
+FreeBlock* hook_allocate_chunk_v2(uint32_t lock_owner) {
+    SIMDGuardFull simdGuard;
+    return g_reference_heap->allocate_chunk(lock_owner);
+}
+
 void* hook_runtime_routines_for_address(ExecutableHeap* heap, uint32_t lock_owner,
                                         uint64_t addr) {
     return heap->runtime_routines_for_address(lock_owner, addr);
@@ -295,17 +338,54 @@ void* hook_runtime_routines_for_address(ExecutableHeap* heap, uint32_t lock_owne
 
 void init_executable_heap_hooks(uintptr_t allocate_chunk_addr,
                                 uintptr_t runtime_routines_for_address_addr,
-                                uintptr_t trace_write_mapping_record_addr) {
+                                uintptr_t trace_write_mapping_record_addr,
+                                uintptr_t executable_heap_addr) {
     // Not hooked — called directly from our map_runtime_routines.  The reference
     // function stays in place and we just borrow it to write the trace record.
     g_trace_write_mapping_record =
         reinterpret_cast<trace_write_mapping_record_t>(trace_write_mapping_record_addr);
 
+    const bool heap_is_global = rosetta_heap_is_global(rosetta_core_runtime_version());
+
+    // Deliberately NOT also assigned to g_executable_heap here.  That global means
+    // "the heap our allocate_chunk has taken over" and is set from `this` on both
+    // paths when the first chunk is allocated; publishing it earlier on only one
+    // path would make the two versions behave differently for no gain (nothing
+    // reads it before then — TranslationCacheAbi.cpp's hooks forward to the
+    // original while it is null, and no fragments exist to find yet anyway).
+    if (heap_is_global && executable_heap_addr)
+        g_reference_heap = reinterpret_cast<ExecutableHeap*>(executable_heap_addr);
+
     if (allocate_chunk_addr) {
-        g_original_allocate_chunk = reinterpret_cast<allocate_chunk_t>(allocate_chunk_addr);
-        hook_install(reinterpret_cast<void*>(allocate_chunk_addr),
-                     reinterpret_cast<void*>(&hook_allocate_chunk),
-                     reinterpret_cast<void**>(&g_original_allocate_chunk));
+        if (heap_is_global) {
+            // Without the heap global there is nothing for the v2 thunk to operate
+            // on, and installing the v1 thunk would misread x0 as `this`.  Leaving
+            // allocate_chunk unhooked is also broken — the reference would map ITS
+            // stub blob while our rewritten runtime-routine offsets describe ours —
+            // so refuse rather than half-hook.  The loader already makes this fatal
+            // before we get here; this is the belt-and-braces check.
+            if (g_reference_heap) {
+                g_original_allocate_chunk_v2 =
+                    reinterpret_cast<allocate_chunk_v2_t>(allocate_chunk_addr);
+                hook_install(reinterpret_cast<void*>(allocate_chunk_addr),
+                             reinterpret_cast<void*>(&hook_allocate_chunk_v2),
+                             reinterpret_cast<void**>(&g_original_allocate_chunk_v2));
+            }
+#ifdef ROSETTA_RUNTIME
+            else {
+                printf(
+                    "RosettaRuntimex87: FATAL runtime version 0x%llx needs the global-heap "
+                    "allocate_chunk ABI but no ExecutableHeap global was supplied — leaving it "
+                    "unhooked; x87 stubs will not be reachable\n",
+                    (unsigned long long)rosetta_core_runtime_version());
+            }
+#endif
+        } else {
+            g_original_allocate_chunk = reinterpret_cast<allocate_chunk_t>(allocate_chunk_addr);
+            hook_install(reinterpret_cast<void*>(allocate_chunk_addr),
+                         reinterpret_cast<void*>(&hook_allocate_chunk),
+                         reinterpret_cast<void**>(&g_original_allocate_chunk));
+        }
     }
 
     if (runtime_routines_for_address_addr) {

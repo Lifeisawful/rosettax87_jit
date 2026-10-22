@@ -14,8 +14,11 @@
 // where `?` is a wildcard, e.g. "FD 43 07 91 ? ?".
 namespace rosetta_shared {
 
+// `optional` suppresses the "not found" diagnostic, for patterns whose absence is
+// a legitimate outcome rather than a failure — e.g. a sequence that only exists on
+// some Rosetta versions, where the caller decides whether missing is fatal.
 inline auto findPattern(const std::vector<uint8_t>& haystack, std::string_view pattern,
-                        const char* name) -> std::optional<uint64_t> {
+                        const char* name, bool optional = false) -> std::optional<uint64_t> {
     struct PatternByte {
         uint8_t value;
         bool wildcard;
@@ -46,7 +49,8 @@ inline auto findPattern(const std::vector<uint8_t>& haystack, std::string_view p
     if (it != haystack.end())
         return static_cast<uint64_t>(std::distance(haystack.begin(), it));
 
-    fprintf(stderr, "%s pattern not found.\n", name);
+    if (!optional)
+        fprintf(stderr, "%s pattern not found.\n", name);
     return std::nullopt;
 }
 
@@ -63,6 +67,15 @@ inline auto decodeAdrp(uint32_t insn, uint64_t pc) -> uint64_t {
 
 inline auto decodeLdrbImm(uint32_t insn) -> uint64_t {
     return (insn >> 10) & 0xFFF;
+}
+
+// ADD Xd, Xn, #imm{, LSL #12} — the immediate only. Pairs with decodeAdrp to
+// recover the full address an ADRP/ADD (clang's ADRL macro) materialises.
+inline auto decodeAddImm(uint32_t insn) -> uint64_t {
+    uint64_t imm12 = (insn >> 10) & 0xFFF;
+    if ((insn >> 22) & 1)
+        imm12 <<= 12;
+    return imm12;
 }
 
 inline auto decodeBl(uint32_t insn, uint64_t pc) -> uint64_t {

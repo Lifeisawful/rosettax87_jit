@@ -5,6 +5,10 @@
 
 static uint64_t g_runtime_version = 0;
 
+void rosetta_core_set_runtime_version(uint64_t runtime_version) {
+    g_runtime_version = runtime_version;
+}
+
 void rosetta_core_init(const RosettaCoreConfig& config) {
     g_runtime_version = config.runtime_version;
     init_custom_translation_hook(config.translate_insn_addr, config.transaction_result_size_addr,
