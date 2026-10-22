@@ -2,21 +2,32 @@ name: Build and Release
 
 on:
   # Only run after CI completes on main, so we never publish a build that
-  # failed its tests. (workflow_run fires on the default branch's copy of this
-  # file, and only for the CI workflow's own triggers — i.e. pushes to main.)
+  # failed its tests.
+  #
+  # `branches` filters on the branch the TRIGGERING workflow ran on, so this is
+  # what keeps feature-branch CI runs from publishing: CI builds every branch
+  # (ci.yml), but only a run on main reaches this workflow. Without the filter,
+  # any green run on any branch would publish its head_sha as `latest`.
+  #
+  # Note workflow_run only ever uses the DEFAULT BRANCH's copy of this file, so
+  # changes here take effect once they land on main — not on a feature branch.
   workflow_run:
     workflows: [CI]
     types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-26
-    # Gate on CI success. On workflow_dispatch there is no triggering run, so
-    # allow that through too.
+    # Gate on CI success AND on main. The branches filter above already does
+    # the latter; restating it here means a publish still cannot happen from a
+    # feature branch if that filter is ever loosened. On workflow_dispatch there
+    # is no triggering run, so allow that through too.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
     permissions:
       contents: write
 

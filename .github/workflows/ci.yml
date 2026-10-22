@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Build + test every branch. Publishing is gated separately: release.yml only
+  # fires for CI runs on main, so a green run here never touches the release.
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
     branches: [main]
   workflow_dispatch:
